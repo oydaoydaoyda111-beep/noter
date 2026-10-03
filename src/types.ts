@@ -25,6 +25,17 @@ export interface Settings {
   density: 'comfortable' | 'compact';
   motion: 'full' | 'subtle' | 'none';
   autosaveDelay: number;
+  accentColor: 'blue' | 'green' | 'purple';
+  startupSection: 'last' | 'notes' | 'finance';
+  spellcheck: boolean;
+  showNoteStats: boolean;
+  financeCurrency: '' | 'AZN' | 'USD' | 'EUR' | 'GBP' | 'TRY';
+  financeDateFormat: 'iso' | 'dmy' | 'mdy';
+  financeTableDensity: 'compact' | 'comfortable';
+  financePageSize: number;
+  financeDefaultAccount: string;
+  financeRememberEntries: boolean;
+  financeShowAccountNotes: boolean;
 }
 
 export interface Workspace {

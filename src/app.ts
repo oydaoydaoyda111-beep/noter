@@ -1,5 +1,8 @@
+import { desktop, readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument } from './desktop/platform';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createStore } from './state/workspace';
-import { storage } from './storage/storage';
+import { storage, validateWorkspace } from './storage/storage';
 import { createEditor } from './editor/editor';
 import { createTree } from './tree/tree';
 import { createTabs } from './tabs/tabs';
@@ -9,11 +12,13 @@ import { askDialog } from './ui/dialog';
 import { showMenu, type MenuItem } from './ui/menu';
 import { animateDocument } from './ui/motion';
 import { icon } from './ui/icons';
+import { nameEmoji } from './ui/emoji';
 import { el } from './ui/dom';
 import type { WorkspaceNode } from './types';
+import { createFinance } from './finance/finance';
 
-export function startApp(mount: HTMLElement) {
-  const loaded = storage.load();
+export async function startApp(mount: HTMLElement) {
+  const loaded = await storage.load();
   const store = createStore(loaded.workspace);
   mount.innerHTML = `
     <div class="app-shell">
@@ -22,6 +27,7 @@ export function startApp(mount: HTMLElement) {
           <div class="brand-mark" aria-hidden="true"><span>n</span></div>
           <div class="brand-copy"><span class="brand-name">noter<span class="brand-period">.</span></span><span class="workspace-name">Personal workspace</span></div>
         </div>
+        <nav class="workspace-sections" aria-label="Workspace sections"><button id="notes-section" type="button" aria-pressed="true">Notes</button><button id="finance-section" type="button" aria-pressed="false">Finance</button></nav>
         <div class="create-actions">
           <button class="new-note-button" id="new-note" type="button"><span>New note</span><kbd class="new-note-key"></kbd></button>
           <button class="new-folder-button icon-button" id="new-folder" type="button" title="New folder" aria-label="New folder"></button>
@@ -31,6 +37,7 @@ export function startApp(mount: HTMLElement) {
           <kbd class="search-key"></kbd>
           <button id="clear-search" class="icon-button" type="button" aria-label="Clear search" title="Clear search" hidden></button>
         </div>
+        <div id="search-filters" class="search-filters" role="group" aria-label="Search in"></div>
         <div class="tree-heading"><h2 id="tree-label">Workspace</h2><span id="note-count"></span></div>
         <div class="sidebar-files"><nav id="file-tree"></nav><div id="search-results" aria-label="Search results" hidden></div></div>
         <div class="sidebar-bottom">
@@ -40,6 +47,7 @@ export function startApp(mount: HTMLElement) {
       </aside>
       <main class="workspace">
         <div class="tab-bar"><div id="tabs" class="tabs"></div><div class="tab-bar-end"><span class="workspace-label">YOUR SPACE, IN FOCUS</span></div></div>
+        <section id="finance-panel" class="finance-panel" aria-label="Finance workspace" hidden></section>
         <section id="note-panel" class="note-panel" role="tabpanel" aria-label="Active note">
           <div class="workspace-topline">
             <div id="breadcrumb" class="breadcrumb" aria-label="Note location"></div>
@@ -76,6 +84,20 @@ export function startApp(mount: HTMLElement) {
   const noteMenuButton = get<HTMLButtonElement>('note-actions');
   const saveStatus = get('save-status');
   const warning = get('storage-warning');
+  function applicationSettings() { openSettings(store, finance.accounts(), { reload: reloadFiles, chooseFolder: switchFolder, exportNotes, importNotes }); }
+  const finance = createFinance(get('finance-panel'), () => store.workspace.settings, applicationSettings, name => store.configure({ financeDefaultAccount: name }));
+  let showingFinance = false;
+  function section(isFinance: boolean) {
+    commitTitle(); showingFinance = isFinance;
+    get('notes-section').setAttribute('aria-pressed', String(!isFinance));
+    get('finance-section').setAttribute('aria-pressed', String(isFinance));
+    if (isFinance) finance.show(); else finance.hide();
+    renderNote();
+    if (isFinance) document.title = 'Finance — Noter';
+    try { localStorage.setItem('noter.section', isFinance ? 'finance' : 'notes'); } catch { /* Navigation still works without storage. */ }
+  }
+  get('notes-section').onclick = () => section(false);
+  get('finance-section').onclick = () => section(true);
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let titleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -89,15 +111,27 @@ export function startApp(mount: HTMLElement) {
     clearTimeout(toastTimer); toastTimer = setTimeout(() => { notification.hidden = true; }, 2400);
   }
 
-  function saveNow() {
+  let editVersion = 0, unsaved = false, applyingDisk = false, polling = false;
+  async function saveNow() {
     clearTimeout(saveTimer);
     if (loaded.warning && !changedSinceLoad) return false;
-    const success = storage.save(store.workspace);
-    saveStatus.dataset.state = success ? 'saved' : 'error';
-    get('save-label').textContent = success ? 'Saved locally' : 'Couldn’t save';
-    if (!success) { warning.textContent = 'Your changes are still in memory. Browser storage is unavailable or full; keep this page open until you can save.'; warning.hidden = false; }
-    else { loaded.warning = undefined; warning.hidden = true; }
-    return success;
+    const version = editVersion;
+    try {
+      const success = await storage.save(store.workspace);
+      if (version === editVersion) {
+        unsaved = !success;
+        saveStatus.dataset.state = success ? 'saved' : 'error';
+        get('save-label').textContent = success ? (desktop ? 'Saved to folder' : 'Saved locally') : 'Couldn’t save';
+        if (!success) { warning.textContent = 'Your changes are still in memory. Storage is unavailable or full; keep Noter open until you can save.'; warning.hidden = false; }
+        else { loaded.warning = undefined; warning.hidden = true; }
+      }
+      return success;
+    } catch (error) {
+      unsaved = true; saveStatus.dataset.state = 'error'; get('save-label').textContent = 'Couldn’t save';
+      warning.replaceChildren(el('span', '', String(error)));
+      if (desktop) { const reload = el('button', 'button-secondary', 'Review synced changes'); reload.onclick = () => void reloadFiles(); warning.append(reload); }
+      warning.hidden = false; return false;
+    }
   }
 
   function scheduleSave() {
@@ -111,29 +145,45 @@ export function startApp(mount: HTMLElement) {
     if (shownNoteId && store.workspace.nodes[shownNoteId] && title.value.trim() && title.value.trim() !== store.workspace.nodes[shownNoteId].name) store.rename(shownNoteId, title.value);
   }
 
-  function open(id: string) { commitTitle(); store.open(id); }
+  function open(id: string) { section(false); store.open(id); }
 
-  function createNote(parentId: string | null) {
-    commitTitle();
-    store.create('note', 'Untitled', parentId);
-    title.focus(); title.select();
+  let creatingNote = false;
+  async function createNote(parentId: string | null) {
+    if (creatingNote) return;
+    creatingNote = true;
+    try {
+      commitTitle();
+      const parent = parentId ? store.workspace.nodes[parentId]?.name : null;
+      const answer = await askDialog({
+        title: 'Create a note',
+        description: parent ? `Add a new note inside ${parent}.` : 'Give your next idea a name.',
+        fields: [{ name: 'name', label: 'Note name', placeholder: 'What’s on your mind?' }],
+        submit: 'Create note', nameEmoji: true,
+      });
+      if (!answer) return;
+      section(false);
+      store.create('note', answer.name, parentId);
+      editor.focus();
+    } finally {
+      creatingNote = false;
+    }
   }
 
   async function createFolder(parentId: string | null) {
     const parent = parentId ? store.workspace.nodes[parentId]?.name : null;
-    const answer = await askDialog({ title: 'A home for your notes', description: parent ? `Create a folder inside ${parent}.` : 'Create a folder in your workspace.', fields: [{ name: 'name', label: 'Folder name', placeholder: 'A new collection' }], submit: 'Create folder' });
+    const answer = await askDialog({ title: 'A home for your notes', description: parent ? `Create a folder inside ${parent}.` : 'Create a folder in your workspace.', fields: [{ name: 'name', label: 'Folder name', placeholder: 'A new collection' }], submit: 'Create folder', nameEmoji: true });
     if (answer) store.create('folder', answer.name, parentId);
   }
 
   async function rename(node: WorkspaceNode) {
-    const answer = await askDialog({ title: `Rename ${node.type}`, fields: [{ name: 'name', label: node.type === 'note' ? 'Note title' : 'Folder name', value: node.name }], submit: 'Rename' });
+    const answer = await askDialog({ title: `Rename ${node.type}`, fields: [{ name: 'name', label: node.type === 'note' ? 'Note title' : 'Folder name', value: node.name }], submit: 'Rename', nameEmoji: true });
     if (answer) store.rename(node.id, answer.name);
   }
 
   async function remove(node: WorkspaceNode) {
     const confirmed = await askDialog({
       title: `Delete “${node.name}”?`,
-      description: node.type === 'folder' ? 'This folder and every note inside it will be permanently removed.' : 'This note will be permanently removed from your workspace.',
+      description: node.type === 'folder' ? desktop ? 'This folder will be removed from the workspace. Its notes are kept in .noter/trash.' : 'This folder and every note inside it will be permanently removed.' : desktop ? 'This note will move to .noter/trash in your workspace folder.' : 'This note will be permanently removed from your workspace.',
       submit: `Delete ${node.type}`, danger: true,
     });
     if (confirmed) { store.remove(node.id); saveNow(); }
@@ -152,7 +202,7 @@ export function startApp(mount: HTMLElement) {
   });
   const tree = createTree(get('file-tree'), store, { open, menu: nodeMenu, createNote });
   const tabs = createTabs(get('tabs'), store, open);
-  const search = createSearch(get<HTMLInputElement>('search'), get<HTMLButtonElement>('clear-search'), get('search-results'), get('file-tree'), get('tree-label'), store, open);
+  const search = createSearch(get<HTMLInputElement>('search'), get<HTMLButtonElement>('clear-search'), get('search-results'), get('file-tree'), get('tree-label'), get('search-filters'), store, open);
 
   function updateStats() {
     const walker = document.createTreeWalker(editorRoot, NodeFilter.SHOW_TEXT, { acceptNode: node => node.parentElement?.closest('.database-block') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
@@ -168,8 +218,9 @@ export function startApp(mount: HTMLElement) {
 
   function renderNote() {
     const note = store.activeNote;
-    panel.hidden = !note; get('workspace-empty').hidden = !!note;
+    panel.hidden = showingFinance || !note; get('workspace-empty').hidden = showingFinance || !!note;
     get('breadcrumb').replaceChildren();
+    get('document').querySelector<HTMLElement>('.document-symbol')!.hidden = !!note && !!nameEmoji(note.name);
     if (note) {
       const crumbs = ['Personal workspace', ...store.path(note.id), `${note.name}.md`];
       crumbs.forEach((name, index) => {
@@ -187,6 +238,7 @@ export function startApp(mount: HTMLElement) {
       if (note) animateDocument(documentPage);
     }
     updateStats();
+    if (showingFinance) document.title = 'Finance — Noter';
   }
 
   function renderCount() {
@@ -194,16 +246,17 @@ export function startApp(mount: HTMLElement) {
   }
 
   store.subscribe(change => {
-    changedSinceLoad = true;
+    if (applyingDisk) { editor.reset(); tree.reset(); scrollPositions.clear(); shownNoteId = null; applySettings(store.workspace.settings); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); return; }
+    editVersion++; unsaved = true; changedSinceLoad = true;
     if (change === 'reset') {
       clearTimeout(titleTimer); editor.reset(); tree.reset(); scrollPositions.clear(); shownNoteId = null;
-      applySettings(store.workspace.settings); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); saveNow(); return;
+      applySettings(store.workspace.settings); finance.refresh(); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); saveNow(); return;
     }
     if (change === 'structure') { tree.render(); tabs.render(); search.render(); renderNote(); renderCount(); }
     if (change === 'tabs') { tabs.render(); tree.activeState(); renderNote(); search.render(); }
     if (change === 'folders') tree.folderState();
     if (change === 'content') { updateStats(); if (get<HTMLInputElement>('search').value.trim()) search.render(); }
-    if (change === 'settings') applySettings(store.workspace.settings);
+    if (change === 'settings') { applySettings(store.workspace.settings); finance.refresh(); }
     scheduleSave();
   });
 
@@ -219,7 +272,7 @@ export function startApp(mount: HTMLElement) {
   get('new-note').onclick = () => createNote(tree.destination);
   get('new-folder').onclick = () => void createFolder(tree.destination);
   get('empty-create').onclick = () => createNote(null);
-  get('settings').onclick = () => openSettings(store);
+  get('settings').onclick = applicationSettings;
   noteMenuButton.onclick = () => {
     commitTitle();
     const note = store.activeNote; if (!note) return;
@@ -233,16 +286,77 @@ export function startApp(mount: HTMLElement) {
     if (document.querySelector('dialog[open]')) return;
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
     switch (event.key.toLowerCase()) {
-      case 's': event.preventDefault(); commitTitle(); if (saveNow()) notify('Saved on this device'); break;
-      case 'f': event.preventDefault(); search.focus(); break;
+      case 's': event.preventDefault(); commitTitle(); void saveNow().then(success => { if (success) notify(desktop ? 'Saved to workspace folder' : 'Saved on this device'); }); break;
+      case 'f': event.preventDefault(); if (showingFinance) finance.focusSearch(); else search.focus(); break;
       case 'n': event.preventDefault(); createNote(tree.destination); break;
       case 'w': if (store.activeNote) { event.preventDefault(); commitTitle(); void tabs.close(store.activeNote.id); } break;
     }
   });
-  window.addEventListener('beforeunload', () => { commitTitle(); saveNow(); });
+  if (!desktop) window.addEventListener('beforeunload', () => { commitTitle(); saveNow(); });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { commitTitle(); saveNow(); } });
 
+  async function exportNotes() {
+    commitTitle();
+    await writeDocument('noter-notes-backup.json', new TextEncoder().encode(JSON.stringify(store.workspace, null, 2)), 'application/json');
+  }
+  async function importNotes() {
+    const file = await readDocument('json'); if (!file) return;
+    const next = validateWorkspace(JSON.parse(new TextDecoder().decode(file.bytes)));
+    const answer = await askDialog({ title: 'Restore notes backup?', description: 'Replace notes, folders, and settings with this backup. Finance is kept. Export your current notes first if you need them.', submit: 'Restore notes', danger: true });
+    if (answer) { store.replace(next); await saveNow(); }
+  }
+  async function switchFolder() {
+    commitTitle(); if (!await saveNow() || finance.isBusy()) { notify('Finish saving your changes before switching folders.'); return; }
+    try { await flushFiles(); if (await chooseFolder()) location.reload(); } catch (error) { notify(String(error)); }
+  }
+  async function reloadFiles() {
+    if (!desktop || polling || finance.isBusy()) return;
+    commitTitle(); clearTimeout(saveTimer);
+    if (unsaved) {
+      const exported = await askDialog({ title: 'Review synced changes', description: 'Your unsaved notes will be exported to a backup before reloading the folder. Finance records on disk will also be reloaded. Cancel to keep editing.', submit: 'Back up edits and reload' });
+      if (!exported || !await writeDocument('noter-unsaved-notes.json', new TextEncoder().encode(JSON.stringify(store.workspace, null, 2)), 'application/json')) return;
+    }
+    polling = true;
+    try {
+      await flushFiles().catch(() => {});
+      const version = editVersion;
+      const snapshot = await readWorkspaceSnapshot();
+      if (version !== editVersion) { notify('Finish editing before reloading synced files.'); return; }
+      const next = validateWorkspace(snapshot.workspace); adoptWorkspaceSnapshot(snapshot); applyingDisk = true; store.replace(next); applyingDisk = false; unsaved = false; loaded.warning = undefined;
+      await finance.reload(); warning.hidden = true; saveStatus.dataset.state = 'saved'; get('save-label').textContent = 'Synced files loaded'; notify('Workspace reloaded from files');
+    } catch (error) { warning.textContent = String(error); warning.hidden = false; }
+    finally { applyingDisk = false; polling = false; }
+  }
+  if (desktop) {
+    document.documentElement.dataset.desktop = 'true';
+    const currentWindow = getCurrentWindow();
+    await currentWindow.onCloseRequested(async event => {
+      event.preventDefault(); commitTitle();
+      if (finance.isBusy()) { notify('Wait for Finance to finish saving before closing.'); return; }
+      if (!await saveNow()) return;
+      try { await flushFiles(); await currentWindow.destroy(); } catch (error) { notify(String(error)); }
+    });
+    await listen<string>('desktop-command', event => {
+      if (event.payload === 'quit') { void currentWindow.close(); return; }
+      if (document.querySelector('dialog[open]')) return;
+      if (event.payload === 'new-note') void createNote(tree.destination);
+      if (event.payload === 'settings') applicationSettings();
+      if (event.payload === 'save') { commitTitle(); void saveNow(); }
+      if (event.payload === 'folder') void switchFolder();
+      if (event.payload === 'reload') void reloadFiles();
+    });
+    setInterval(() => {
+      if (polling || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
+      void Promise.allSettled([workspaceChanged(), financeChanged()]).then(results => {
+        if (results.some(result => result.status === 'fulfilled' && result.value)) { void reloadFiles(); return; }
+        const failed = results.find(result => result.status === 'rejected');
+        if (failed?.status === 'rejected') { warning.textContent = `Could not check synced files: ${String(failed.reason)}`; warning.hidden = false; }
+      });
+    }, 5000);
+  }
+
   applySettings(store.workspace.settings); tree.render(); tabs.render(); renderNote(); renderCount();
+  try { const startup = store.workspace.settings.startupSection; if ((startup === 'last' ? localStorage.getItem('noter.section') : startup) === 'finance') section(true); } catch { if (store.workspace.settings.startupSection === 'finance') section(true); }
   if (loaded.warning) { warning.textContent = loaded.warning; warning.hidden = false; }
   else saveNow();
 }

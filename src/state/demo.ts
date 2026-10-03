@@ -1,13 +1,6 @@
-import type { Workspace, Settings } from '../types';
-
-export const defaultSettings: Settings = {
-  fontSize: 18,
-  fontStyle: 'sans',
-  documentWidth: 790,
-  density: 'comfortable',
-  motion: 'full',
-  autosaveDelay: 650,
-};
+import type { Workspace } from '../types';
+import { defaultSettings } from '../settings/model';
+export { defaultSettings } from '../settings/model';
 
 export function emptyWorkspace(): Workspace {
   return {

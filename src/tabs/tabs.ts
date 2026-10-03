@@ -1,6 +1,7 @@
 import type { Store } from '../state/workspace';
 import { button, el } from '../ui/dom';
 import { icon } from '../ui/icons';
+import { nameEmoji } from '../ui/emoji';
 import { animateOut } from '../ui/motion';
 
 export function createTabs(container: HTMLElement, store: Store, open: (id: string) => void) {
@@ -42,7 +43,8 @@ export function createTabs(container: HTMLElement, store: Store, open: (id: stri
         const control = button(note.name, 'tab-control'); control.dataset.id = id;
         control.setAttribute('role', 'tab'); control.setAttribute('aria-selected', String(active));
         control.setAttribute('aria-controls', 'note-panel'); control.tabIndex = active ? 0 : -1;
-        control.append(icon('note'), el('span', 'tab-label', note.name));
+        if (!nameEmoji(note.name)) control.append(icon('note'));
+        control.append(el('span', 'tab-label', note.name));
         control.onclick = () => open(id);
         const dismiss = button(`Close ${note.name}`, 'tab-close'); dismiss.append(icon('close'));
         dismiss.onclick = () => void close(id); tab.append(control, dismiss); container.append(tab);

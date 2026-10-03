@@ -1,3 +1,4 @@
+import { copyText, openExternal } from '../desktop/platform';
 import { el, button } from '../ui/dom';
 import { icon } from '../ui/icons';
 import { askDialog } from '../ui/dialog';
@@ -124,7 +125,7 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
           if (!current || !root.contains(pre)) return;
           clearTimeout(current.timer); copy.disabled = true;
           try {
-            await navigator.clipboard.writeText(pre.textContent ?? '');
+            await copyText(pre.textContent ?? '');
             label.textContent = 'Copied'; copy.replaceChild(icon('check'), copy.firstChild!);
             copy.dataset.state = 'copied';
           } catch {
@@ -671,7 +672,7 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     const link = (event.target as Element).closest('a');
     if (link) {
       event.preventDefault();
-      if (event.metaKey || event.ctrlKey) { const href = safeUrl(link.href); if (href) window.open(href, '_blank', 'noopener,noreferrer'); }
+      if (event.metaKey || event.ctrlKey) { const href = safeUrl(link.href); if (href) void openExternal(href).catch(() => {}); }
     }
   });
 

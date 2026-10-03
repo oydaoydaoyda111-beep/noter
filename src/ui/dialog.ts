@@ -1,6 +1,7 @@
 import { button, el } from './dom';
 import { icon } from './icons';
 import { animateOut } from './motion';
+import { createNameEmojiPicker } from './emoji';
 
 interface DialogOptions {
   title: string;
@@ -8,6 +9,7 @@ interface DialogOptions {
   fields?: { name: string; label: string; value?: string; placeholder?: string; type?: string }[];
   submit: string;
   danger?: boolean;
+  nameEmoji?: boolean;
 }
 
 export function askDialog(options: DialogOptions): Promise<Record<string, string> | null> {
@@ -33,8 +35,12 @@ export function askDialog(options: DialogOptions): Promise<Record<string, string
       input.required = true;
       input.maxLength = field.name === 'name' ? 120 : 2000;
       input.autocomplete = 'off';
+      input.addEventListener('input', () => {
+        input.setCustomValidity(input.value.trim() ? '' : 'Please enter a name or value.');
+      });
       label.append(input);
       form.append(label);
+      if (options.nameEmoji && field.name === 'name') form.append(createNameEmojiPicker(input));
     }
     const actions = el('div', 'dialog-actions');
     const cancel = button('Cancel', 'button-secondary');

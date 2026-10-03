@@ -1,13 +1,22 @@
 import { button, el } from '../ui/dom';
 import { icon } from '../ui/icons';
-import { monthKey, type Cell, type Column, type NoteDatabase, type Row } from './model';
+import { visibleColumns, optionColor, optionPalette, monthKey, type Cell, type Column, type NoteDatabase, type Row } from './model';
 
 export interface ViewActions {
+  selectedRows: Set<string>;
+  selectRow(row: Row, selected: boolean): void;
   editRow(row: Row): void;
   addRow(defaults?: Record<string, Cell>): void;
   moveRow(row: Row, column: Column, value: string): void;
   changeMonth(month: string, control: 'previous' | 'next' | 'today'): void;
   addProperty(type: 'date' | 'select'): void;
+}
+
+function recordSelection(data: NoteDatabase, row: Row, actions: ViewActions): HTMLInputElement {
+  const control = el('input', 'database-record-select'); control.type = 'checkbox'; control.checked = actions.selectedRows.has(row.id);
+  control.dataset.selectionId = row.id; control.setAttribute('aria-label', `Select ${recordTitle(data, row)}`);
+  control.onchange = () => actions.selectRow(row, control.checked);
+  return control;
 }
 
 export function recordTitle(data: NoteDatabase, row: Row): string {
@@ -30,8 +39,8 @@ export function kanbanView(data: NoteDatabase, rows: Row[], actions: ViewActions
   const board = el('div', 'database-board');
   const groups = [...new Set(['', ...column.options, ...data.rows.map(row => String(row.cells[column.id] ?? ''))])];
   let dragged: Row | null = null;
-  for (const [index, group] of groups.entries()) {
-    const lane = el('section', 'database-lane'); lane.style.setProperty('--lane-color', ['#91a2b4', '#c3ae89', '#8bb1cc', '#94b7a2', '#b3a1c2'][index % 5]);
+  for (const group of groups) {
+    const lane = el('section', 'database-lane'); lane.style.setProperty('--lane-color', optionPalette[optionColor(column, group)]);
     lane.setAttribute('aria-label', `${group || 'Unassigned'} lane`);
     const members = rows.filter(row => String(row.cells[column.id] ?? '') === group);
     const header = el('div', 'database-lane-header');
@@ -42,10 +51,11 @@ export function kanbanView(data: NoteDatabase, rows: Row[], actions: ViewActions
     for (const row of members) {
       const card = el('article', 'database-card'); card.draggable = true; card.dataset.rowId = row.id;
       const edit = button(`Edit ${recordTitle(data, row)}`, 'database-card-open');
-      edit.textContent = recordTitle(data, row); edit.onclick = () => actions.editRow(row); card.append(edit);
+      edit.textContent = recordTitle(data, row); edit.onclick = () => actions.editRow(row);
+      const cardHeader = el('div', 'database-card-header'); cardHeader.append(recordSelection(data, row, actions), edit); card.append(cardHeader); card.classList.toggle('is-selected', actions.selectedRows.has(row.id));
       const details = el('div', 'database-card-details');
       const primary = data.columns.find(item => item.type === 'text') ?? data.columns[0];
-      for (const property of data.columns.filter(item => item.id !== column.id && item.id !== primary.id).slice(0, 3)) {
+      for (const property of visibleColumns(data).filter(item => item.id !== column.id && item.id !== primary.id).slice(0, 3)) {
         const value = row.cells[property.id];
         if (value === '' || value === null || value === false) continue;
         const detail = el('span', '', property.type === 'checkbox' ? `✓ ${property.name}` : String(value));
@@ -120,7 +130,9 @@ export function calendarView(data: NoteDatabase, rows: Row[], actions: ViewActio
     add.onclick = () => actions.addRow({ [column.id]: key }); header.append(add); day.append(header);
     for (const row of byDate.get(key) ?? []) {
       const event = button(`Edit ${recordTitle(data, row)} on ${key}`, 'database-calendar-event'); event.textContent = recordTitle(data, row);
-      event.onclick = () => actions.editRow(row); day.append(event);
+      event.onclick = () => actions.editRow(row);
+      const record = el('div', 'database-calendar-record'); record.dataset.rowId = row.id; record.classList.toggle('is-selected', actions.selectedRows.has(row.id));
+      record.append(recordSelection(data, row, actions), event); day.append(record);
     }
     grid.append(day);
   }
@@ -133,7 +145,9 @@ export function calendarView(data: NoteDatabase, rows: Row[], actions: ViewActio
   if (!undated.length) unscheduled.append(el('p', '', data.filter.trim() ? 'No matching undated records.' : 'Every record has a date.'));
   for (const row of undated) {
     const item = button(`Schedule ${recordTitle(data, row)}`, 'database-calendar-event'); item.textContent = recordTitle(data, row);
-    item.onclick = () => actions.editRow(row); unscheduled.append(item);
+    item.onclick = () => actions.editRow(row);
+    const record = el('div', 'database-calendar-record'); record.dataset.rowId = row.id; record.classList.toggle('is-selected', actions.selectedRows.has(row.id));
+    record.append(recordSelection(data, row, actions), item); unscheduled.append(record);
   }
   calendar.append(unscheduled); return calendar;
 }

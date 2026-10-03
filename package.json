@@ -7,13 +7,26 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
+    "tauri": "node scripts/tauri.mjs",
+    "dev:desktop": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "desktop:dev": "node scripts/tauri.mjs dev",
+    "desktop:build": "node scripts/tauri.mjs build",
+    "desktop:test": "node scripts/tauri.mjs test-rust",
+    "desktop:package": "npm run desktop:build && node scripts/package-macos.mjs"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1",
+    "@xmldom/xmldom": "^0.9.12",
     "typescript": "~5.9.3",
     "vite": "^8.0.0"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/plugin-clipboard-manager": "^2.4.1",
+    "@tauri-apps/plugin-opener": "^2.7.0",
+    "fflate": "^0.8.3",
     "highlight.js": "^11.12.0"
   }
 }

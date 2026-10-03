@@ -2,6 +2,7 @@ import type { Store } from '../state/workspace';
 import type { WorkspaceNode } from '../types';
 import { button, el, emptyState } from '../ui/dom';
 import { icon } from '../ui/icons';
+import { nameEmoji } from '../ui/emoji';
 
 export interface TreeActions {
   open: (id: string) => void;
@@ -25,10 +26,12 @@ export function createTree(container: HTMLElement, store: Store, actions: TreeAc
     control.setAttribute('aria-level', String(depth + 1));
     if (node.type === 'folder') {
       control.setAttribute('aria-expanded', String(!store.workspace.collapsedFolders.includes(id)));
-      control.append(icon('chevron'), icon('folder'));
+      control.append(icon('chevron'));
+      if (!nameEmoji(node.name)) control.append(icon('folder'));
     } else {
       control.setAttribute('aria-selected', String(store.workspace.activeNoteId === id));
-      control.append(el('span', 'tree-spacer'), icon('note'));
+      control.append(el('span', 'tree-spacer'));
+      if (!nameEmoji(node.name)) control.append(icon('note'));
       row.classList.toggle('is-active', store.workspace.activeNoteId === id);
     }
     const label = el('span', 'tree-label', node.name);

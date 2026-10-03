@@ -1,4 +1,5 @@
 import type { Change, Folder, Note, Settings, Workspace, WorkspaceNode } from '../types';
+import { normalizeSettings } from '../settings/model';
 
 export function createStore(initial: Workspace) {
   let workspace = initial;
@@ -98,7 +99,7 @@ export function createStore(initial: Workspace) {
       emit('content', id);
     },
     configure(settings: Partial<Settings>) {
-      Object.assign(workspace.settings, settings);
+      workspace.settings = normalizeSettings({ ...workspace.settings, ...settings });
       emit('settings');
     },
     replace(next: Workspace) {

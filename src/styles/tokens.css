@@ -39,6 +39,9 @@
 }
 
 :root[data-density='compact'] { --row-height: 34px; }
+:root[data-accent='green'] { --accent: #b0d4ba; --accent-dim: rgba(156, 205, 169, .12); }
+:root[data-accent='purple'] { --accent: #c5b6e4; --accent-dim: rgba(183, 155, 225, .12); }
+:root[data-note-stats='false'] #document-stats { visibility: hidden; }
 :root[data-motion='subtle'] { --motion-fast: 100ms; --motion-normal: 140ms; }
 :root[data-motion='none'] { --motion-fast: 0ms; --motion-normal: 0ms; }
 :root[data-editor-font='serif'] { --font-document: var(--font-serif); --font-document-display: var(--font-serif); }
