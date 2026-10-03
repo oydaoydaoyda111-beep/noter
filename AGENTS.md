@@ -2,6 +2,8 @@
 
 ## Project
 
+Read `MEMORY.md` for established product decisions, completed work, and known limitations. Keep that file concise and current when decisions change; do not store secrets or private financial records.
+
 Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript, Vite, and native DOM APIs. It includes a Markdown editor, folders, tabs, search, settings, and embedded databases with table, kanban, and calendar views. Desktop notes are Markdown files in a user-selected folder. Shared metadata and Finance JSON/Excel files live in `.noter` for Syncthing. There is no backend. The browser preview retains legacy localStorage/IndexedDB for development and migration.
 
 ## Setup and commands
@@ -10,6 +12,7 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - Use a Node.js version supported by the locked Vite release; Node.js 24 works with this project.
 - `npm run desktop:dev` launches Tauri with its fixed Vite port 1420.
 - `npm run desktop:build` builds native bundles; platform prerequisites are required.
+- `npm run desktop:package` builds the app and creates a DMG on macOS without Finder automation.
 - `npm run desktop:test` runs Rust vault regression tests.
 - `npm run dev` starts the development server on localhost.
 - `npm run check` checks TypeScript without generating files.
