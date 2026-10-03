@@ -36,24 +36,25 @@ Your workspace/
     Notes App.md
   .noter/
     workspace.json
-    finance.json
+    finance/
+      log-<device>.jsonl
     finance-template.xlsx
     trash/
 ```
 
 - Notes are UTF-8 `.md` files. Folders and emoji filenames are preserved. Filename characters unsupported on Windows are normalized when saving. Embedded Noter databases remain fenced `noter-database` blocks inside their Markdown notes.
 - `.noter/workspace.json` contains note IDs, file paths, ordering, tabs, and preferences, without duplicating note content.
-- `.noter/finance.json` contains accounts, category definitions, defaults, and transactions. Amounts are signed integer cents. Its schema is version 1 and it includes a SHA-256 fingerprint of the workbook template.
+- `.noter/finance/log-<device>.jsonl` holds Finance as one append-only change log per device: accounts, category definitions, defaults, and transactions. Each device writes only its own log, so Syncthing never creates conflicting copies; every device replays all logs, and the latest change wins per transaction or setting. Amounts are signed integer cents. A former `.noter/finance.json` is migrated once and moved to `.noter/trash`.
 - `.noter/finance-template.xlsx` preserves the imported workbook's other sheets and formatting for Excel exports. Import through Finance once; export `.xlsx` backups with the native save dialog. Don't edit this template directly: reimport a changed workbook through Noter.
 - `.noter/trash` keeps prior note versions, removed notes, and Finance snapshots. These are ordinary files you can copy back manually. It can grow over time; manage it yourself when backups are no longer needed.
 
 Sync the **whole workspace folder, including `.noter`**. Syncthing performs the synchronization; Noter does not upload anything or require an account. If you have custom ignore rules, make sure they do not exclude `.noter` or its Finance template. App binaries, development caches, and the device's chosen-folder configuration are outside the workspace and should not be synced.
 
-Noter checks for incoming changes every five seconds when there are no unsaved edits or open dialogs. You can also use File → Reload Synced Files. Saves check the disk revision before writing. If your unsaved notes conflict with incoming files, Noter offers to export the edits before reloading. Markdown conflict copies remain visible as separate notes. Finance conflict copies in `.noter` block Finance writes until resolved; automatic record merging is not implemented. Let synchronization finish before opening Finance on another device, and avoid editing the same data concurrently on multiple devices.
+Noter checks for incoming changes every five seconds when there are no unsaved edits or open dialogs. You can also use File → Reload Synced Files. Saves check the disk revision before writing. If your unsaved notes conflict with incoming files, Noter offers to export the edits before reloading. Markdown conflict copies remain visible as separate notes. Finance changes from different devices merge automatically through the per-device logs; if two devices edit the same transaction before syncing, the later edit wins.
 
 File storage, safe-path checks, revision hashing, recovery snapshots, and Excel ZIP compression/decompression run in Rust. Native workbook archive processing runs on worker threads; the desktop UI does not load the browser ZIP library.
 
-Each file is replaced atomically. A workspace involves multiple files, so an interrupted sync or crash can still leave a partial set temporarily. Finance waits if its template and JSON fingerprints differ. Keep regular Excel/notes backups and Syncthing versioning if you want additional recovery.
+Each file is replaced atomically. A workspace involves multiple files, so an interrupted sync or crash can still leave a partial set temporarily. Finance waits if its template and log fingerprints differ. Keep regular Excel/notes backups and Syncthing versioning if you want additional recovery.
 
 Existing hidden files, symlinks, non-Markdown files, and `node_modules` are not imported as notes. A workspace supports up to 10,000 notes/folders, 10 MB per note, and 100 MB of Markdown content.
 

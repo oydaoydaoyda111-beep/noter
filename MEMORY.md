@@ -4,7 +4,7 @@ Last updated: 2026-10-03. This is a durable handoff, not a feature backlog. Chec
 
 ## Product decisions and preferences
 
-- Noter is the user's main personal workspace. Tauri desktop is the primary product; the browser preview remains for development and migration. A future Kotlin mobile client is an intention, not implemented work.
+- Noter is the user's main personal workspace. Tauri desktop is the primary product; the browser preview remains for development and migration. A pure-Kotlin Android port (Jetpack Compose, no Tauri/Rust/TS) is being built in `android/`, staged: Stage 1 = SAF vault compatible with `.noter/workspace.json`, tree, tabs, plain-text editor, autosave, settings. Finance is ported (same log format, transactions/transfers, accounts, categories, filters, Finance settings, Notes/Finance bottom navigation); Excel import/export is deferred at the user's request, so Android can start Finance with an empty template. Notes use a live-styled Markdown editor (source stays Markdown; markers dimmed) with formatting toolbar, slash commands (no Database block yet), list/quote continuation, and undo/redo. Not yet ported: search, databases, moving notes. Builds with Android Studio's JBR and the Gradle 8.9 wrapper; verified on the Medium_Phone_API_36.1 emulator.
 - The user synchronizes files with Syncthing. Choose the workspace folder on first launch; keep notes readable as Markdown and shared app data in `.noter`. No hosted backend is needed.
 - Finance replaces routine Excel entry. Excel remains the backup/export format. Preserve imported workbook formatting, other sheets, formulas, transaction IDs, and transfers.
 - Prefer compact UI: small Finance row padding, compact account management, convenient category/subcategory selection and database property management.
@@ -23,7 +23,7 @@ Last updated: 2026-10-03. This is a durable handoff, not a feature backlog. Chec
 ## Persistence and important boundaries
 
 - `src-tauri/src/vault.rs` owns Markdown files, IDs/paths/order/settings in `.noter/workspace.json`, revision checks, safe paths, symlink restrictions, and recoverable snapshots in `.noter/trash`.
-- Finance is separate: `.noter/finance.json` (schema version 1, signed integer cents) plus the original `.noter/finance-template.xlsx`. A template fingerprint detects mismatched sync state. Never silently overwrite incoming synced changes.
+- Finance is separate: append-only per-device logs in `.noter/finance/log-<device>.jsonl` (format in `src/finance/log.ts`, mirrored by Android `FinanceLog.kt`; replay ordered by ts/dev/seq, last write wins, signed integer cents) plus the original `.noter/finance-template.xlsx`. Chosen by the user over single-file `finance.json` for lightweight saves and conflict-free Syncthing sync; legacy `finance.json` is migrated once into the log and moved to trash. Device IDs: desktop app config `device.json`, Android SharedPreferences. A template fingerprint detects mismatched sync state. No log compaction yet. Never silently overwrite incoming synced changes.
 - `src-tauri/src/archive.rs` processes bounded Excel ZIP archives on worker threads. `src/finance/archive.ts` uses native commands on desktop and lazily loads `fflate` in browser preview. Workbook export is asynchronous.
 - `src/desktop/platform.ts` coordinates native revisions and save queues. `src/app.ts` flushes pending work before closing and checks external changes every five seconds when safe to reload.
 - Browser legacy stores remain available for migration: notes in localStorage `noter.workspace.v1`, Finance in IndexedDB `noter.finance.v1`. Notes JSON backups exclude Finance; export Finance separately to Excel.
@@ -32,7 +32,7 @@ Last updated: 2026-10-03. This is a durable handoff, not a feature backlog. Chec
 ## Known limitations
 
 - Writes are atomic per file, not across the whole workspace. An interrupted operation or synchronization can temporarily leave a partial set.
-- Finance sync conflict copies block writes and require manual resolution; automatic record merging is not implemented. Markdown conflict copies appear as separate notes.
+- Finance merges per record (last write wins); concurrent edits to the same transaction keep only the later one. Logs grow without compaction. Markdown conflict copies appear as separate notes.
 - Recovery snapshots accumulate; no automatic retention management exists.
 - macOS bundles are locally ad-hoc signed, not notarized. Windows/Linux packages and a mobile client have not been verified or delivered.
 

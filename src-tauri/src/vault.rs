@@ -437,112 +437,130 @@ pub fn save(root: &Path, workspace: Value, expected: &str) -> Result<String> {
     atomic_write(&safe_path(root, ".noter/workspace.json")?, &bytes)?;
     revision(root)
 }
-fn check_finance_conflicts(root: &Path) -> Result<()> {
-    let folder = safe_path(root, ".noter")?;
-    if folder.exists() {
-        for entry in fs::read_dir(folder).map_err(|e| error("Could not inspect Finance sync", e))? {
-            let name = entry
-                .map_err(|e| error("Could not inspect Finance sync", e))?
-                .file_name()
-                .to_string_lossy()
-                .to_string();
-            if name.starts_with("finance.sync-conflict-") && name.ends_with(".json") {
-                return Err("Finance has a Syncthing conflict copy in .noter. Keep both files and resolve the conflict before editing Finance.".into());
-            }
-        }
-    }
-    Ok(())
+const FINANCE_LOGS: &str = ".noter/finance";
+const FINANCE_LEGACY: &str = ".noter/finance.json";
+const FINANCE_TEMPLATE: &str = ".noter/finance-template.xlsx";
+const MAX_FINANCE_LOGS: u64 = 100_000_000;
+fn millis(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_millis())
 }
-pub fn read_finance(root: &Path) -> Result<Option<Value>> {
-    check_finance_conflicts(root)?;
-    let path = safe_path(root, ".noter/finance.json")?;
-    match fs::read(&path) {
-        Ok(bytes) => {
-            let mut data: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| "Finance data could not be read. Your files have been kept.")?;
-            let template = safe_path(root, ".noter/finance-template.xlsx")?;
-            let bytes =
-                fs::read(template).map_err(|e| error("Could not read Finance workbook", e))?;
-            if data["templateSha256"]
-                .as_str()
-                .is_some_and(|hash| hash != format!("{:x}", Sha256::digest(&bytes)))
-            {
-                return Err("Finance workbook is still syncing or was changed independently. Wait for Syncthing to finish and reload.".into());
-            }
-            data.as_object_mut()
-                .ok_or("Invalid Finance data.")?
-                .remove("templateSha256");
-            data["template"] = json!(bytes);
-            Ok(Some(data))
+/// Finance log files, sorted by name. Each device appends only to its own `log-<device>.jsonl`.
+fn finance_logs(root: &Path) -> Result<Vec<(String, PathBuf, fs::Metadata)>> {
+    let folder = safe_path(root, FINANCE_LOGS)?;
+    let entries = match fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(error("Could not read Finance logs", e)),
+    };
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| error("Could not read Finance logs", e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|e| error("Could not inspect Finance logs", e))?;
+        if name.starts_with('.') || !name.ends_with(".jsonl") || !metadata.is_file() {
+            continue;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(error("Could not read Finance", e)),
+        result.push((name, entry.path(), metadata));
     }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(result)
 }
 pub fn finance_revision(root: &Path) -> Result<String> {
-    check_finance_conflicts(root)?;
     let mut hash = Sha256::new();
-    for name in [".noter/finance.json", ".noter/finance-template.xlsx"] {
-        match fs::read(safe_path(root, name)?) {
-            Ok(bytes) => hash.update(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => hash.update([0]),
+    for (name, _, metadata) in finance_logs(root)? {
+        hash.update(format!("{name}\0{}\0{}\n", metadata.len(), millis(&metadata)));
+    }
+    for name in [FINANCE_LEGACY, FINANCE_TEMPLATE] {
+        match fs::metadata(safe_path(root, name)?) {
+            Ok(metadata) => {
+                hash.update(format!("{name}\0{}\0{}\n", metadata.len(), millis(&metadata)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                hash.update(format!("{name}\0-\n"))
+            }
             Err(e) => return Err(error("Could not check Finance files", e)),
         }
     }
     Ok(format!("{:x}", hash.finalize()))
 }
-pub fn save_finance(
+/// Raw Finance files: every device log, the legacy single-file data (until migrated), and the Excel template.
+pub fn read_finance(root: &Path) -> Result<Value> {
+    let mut logs = Vec::new();
+    let mut total = 0;
+    for (name, path, metadata) in finance_logs(root)? {
+        total += metadata.len();
+        if total > MAX_FINANCE_LOGS {
+            return Err("Finance logs are larger than 100 MB.".into());
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|_| "A Finance log could not be read as UTF-8. Your files have been kept.")?;
+        logs.push(json!({"name": name, "text": text}));
+    }
+    let legacy = match fs::read(safe_path(root, FINANCE_LEGACY)?) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| "Finance data could not be read. Your files have been kept.")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(e) => return Err(error("Could not read Finance", e)),
+    };
+    let template = match fs::read(safe_path(root, FINANCE_TEMPLATE)?) {
+        Ok(bytes) => json!(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(e) => return Err(error("Could not read Finance workbook", e)),
+    };
+    Ok(json!({"logs": logs, "legacy": legacy, "template": template}))
+}
+/// Appends one batch line to this device's log. A replaced workbook template is written first,
+/// so a batch that references its fingerprint never exists without the template itself.
+pub fn append_finance(
     root: &Path,
-    mut data: Value,
-    template: &[u8],
-    expected: &str,
+    device: &str,
+    line: &str,
+    template: Option<&[u8]>,
+    retire_legacy: bool,
 ) -> Result<String> {
-    if finance_revision(root)? != expected {
-        return Err(
-            "SYNC_CONFLICT: Finance files changed outside Noter. Reload Finance before saving."
-                .into(),
-        );
-    }
-    if data["version"] != 1
-        || !data["transactions"].is_array()
-        || !data["accounts"].is_array()
-        || template.len() > 10_000_000
+    if device.is_empty() || device.len() > 64 || !device.chars().all(|c| c.is_ascii_alphanumeric())
     {
-        return Err("Invalid Finance data.".into());
+        return Err("Invalid device identifier.".into());
     }
-    data.as_object_mut()
-        .ok_or("Invalid Finance data.")?
-        .remove("template");
-    data["templateSha256"] = json!(format!("{:x}", Sha256::digest(template)));
-    let previous_json = safe_path(root, ".noter/finance.json")?;
-    let previous_template = safe_path(root, ".noter/finance-template.xlsx")?;
-    let old_template = fs::read(&previous_template).ok();
-    if let Ok(bytes) = fs::read(&previous_json) {
-        let backup = format!(".noter/trash/finance-{}-{}", now(), Uuid::new_v4());
-        atomic_write(&safe_path(root, &format!("{backup}/finance.json"))?, &bytes)?;
-        if let Some(bytes) = &old_template {
-            atomic_write(
-                &safe_path(root, &format!("{backup}/finance-template.xlsx"))?,
-                bytes,
-            )?;
+    let body = line.strip_prefix('\n').unwrap_or(line);
+    let record = body.strip_suffix('\n').ok_or("Invalid Finance change.")?;
+    if record.contains('\n')
+        || record.len() > 50_000_000
+        || serde_json::from_str::<Value>(record).map_or(true, |value| value["v"] != 1)
+    {
+        return Err("Invalid Finance change.".into());
+    }
+    if let Some(bytes) = template {
+        if bytes.len() > 10_000_000 {
+            return Err("Finance workbook is too large.".into());
         }
+        atomic_write(&safe_path(root, FINANCE_TEMPLATE)?, bytes)?;
     }
-    if finance_revision(root)? != expected {
-        return Err(
-            "SYNC_CONFLICT: Finance changed while preparing the save. Reload before saving.".into(),
-        );
-    }
-    atomic_write(&safe_path(root, ".noter/finance-template.xlsx")?, template)?;
-    if let Err(problem) = atomic_write(
-        &previous_json,
-        &serde_json::to_vec_pretty(&data).map_err(|e| error("Could not prepare Finance", e))?,
-    ) {
-        if let Some(bytes) = old_template {
-            let _ = atomic_write(&previous_template, &bytes);
-        } else {
-            let _ = fs::remove_file(&previous_template);
-        }
-        return Err(problem);
+    let path = safe_path(root, &format!("{FINANCE_LOGS}/log-{device}.jsonl"))?;
+    fs::create_dir_all(path.parent().ok_or("Invalid Finance location.")?)
+        .map_err(|e| error("Could not create Finance folder", e))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| error("Could not open Finance log", e))?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| error("Could not save Finance", e))?;
+    let legacy = safe_path(root, FINANCE_LEGACY)?;
+    if retire_legacy && legacy.is_file() {
+        let target = safe_path(
+            root,
+            &format!(".noter/trash/finance-migrated-{}-{}.json", now(), Uuid::new_v4()),
+        )?;
+        fs::create_dir_all(target.parent().ok_or("Invalid trash location.")?)
+            .map_err(|e| error("Could not create trash folder", e))?;
+        fs::rename(&legacy, &target).map_err(|e| error("Could not retire finance.json", e))?;
     }
     finance_revision(root)
 }
@@ -655,54 +673,35 @@ mod tests {
         assert!(!outside.path().join("workspace.json").exists());
     }
     #[test]
-    fn finance_is_file_based_and_checks_external_changes() {
+    fn finance_logs_append_per_device_and_retire_legacy_data() {
         let root = tempfile::tempdir().unwrap();
-        let revision = finance_revision(root.path()).unwrap();
-        let data = json!({"version":1,"accounts":[{"name":"Checking","note":""}],"transactions":[{"id":"example","cents":10,"account":"Checking"}],"categories":[],"sourceName":"sample.xlsx"});
-        let revision = save_finance(root.path(), data.clone(), &[1, 2, 3], &revision).unwrap();
-        let loaded = read_finance(root.path()).unwrap().unwrap();
+        let empty = finance_revision(root.path()).unwrap();
+        assert_eq!(read_finance(root.path()).unwrap()["logs"], json!([]));
+        fs::create_dir(root.path().join(".noter")).unwrap();
+        fs::write(root.path().join(".noter/finance.json"), r#"{"version":1}"#).unwrap();
+        let line = "{\"v\":1,\"ts\":1,\"dev\":\"abc\",\"seq\":1,\"ops\":[]}\n";
+        let revision = append_finance(root.path(), "abc", line, Some(&[1, 2, 3]), true).unwrap();
+        assert_ne!(revision, empty);
+        append_finance(root.path(), "abc", &format!("\n{line}"), None, false).unwrap();
+        let loaded = read_finance(root.path()).unwrap();
+        assert_eq!(loaded["logs"][0]["name"], "log-abc.jsonl");
+        assert_eq!(loaded["logs"][0]["text"], format!("{line}\n{line}"));
         assert_eq!(loaded["template"], json!([1, 2, 3]));
-        assert_eq!(loaded["transactions"], data["transactions"]);
-        fs::write(
-            root.path().join(".noter/finance.json"),
-            serde_json::to_vec(&json!({"version":1,"transactions":[],"accounts":[]})).unwrap(),
-        )
-        .unwrap();
-        assert!(
-            save_finance(root.path(), data, &[1, 2, 3], &revision)
-                .unwrap_err()
-                .contains("SYNC_CONFLICT")
-        );
+        assert_eq!(loaded["legacy"], Value::Null);
+        assert!(fs::read_dir(root.path().join(".noter/trash")).unwrap().next().is_some());
+        fs::write(root.path().join(".noter/finance/log-other.jsonl"), line).unwrap();
+        assert_ne!(finance_revision(root.path()).unwrap(), revision);
+        assert_eq!(read_finance(root.path()).unwrap()["logs"].as_array().unwrap().len(), 2);
     }
     #[test]
-    fn finance_waits_for_complete_sync_and_keeps_conflict_copies() {
+    fn finance_rejects_invalid_changes_and_devices() {
         let root = tempfile::tempdir().unwrap();
-        let data = json!({"version":1,"accounts":[],"transactions":[]});
-        let revision = finance_revision(root.path()).unwrap();
-        save_finance(root.path(), data.clone(), &[1, 2, 3], &revision).unwrap();
-        fs::write(root.path().join(".noter/finance-template.xlsx"), [4, 5, 6]).unwrap();
-        assert!(
-            read_finance(root.path())
-                .unwrap_err()
-                .contains("still syncing")
-        );
-        fs::write(root.path().join(".noter/finance-template.xlsx"), [1, 2, 3]).unwrap();
-        assert!(read_finance(root.path()).is_ok());
-        let conflict = root
-            .path()
-            .join(".noter/finance.sync-conflict-20261003-TEST.json");
-        fs::write(&conflict, serde_json::to_vec(&data).unwrap()).unwrap();
-        assert!(
-            finance_revision(root.path())
-                .unwrap_err()
-                .contains("conflict copy")
-        );
-        assert!(
-            read_finance(root.path())
-                .unwrap_err()
-                .contains("conflict copy")
-        );
-        assert!(conflict.exists());
+        let line = "{\"v\":1}\n";
+        assert!(append_finance(root.path(), "../x", line, None, false).is_err());
+        assert!(append_finance(root.path(), "abc", "{\"v\":1}", None, false).is_err());
+        assert!(append_finance(root.path(), "abc", "{\"v\":1}\n{}\n", None, false).is_err());
+        assert!(append_finance(root.path(), "abc", "not json\n", None, false).is_err());
+        assert!(!root.path().join(".noter/finance").exists());
     }
     #[test]
     fn existing_markdown_filename_spelling_is_preserved() {

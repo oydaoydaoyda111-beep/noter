@@ -70,28 +70,49 @@ async fn save_workspace(
 ) -> Result<String, String> {
     vault::save(&root(&state)?, workspace, &expected)
 }
+/// A random identifier for this installation; it names this device's Finance log file.
+fn device_id(app: &tauri::AppHandle) -> Result<String, String> {
+    let path = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "App settings are unavailable.")?
+        .join("device.json");
+    if let Some(id) = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|data| data["id"].as_str().map(str::to_string))
+    {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    vault::atomic_write(&path, &serde_json::to_vec(&json!({"id": id})).unwrap())?;
+    Ok(id)
+}
 #[tauri::command]
-async fn load_finance(state: State<'_, VaultState>) -> Result<Value, String> {
+async fn load_finance(app: tauri::AppHandle, state: State<'_, VaultState>) -> Result<Value, String> {
     let folder = root(&state)?;
     let revision = vault::finance_revision(&folder)?;
-    let finance = vault::read_finance(&folder)?;
+    let mut finance = vault::read_finance(&folder)?;
     if vault::finance_revision(&folder)? != revision {
         return Err("Finance changed while loading. Wait for synchronization and reload.".into());
     }
-    Ok(json!({"finance":finance, "revision":revision}))
+    finance["revision"] = json!(revision);
+    finance["device"] = json!(device_id(&app)?);
+    Ok(finance)
 }
 #[tauri::command]
 async fn finance_revision(state: State<'_, VaultState>) -> Result<String, String> {
     vault::finance_revision(&root(&state)?)
 }
 #[tauri::command]
-async fn save_finance(
+async fn append_finance(
+    app: tauri::AppHandle,
     state: State<'_, VaultState>,
-    data: Value,
-    template: Vec<u8>,
-    expected: String,
+    line: String,
+    template: Option<Vec<u8>>,
+    retire_legacy: bool,
 ) -> Result<String, String> {
-    vault::save_finance(&root(&state)?, data, &template, &expected)
+    vault::append_finance(&root(&state)?, &device_id(&app)?, &line, template.as_deref(), retire_legacy)
 }
 #[tauri::command]
 async fn open_document(app: tauri::AppHandle, extension: String) -> Result<Option<Value>, String> {
@@ -191,7 +212,7 @@ pub fn run() {
             save_workspace,
             workspace_revision,
             load_finance,
-            save_finance,
+            append_finance,
             finance_revision,
             open_document,
             save_document
