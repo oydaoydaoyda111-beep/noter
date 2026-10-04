@@ -29,14 +29,26 @@ function sameJSON(left: unknown, right: unknown): boolean {
   const first = left as Record<string, unknown>, second = right as Record<string, unknown>, keys = Object.keys(first);
   return keys.length === Object.keys(second).length && keys.every(key => Object.hasOwn(second, key) && sameJSON(first[key], second[key]));
 }
+/** The synced part of a workspace: view state stays on this device and edit times are not published. */
+function shared(workspace: unknown) {
+  if (!workspace || typeof workspace !== 'object') return workspace;
+  const { openTabs: _tabs, activeNoteId: _active, collapsedFolders: _folders, ...rest } = workspace as Record<string, unknown>;
+  const nodes = Object.fromEntries(Object.entries((rest.nodes ?? {}) as Record<string, Record<string, unknown>>)
+    .map(([id, { updatedAt: _updated, ...node }]) => [id, node]));
+  return { ...rest, nodes };
+}
 export function saveWorkspaceFile(workspace: unknown) {
   const snapshot: unknown = JSON.parse(JSON.stringify(workspace));
   const operation = workspaceQueue.catch(() => {}).then(async () => {
-    if (sameJSON(snapshot, workspaceBase)) return;
-    revision = await invoke<string>('save_workspace', { workspace: snapshot, expected: revision }); workspaceBase = snapshot;
+    if (sameJSON(shared(snapshot), shared(workspaceBase))) return;
+    // The base lets the vault merge notes another device changed meanwhile instead of rejecting the save.
+    revision = await invoke<string>('save_workspace', { workspace: snapshot, expected: revision, base: workspaceBase }); workspaceBase = snapshot;
   });
   workspaceQueue = operation; return operation;
 }
+export interface ViewState { openTabs: string[]; activeNoteId: string | null; collapsedFolders: string[] }
+export function readViewState() { return invoke<Partial<ViewState> | null>('read_view_state').catch(() => null); }
+export function saveViewState(view: ViewState) { return invoke<void>('save_view_state', { view }); }
 let financeDevice = '', financeClock = 0, financeSeq = 0, financeNewline = false;
 let financeOwnLog: string | null = null, financeTemplate: string | null = null;
 let financeNeedsReload = false;

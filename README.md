@@ -59,10 +59,10 @@ Your workspace/
 ```
 
 - Notes are UTF-8 `.md` files. Folders and emoji filenames are preserved. Filename characters unsupported on Windows are normalized when saving. Embedded Noter databases remain fenced `noter-database` JSON blocks inside their Markdown notes on both platforms; no separate database file is needed.
-- `.noter/workspace.json` contains note IDs, file paths, ordering, tabs, and preferences, without duplicating note content.
+- `.noter/workspace.json` contains note IDs, file paths, ordering and preferences, without duplicating note content. It changes only when notes or folders are added, renamed, moved or deleted, or settings change. Open tabs and collapsed folders are kept separately on each device.
 - `.noter/finance/log-<device>.jsonl` holds Finance as one append-only change log per device: accounts, category definitions, defaults, and transactions. Each installation writes only its own log to avoid competing writes during normal sync; both apps replay all logs, and the latest change wins per transaction or setting. Amounts are signed integer cents within the JavaScript safe integer range on both platforms. A former `.noter/finance.json` is migrated once and moved to `.noter/trash`.
 - `.noter/finance-template.xlsx` preserves the imported workbook's other sheets and formatting for Excel exports. Import through Finance once; export `.xlsx` backups with the native save dialog. Don't edit this template directly: reimport a changed workbook through Noter.
-- `.noter/trash` keeps prior note versions, removed notes, and Finance snapshots. These are ordinary files you can copy back manually. It can grow over time; manage it yourself when backups are no longer needed.
+- `.noter/trash` keeps prior note versions (at most one per note every ten minutes while editing), removed notes, and Finance snapshots. These are ordinary files you can copy back manually. It can grow over time; manage it yourself when backups are no longer needed.
 
 Sync the **whole workspace folder, including `.noter`**. Syncthing performs the synchronization; Noter does not upload anything or require an account. If you have custom ignore rules, make sure they do not exclude `.noter` or its Finance template. App binaries, development caches, and the device's chosen-folder configuration are outside the workspace and should not be synced.
 
@@ -75,7 +75,7 @@ Add these temporary-file patterns to Syncthing's ignore list on each device (or 
 
 Use a separate app installation identity on each device; sync the workspace, not the app configuration. Both clients use the [same versioned file contract](docs/FILE_STORAGE.md), checked by shared synthetic fixtures.
 
-Noter checks for incoming changes every five seconds when there are no unsaved edits or open dialogs. You can also use File → Reload Synced Files. Saves check the disk revision before writing. If your unsaved notes conflict with incoming files, Noter offers to export the edits before reloading. Markdown conflict copies remain visible as separate notes. Finance changes from different devices merge automatically through the per-device logs; if two devices edit the same transaction before syncing, the later edit wins.
+Noter checks for incoming changes every five seconds when there are no unsaved edits or open dialogs. You can also use File → Reload Synced Files. If another device changed other notes in the meantime, saving merges: your edited notes are written, theirs are kept, and the incoming changes load as soon as you pause, without resetting the note you are editing. Only when both devices edit the same note (or both restructure notes) does Noter stop and offer to keep both versions in a Recovered edits folder. Markdown conflict copies remain visible as separate notes. Finance changes from different devices merge automatically through the per-device logs; if two devices edit the same transaction before syncing, the later edit wins.
 
 Desktop file storage, safe-path checks, revision hashing, recovery snapshots, and Excel ZIP compression/decompression run in Rust. Android uses Kotlin and the Storage Access Framework to access the same files. The JavaScript ZIP library is used only by tests. Excel import/export remains desktop-only.
 

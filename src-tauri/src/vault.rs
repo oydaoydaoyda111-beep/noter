@@ -2,16 +2,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 type Result<T> = std::result::Result<T, String>;
 const MAX_NOTE: u64 = 10_000_000;
-#[derive(Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Manifest {
     workspace: Value,
     paths: BTreeMap<String, String>,
@@ -172,6 +173,78 @@ fn complete_snapshot(root: &Path, disk: &BTreeMap<String, Option<String>>, previ
         }
     }
     Ok(())
+}
+/// What every synced device must agree on: the note tree. Device-local view state, edit times and
+/// note text are excluded; they change on every click or keystroke.
+fn structure(workspace: &Value) -> Value {
+    let nodes: serde_json::Map<String, Value> = workspace["nodes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(id, node)| {
+            let shape = json!({"name": node["name"], "type": node["type"], "parentId": node["parentId"], "children": node["children"]});
+            (id.clone(), shape)
+        })
+        .collect();
+    json!({"nodes": nodes, "rootIds": workspace["rootIds"]})
+}
+/// Open tabs, the active note, collapsed folders and edit times stay as already published. Each device
+/// keeps its own view state, so routine edits leave the shared manifest unchanged instead of making
+/// synced devices overwrite each other's copy of it.
+fn keep_published_view(metadata: &mut Value, previous: &Value) {
+    if !previous.is_object() {
+        return;
+    }
+    let kinds: HashMap<String, Value> = metadata["nodes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(id, node)| (id.clone(), node["type"].clone()))
+        .collect();
+    let existing = |list: &Value, kind: &str| -> Vec<Value> {
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|id| id.as_str().and_then(|id| kinds.get(id)).is_some_and(|value| value == kind))
+            .cloned()
+            .collect()
+    };
+    // A workspace without published tabs or folder state takes this device's as its starting point.
+    let tabs = existing(&previous["openTabs"], "note");
+    if !tabs.is_empty() {
+        metadata["activeNoteId"] = if tabs.contains(&previous["activeNoteId"]) {
+            previous["activeNoteId"].clone()
+        } else {
+            tabs[0].clone()
+        };
+        metadata["openTabs"] = json!(tabs);
+    }
+    if previous["collapsedFolders"].is_array() {
+        metadata["collapsedFolders"] = json!(existing(&previous["collapsedFolders"], "folder"));
+    }
+    if let Some(nodes) = metadata["nodes"].as_object_mut() {
+        for (id, node) in nodes {
+            for key in ["createdAt", "updatedAt"] {
+                if previous["nodes"][id][key].is_u64() {
+                    node[key] = previous["nodes"][id][key].clone();
+                }
+            }
+        }
+    }
+}
+/// Content edits keep one recoverable copy per note every ten minutes; a copy per autosave filled
+/// `.noter/trash` with folders that Syncthing then had to send to every device. Renames and deletions
+/// always keep a copy.
+const BACKUP_INTERVAL: Duration = Duration::from_secs(600);
+fn recent_backups() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Instant>> {
+    static RECENT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    RECENT.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn backup_is_recent(root: &Path, relative: &str) -> bool {
+    recent_backups().get(&root.join(relative)).is_some_and(|at| at.elapsed() < BACKUP_INTERVAL)
+}
+fn remember_backup(root: &Path, relative: &str) {
+    recent_backups().insert(root.join(relative), Instant::now());
 }
 fn manifest_bytes(next: &Manifest, previous: &Manifest, original: Option<&[u8]>) -> Result<Vec<u8>> {
     if next == previous {
@@ -689,6 +762,88 @@ pub fn preserve_edits(root: &Path, workspace: &Value, base: &Value) -> Result<Pr
 pub fn save(root: &Path, workspace: Value, expected: &str) -> Result<String> {
     save_before_change(root, workspace, expected, &mut |_| {})
 }
+/// Saves the edits made since `base`, the workspace this device last loaded or saved. If synced files
+/// changed meanwhile, notes this device did not edit keep their incoming text, and each note it did
+/// edit is written only if it is still unchanged since `base`. The result then differs from the disk
+/// revision, so the device loads the incoming changes once it is idle.
+pub fn save_merging(root: &Path, workspace: Value, expected: &str, base: &Value) -> Result<String> {
+    save_merging_before_change(root, workspace, expected, base, &mut |_| {})
+}
+fn save_merging_before_change(
+    root: &Path,
+    workspace: Value,
+    expected: &str,
+    base: &Value,
+    before_change: &mut impl FnMut(&str),
+) -> Result<String> {
+    let (disk, metadata) = read_snapshot(root)?;
+    let current = snapshot_revision(&disk, metadata.as_deref().unwrap_or_default());
+    if current == expected {
+        return save_before_change(root, workspace, expected, before_change);
+    }
+    let previous = manifest(metadata.as_deref())?;
+    let nodes = workspace["nodes"].as_object().ok_or("Invalid notes.")?;
+    let base_text = |id: &str| base["nodes"][id]["markdown"].as_str();
+    let edited = |id: &str| nodes.get(id).and_then(|node| node["markdown"].as_str()).filter(|text| base_text(id) != Some(*text));
+    let conflict = |id: &str| {
+        let name = nodes.get(id).and_then(|node| node["name"].as_str()).unwrap_or("A note");
+        format!("SYNC_CONFLICT: “{name}” also changed on another device. Reload to keep both versions; your edits are still here.")
+    };
+    if structure(&workspace) != structure(base) {
+        // New, renamed, moved or deleted notes need the tree this device last saw.
+        if structure(&previous.workspace) != structure(base) {
+            return Err("SYNC_CONFLICT: Notes were added, renamed or moved on another device. Reload before saving these changes; your edits are still here.".into());
+        }
+        let mut merged = workspace.clone();
+        for (id, path) in &previous.paths {
+            let Some(node) = merged["nodes"].get_mut(id).filter(|node| node["type"] == "note") else { continue };
+            let incoming = disk.get(path).and_then(|entry| entry.as_deref());
+            if edited(id).is_some() {
+                if incoming != base_text(id) {
+                    return Err(conflict(id));
+                }
+            } else if let Some(text) = incoming {
+                node["markdown"] = json!(text);
+            }
+        }
+        let saved = save_before_change(root, merged, &current, before_change)?;
+        return Ok(format!("{saved}:merged"));
+    }
+    // Only note text or settings changed here: write those notes where they now live.
+    let mut writes = Vec::new();
+    for (id, node) in nodes {
+        let Some(text) = edited(id).filter(|_| node["type"] == "note") else { continue };
+        if text.len() as u64 > MAX_NOTE {
+            return Err("Keep each note below 10 MB.".into());
+        }
+        let path = previous.paths.get(id).filter(|_| previous.workspace["nodes"][id]["type"] == "note").ok_or_else(|| conflict(id))?;
+        if disk.get(path).and_then(|entry| entry.as_deref()) != base_text(id) {
+            return Err(conflict(id));
+        }
+        writes.push((path.clone(), text));
+    }
+    let trash = format!(".noter/trash/{}-{}", now(), Uuid::new_v4());
+    for (path, text) in &writes {
+        if !backup_is_recent(root, path) {
+            if let Some(old) = disk.get(path).and_then(|entry| entry.as_deref()) {
+                atomic_write(&safe_path(root, &format!("{trash}/{path}"))?, old.as_bytes())?;
+                remember_backup(root, path);
+            }
+        }
+        before_change(path);
+        unchanged_file(root, path, disk.get(path))?;
+        atomic_write(&safe_path(root, path)?, text.as_bytes())?;
+    }
+    if workspace["settings"] != base["settings"] && previous.workspace.is_object() {
+        let mut next = previous.clone();
+        next.workspace["settings"] = workspace["settings"].clone();
+        let bytes = manifest_bytes(&next, &previous, metadata.as_deref())?;
+        before_change(".noter/workspace.json");
+        unchanged_metadata(root, metadata.as_deref())?;
+        atomic_write(&safe_path(root, ".noter/workspace.json")?, &bytes)?;
+    }
+    Ok(format!("{}:merged", revision(root)?))
+}
 fn save_before_change(
     root: &Path,
     workspace: Value,
@@ -744,11 +899,13 @@ fn save_before_change(
             continue;
         }
         let source = safe_path(root, old)?;
-        let desired = paths.get(id);
+        let moved = paths.get(id).is_none_or(|path| path != old);
         let content = disk.get(old).and_then(|value| value.as_deref());
-        let changed = desired.is_none_or(|path| path != old)
-            || content != nodes.get(id).and_then(|node| node["markdown"].as_str());
-        if changed && source.is_file() {
+        let edited = content != nodes.get(id).and_then(|node| node["markdown"].as_str());
+        if (moved || (edited && !backup_is_recent(root, old))) && source.is_file() {
+            if !moved {
+                remember_backup(root, old);
+            }
             let backup = safe_path(root, &format!("{trash}/{old}"))?;
             if let Some(text) = content {
                 atomic_write(&backup, text.as_bytes())?;
@@ -815,6 +972,7 @@ fn save_before_change(
     for node in output_metadata["nodes"].as_object_mut().unwrap().values_mut() {
         node.as_object_mut().unwrap().remove("markdown");
     }
+    keep_published_view(&mut output_metadata, &previous.workspace);
     let bytes = manifest_bytes(&Manifest {
         workspace: output_metadata,
         paths,
@@ -1571,6 +1729,91 @@ mod tests {
             fs::read_to_string(root.path().join(".noter/workspace.json")).unwrap(),
             "broken"
         );
+    }
+    fn note_id(workspace: &Value, name: &str) -> String {
+        workspace["nodes"].as_object().unwrap().values().find(|node| node["name"] == name).unwrap()["id"]
+            .as_str().unwrap().to_string()
+    }
+    fn two_notes() -> (tempfile::TempDir, LoadedWorkspace) {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Desk.md"), "Desk\n").unwrap();
+        fs::write(root.path().join("Phone.md"), "Phone\n").unwrap();
+        let loaded = load(root.path()).unwrap();
+        (root, loaded)
+    }
+    #[test]
+    fn routine_edits_and_view_changes_leave_the_shared_manifest_unchanged() {
+        let (root, loaded) = two_notes();
+        let manifest = root.path().join(".noter/workspace.json");
+        let published = fs::read(&manifest).unwrap();
+        let (desk, phone) = (note_id(&loaded.workspace, "Desk"), note_id(&loaded.workspace, "Phone"));
+        let mut edited = loaded.workspace.clone();
+        edited["nodes"][&desk]["markdown"] = json!("Desk edited\n");
+        edited["nodes"][&desk]["updatedAt"] = json!(9_999_999_999_999u64);
+        edited["openTabs"] = json!([desk, phone]);
+        edited["activeNoteId"] = json!(phone);
+        let revision = save(root.path(), edited.clone(), &loaded.revision).unwrap();
+        assert_eq!(fs::read(&manifest).unwrap(), published);
+        edited["nodes"][&desk]["markdown"] = json!("Desk edited again\n");
+        save(root.path(), edited, &revision).unwrap();
+        assert_eq!(fs::read(&manifest).unwrap(), published);
+        assert_eq!(fs::read_to_string(root.path().join("Desk.md")).unwrap(), "Desk edited again\n");
+        // Consecutive autosaves of one note keep a single recoverable copy instead of one per save.
+        assert_eq!(fs::read_dir(root.path().join(".noter/trash")).unwrap().count(), 1);
+    }
+    #[test]
+    fn incoming_edits_to_other_notes_merge_with_local_edits() {
+        let (root, loaded) = two_notes();
+        let published = fs::read(root.path().join(".noter/workspace.json")).unwrap();
+        fs::write(root.path().join("Phone.md"), "Edited on the phone\n").unwrap();
+        let mut local = loaded.workspace.clone();
+        local["nodes"][&note_id(&loaded.workspace, "Desk")]["markdown"] = json!("Edited on the desktop\n");
+        let saved = save_merging(root.path(), local.clone(), &loaded.revision, &loaded.workspace).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("Desk.md")).unwrap(), "Edited on the desktop\n");
+        assert_eq!(fs::read_to_string(root.path().join("Phone.md")).unwrap(), "Edited on the phone\n");
+        assert_eq!(fs::read(root.path().join(".noter/workspace.json")).unwrap(), published);
+        // The device must still load the phone's edit, so the acknowledged revision is not the disk's.
+        assert_ne!(saved, revision(root.path()).unwrap());
+        // Typing continues before that reload: the next save merges against the snapshot just saved.
+        let base = local.clone();
+        local["nodes"][&note_id(&loaded.workspace, "Desk")]["markdown"] = json!("Edited on the desktop twice\n");
+        save_merging(root.path(), local, &saved, &base).unwrap();
+        let reloaded = load(root.path()).unwrap();
+        assert_eq!(reloaded.workspace["nodes"][&note_id(&loaded.workspace, "Phone")]["markdown"], "Edited on the phone\n");
+        assert_eq!(reloaded.workspace["nodes"][&note_id(&loaded.workspace, "Desk")]["markdown"], "Edited on the desktop twice\n");
+    }
+    #[test]
+    fn edits_to_the_same_note_on_two_devices_are_never_overwritten() {
+        let (root, loaded) = two_notes();
+        fs::write(root.path().join("Desk.md"), "Phone edited the desk note\n").unwrap();
+        let mut local = loaded.workspace.clone();
+        local["nodes"][&note_id(&loaded.workspace, "Desk")]["markdown"] = json!("Desktop edit\n");
+        let failure = save_merging(root.path(), local, &loaded.revision, &loaded.workspace).unwrap_err();
+        assert!(failure.starts_with("SYNC_CONFLICT") && failure.contains("Desk"));
+        assert_eq!(fs::read_to_string(root.path().join("Desk.md")).unwrap(), "Phone edited the desk note\n");
+    }
+    #[test]
+    fn local_renames_merge_incoming_text_but_not_incoming_structure() {
+        let (root, loaded) = two_notes();
+        fs::write(root.path().join("Phone.md"), "Edited on the phone\n").unwrap();
+        let mut local = loaded.workspace.clone();
+        let desk = note_id(&local, "Desk");
+        local["nodes"][&desk]["name"] = json!("Desk renamed");
+        let saved = save_merging(root.path(), local.clone(), &loaded.revision, &loaded.workspace).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("Desk renamed.md")).unwrap(), "Desk\n");
+        assert!(!root.path().join("Desk.md").exists());
+        assert_eq!(fs::read_to_string(root.path().join("Phone.md")).unwrap(), "Edited on the phone\n");
+        // Another device publishes a new note; a structural change made against the older tree waits.
+        let other = load(root.path()).unwrap();
+        let mut remote = other.workspace.clone();
+        remote["nodes"]["new-note"] = json!({"id": "new-note", "name": "From phone", "type": "note", "markdown": "Hi\n", "parentId": null, "createdAt": 1, "updatedAt": 1});
+        remote["rootIds"].as_array_mut().unwrap().push(json!("new-note"));
+        save(root.path(), remote, &other.revision).unwrap();
+        let base = local.clone();
+        local["nodes"][&note_id(&loaded.workspace, "Phone")]["name"] = json!("Phone renamed");
+        let failure = save_merging(root.path(), local, &saved, &base).unwrap_err();
+        assert!(failure.contains("added, renamed or moved on another device"));
+        assert!(root.path().join("Phone.md").exists() && root.path().join("From phone.md").exists());
     }
     fn link_folder(target: &Path, link: &Path) {
         #[cfg(unix)]

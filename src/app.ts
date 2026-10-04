@@ -1,8 +1,8 @@
-import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits } from './desktop/platform';
+import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits, saveViewState } from './desktop/platform';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createStore } from './state/workspace';
-import { storage, validateWorkspace } from './storage/storage';
+import { applyView, storage, validateWorkspace } from './storage/storage';
 import { createEditor } from './editor/editor';
 import { createTree } from './tree/tree';
 import { createTabs } from './tabs/tabs';
@@ -246,16 +246,33 @@ export async function startApp(mount: HTMLElement) {
     get('note-count').textContent = String(Object.values(store.workspace.nodes).filter(node => node.type === 'note').length);
   }
 
+  let viewTimer: ReturnType<typeof setTimeout> | undefined;
+  let keepEditorOnReload = false;
+  // Tabs and folder state belong to this device; storing them in the synced workspace made every click a shared change.
+  function persistView() {
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(() => {
+      const { openTabs, activeNoteId, collapsedFolders } = store.workspace;
+      void saveViewState({ openTabs, activeNoteId, collapsedFolders }).catch(() => { /* Tabs still work if device preferences cannot be saved. */ });
+    }, 300);
+  }
+
   store.subscribe(change => {
-    if (applyingDisk) { editor.reset(); tree.reset(); scrollPositions.clear(); shownNoteId = null; applySettings(store.workspace.settings); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); return; }
+    if (applyingDisk) {
+      // Incoming changes to other notes must not reset the caret, selection or undo history of the open note.
+      if (!keepEditorOnReload) { editor.reset(); scrollPositions.clear(); shownNoteId = null; }
+      tree.reset(); applySettings(store.workspace.settings); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); return;
+    }
+    if (change === 'tabs' || change === 'folders') {
+      if (change === 'tabs') { tabs.render(); tree.activeState(); renderNote(); search.render(); } else tree.folderState();
+      persistView(); return;
+    }
     editVersion++; unsaved = true; changedSinceLoad = true;
     if (change === 'reset') {
       clearTimeout(titleTimer); editor.reset(); tree.reset(); scrollPositions.clear(); shownNoteId = null;
       applySettings(store.workspace.settings); finance.refresh(); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); saveNow(); return;
     }
-    if (change === 'structure') { tree.render(); tabs.render(); search.render(); renderNote(); renderCount(); }
-    if (change === 'tabs') { tabs.render(); tree.activeState(); renderNote(); search.render(); }
-    if (change === 'folders') tree.folderState();
+    if (change === 'structure') { tree.render(); tabs.render(); search.render(); renderNote(); renderCount(); persistView(); }
     if (change === 'content') { updateStats(); if (get<HTMLInputElement>('search').value.trim()) search.render(); }
     if (change === 'settings') { applySettings(store.workspace.settings); finance.refresh(); }
     scheduleSave();
@@ -329,7 +346,7 @@ export async function startApp(mount: HTMLElement) {
     commitTitle(); if (!await saveNow() || finance.isBusy()) { notify('Finish saving your changes before switching folders.'); return; }
     try { await flushFiles(); if (await chooseFolder()) location.reload(); } catch (error) { notify(String(error)); }
   }
-  async function reloadFiles() {
+  async function reloadFiles(automatic = false) {
     if (polling || finance.isBusy()) return;
     commitTitle(); clearTimeout(saveTimer);
     polling = true;
@@ -344,10 +361,14 @@ export async function startApp(mount: HTMLElement) {
       if (recovery) { warning.textContent = `Your edits were backed up to ${recovery.snapshot}${recovery.folder ? ` and copied into ${recovery.folder}` : ''}.`; warning.hidden = false; }
       const snapshot = await readWorkspaceSnapshot();
       if (version !== editVersion) { notify('Finish editing before reloading synced files.'); return; }
-      const next = validateWorkspace(snapshot.workspace); adoptWorkspaceSnapshot(snapshot); applyingDisk = true; store.replace(next); applyingDisk = false; unsaved = false; loaded.warning = undefined;
-      await finance.reload(); warning.hidden = recovery === null; saveStatus.dataset.state = 'saved'; get('save-label').textContent = recovery ? 'Both versions kept' : 'Synced files loaded'; notify(recovery ? 'Your edits were preserved; synced files loaded' : 'Workspace reloaded from files');
+      const current = store.workspace, active = store.activeNote;
+      const next = applyView(validateWorkspace(snapshot.workspace), { openTabs: current.openTabs, activeNoteId: current.activeNoteId, collapsedFolders: current.collapsedFolders });
+      const incoming = active ? next.nodes[active.id] : null;
+      keepEditorOnReload = !recovery && next.activeNoteId === active?.id && incoming?.type === 'note' && incoming.markdown === active.markdown;
+      adoptWorkspaceSnapshot(snapshot); applyingDisk = true; store.replace(next); applyingDisk = false; keepEditorOnReload = false; unsaved = false; loaded.warning = undefined;
+      await finance.reload(); warning.hidden = recovery === null; saveStatus.dataset.state = 'saved'; get('save-label').textContent = recovery ? 'Both versions kept' : 'Synced files loaded'; if (recovery || !automatic) notify(recovery ? 'Your edits were preserved; synced files loaded' : 'Workspace reloaded from files');
     } catch (error) { warning.textContent = String(error); warning.hidden = false; }
-    finally { applyingDisk = false; polling = false; }
+    finally { applyingDisk = false; keepEditorOnReload = false; polling = false; }
   }
   document.documentElement.dataset.desktop = 'true';
   const currentWindow = getCurrentWindow();
@@ -372,7 +393,7 @@ export async function startApp(mount: HTMLElement) {
     try {
       const results = await Promise.allSettled([workspaceChanged(force), financeChanged()]);
       if (document.hidden || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
-      if (results.some(result => result.status === 'fulfilled' && result.value)) { await reloadFiles(); return; }
+      if (results.some(result => result.status === 'fulfilled' && result.value)) { await reloadFiles(true); return; }
       const failed = results.find(result => result.status === 'rejected');
       if (failed?.status === 'rejected') { warning.textContent = `Could not check synced files: ${String(failed.reason)}`; warning.hidden = false; }
     } finally { checkingFiles = false; }

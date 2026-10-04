@@ -1,4 +1,4 @@
-import { loadWorkspaceFile, saveWorkspaceFile } from '../desktop/platform.ts';
+import { loadWorkspaceFile, readViewState, saveWorkspaceFile, type ViewState } from '../desktop/platform.ts';
 import { normalizeSettings } from '../settings/model.ts';
 import type { Workspace, WorkspaceNode } from '../types';
 
@@ -30,9 +30,19 @@ export function validateWorkspace(data: unknown): Workspace {
   };
 }
 
+/** This device's open tabs, active note and collapsed folders, limited to notes that still exist. */
+export function applyView(workspace: Workspace, view: Partial<ViewState> | null | undefined): Workspace {
+  if (!view) return workspace;
+  const openTabs = [...new Set(Array.isArray(view.openTabs) ? view.openTabs : [])].filter(id => workspace.nodes[id]?.type === 'note');
+  const activeNoteId = typeof view.activeNoteId === 'string' && openTabs.includes(view.activeNoteId) ? view.activeNoteId : openTabs[0] ?? null;
+  const collapsedFolders = (Array.isArray(view.collapsedFolders) ? view.collapsedFolders : []).filter(id => workspace.nodes[id]?.type === 'folder');
+  return { ...workspace, openTabs, activeNoteId, collapsedFolders };
+}
+
 export const storage = {
   async load(): Promise<{ workspace: Workspace; warning?: string }> {
-    return { workspace: validateWorkspace(await loadWorkspaceFile()) };
+    const workspace = validateWorkspace(await loadWorkspaceFile());
+    return { workspace: applyView(workspace, await readViewState()) };
   },
   async save(workspace: Workspace): Promise<boolean> {
     await saveWorkspaceFile(workspace);

@@ -64,6 +64,31 @@ fn save_last_section(app: tauri::AppHandle, section: String) -> Result<(), Strin
         &serde_json::to_vec(&json!({"lastSection": section})).unwrap(),
     )
 }
+/// Open tabs, the active note and collapsed folders belong to this device, not the synced workspace.
+fn view_state_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "App settings are unavailable.")?
+        .join("view.json"))
+}
+#[tauri::command]
+fn read_view_state(app: tauri::AppHandle, state: State<'_, VaultState>) -> Result<Value, String> {
+    let folder = root(&state)?;
+    let saved = fs::read(view_state_file(&app)?)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    Ok(if saved["root"] == json!(folder.to_string_lossy()) { saved["view"].clone() } else { Value::Null })
+}
+#[tauri::command]
+fn save_view_state(app: tauri::AppHandle, state: State<'_, VaultState>, view: Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(&json!({"root": root(&state)?.to_string_lossy(), "view": view})).unwrap();
+    if !view.is_object() || bytes.len() > 1_000_000 {
+        return Err("Invalid view state.".into());
+    }
+    vault::atomic_write(&view_state_file(&app)?, &bytes)
+}
 #[tauri::command]
 async fn choose_workspace_folder(
     app: tauri::AppHandle,
@@ -122,8 +147,12 @@ async fn save_workspace(
     state: State<'_, VaultState>,
     workspace: Value,
     expected: String,
+    base: Option<Value>,
 ) -> Result<String, String> {
-    vault::save(&root(&state)?, workspace, &expected)
+    match base {
+        Some(base) => vault::save_merging(&root(&state)?, workspace, &expected, &base),
+        None => vault::save(&root(&state)?, workspace, &expected),
+    }
 }
 #[tauri::command]
 async fn preserve_workspace_edits(
@@ -292,6 +321,8 @@ pub fn run() {
             workspace_folder,
             read_last_section,
             save_last_section,
+            read_view_state,
+            save_view_state,
             choose_workspace_folder,
             load_workspace,
             save_workspace,

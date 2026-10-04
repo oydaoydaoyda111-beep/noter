@@ -8,6 +8,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import app.noter.model.Folder
+import app.noter.model.Note
 import app.noter.model.Settings
 import app.noter.model.Workspace
 import app.noter.model.WorkspaceOps
@@ -25,6 +27,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONException
+import org.json.JSONObject
 
 enum class Screen { Loading, NeedFolder, Ready, Failed }
 
@@ -107,11 +112,17 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                         screen = Screen.Ready
                         return@withLock
                     }
+                    // Tabs and folder state belong to this device: keep the current ones on reload, restore saved ones on open.
+                    val next = applyView(opened.second.workspace, if (showLoading) savedView(uri) else snapshot)
+                    val active = snapshot.nodes[snapshot.activeNoteId] as? Note
+                    val unchangedNote = !showLoading && !keepEdits && active != null && next.activeNoteId == active.id &&
+                        (next.nodes[active.id] as? Note)?.markdown == active.markdown
                     vault = opened.first
                     revision = opened.second.revision
-                    workspace = opened.second.workspace
-                    savedWorkspace = workspace
-                    loadGeneration++
+                    workspace = next
+                    savedWorkspace = next
+                    // Incoming changes to other notes must not reset the open note's cursor or undo history.
+                    if (!unchangedNote) loadGeneration++
                     folderName = Uri.decode(uri.lastPathSegment.orEmpty()).substringAfterLast(':').substringAfterLast('/')
                     version = 0
                     savedVersion = 0
@@ -173,7 +184,9 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                 val snapshot = workspace
                 val snapshotVersion = version
                 try {
-                    revision = withContext(Dispatchers.IO) { target.save(snapshot, revision) }
+                    // The base lets the vault merge notes another device changed meanwhile instead of rejecting the save.
+                    val base = savedWorkspace
+                    revision = withContext(Dispatchers.IO) { target.save(snapshot, revision, base) }
                     savedVersion = snapshotVersion
                     savedWorkspace = snapshot
                 } catch (problem: SyncConflictException) {
@@ -218,15 +231,48 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     fun createFolder(name: String, parentId: String?) = change { WorkspaceOps.addFolder(it, name, parentId) }
     fun rename(id: String, name: String) = change { WorkspaceOps.rename(it, id, name) }
     fun delete(id: String) = change { WorkspaceOps.delete(it, id) }
-    fun openNote(id: String) = change { WorkspaceOps.open(it, id) }
-    fun selectTab(id: String) = change { WorkspaceOps.select(it, id) }
-    fun closeTab(id: String) = change { WorkspaceOps.close(it, id) }
-    fun toggleFolder(id: String) = change { WorkspaceOps.toggleFolder(it, id) }
+    fun openNote(id: String) = view { WorkspaceOps.open(it, id) }
+    fun selectTab(id: String) = view { WorkspaceOps.select(it, id) }
+    fun closeTab(id: String) = view { WorkspaceOps.close(it, id) }
+    fun toggleFolder(id: String) = view { WorkspaceOps.toggleFolder(it, id) }
+
+    /** Tab and folder changes stay on this device; publishing them made every tap a change for the other devices. */
+    private fun view(transform: (Workspace) -> Workspace) {
+        val next = transform(workspace)
+        if (next === workspace) return
+        workspace = next
+        val uri = treeUri ?: return
+        val state = JSONObject()
+            .put("openTabs", JSONArray(next.openTabs))
+            .put("activeNoteId", next.activeNoteId ?: JSONObject.NULL)
+            .put("collapsedFolders", JSONArray(next.collapsedFolders))
+        preferences.edit().putString(VIEW_KEY + uri, state.toString()).apply()
+    }
+
+    private fun savedView(uri: Uri): Workspace? = try {
+        val state = JSONObject(preferences.getString(VIEW_KEY + uri, null) ?: return null)
+        fun strings(key: String) = state.optJSONArray(key)?.let { list -> List(list.length()) { list.optString(it) } }.orEmpty()
+        Workspace(openTabs = strings("openTabs"), activeNoteId = state.opt("activeNoteId") as? String, collapsedFolders = strings("collapsedFolders"))
+    } catch (_: JSONException) {
+        null
+    }
+
+    /** [view]'s tabs, active note and collapsed folders, limited to notes and folders that still exist. */
+    private fun applyView(workspace: Workspace, view: Workspace?): Workspace {
+        if (view == null) return workspace
+        val tabs = view.openTabs.distinct().filter { workspace.nodes[it] is Note }
+        return workspace.copy(
+            openTabs = tabs,
+            activeNoteId = view.activeNoteId?.takeIf { it in tabs } ?: tabs.firstOrNull(),
+            collapsedFolders = view.collapsedFolders.filter { workspace.nodes[it] is Folder },
+        )
+    }
     fun updateSettings(transform: (Settings) -> Settings) = change { WorkspaceOps.updateSettings(it, transform) }
 
     private companion object {
         const val TREE_KEY = "workspaceTree"
         const val SECTION_KEY = "section"
+        const val VIEW_KEY = "view:"
         const val POLL_MS = 5000L
     }
 }

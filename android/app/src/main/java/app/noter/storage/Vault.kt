@@ -38,6 +38,11 @@ class Vault(private val saf: Saf) {
     private class Manifest(val workspace: JSONObject, val paths: Map<String, String>, val bytes: ByteArray)
     private class Snapshot(val disk: TreeMap<String, Entry>, val contents: TreeMap<String, String?>, val manifest: Manifest)
 
+    private companion object {
+        const val BACKUP_INTERVAL_NS = 600_000_000_000L
+        val recentBackups = HashMap<String, Long>()
+    }
+
     private var pollingMetadata: String? = null
     private var pollingRevision: String? = null
     private var lastFullCheck = 0L
@@ -219,12 +224,65 @@ class Vault(private val saf: Saf) {
             .put("openTabs", JSONArray(workspace.openTabs))
             .put("activeNoteId", workspace.activeNoteId ?: JSONObject.NULL)
             .put("collapsedFolders", JSONArray(workspace.collapsedFolders))
+        if (previous != null && previous.workspace.length() > 0) keepPublishedView(metadata, previous.workspace, workspace)
         val result = JSONObject().put("workspace", metadata).put("paths", JSONObject(paths))
         if (previous != null && previous.bytes.isNotEmpty() && sameJson(result, JSONObject(decode(previous.bytes)))) {
             return previous.bytes
         }
         return result.toString(2).toByteArray()
     }
+
+    /**
+     * Open tabs, the active note, collapsed folders and edit times stay as already published. Each device keeps its own
+     * view state, so routine edits leave the shared manifest unchanged instead of making synced devices overwrite it.
+     */
+    private fun keepPublishedView(metadata: JSONObject, previous: JSONObject, workspace: Workspace) {
+        fun ids(list: JSONArray, keep: (Node?) -> Boolean) =
+            (0 until list.length()).mapNotNull { list.opt(it) as? String }.filter { keep(workspace.nodes[it]) }
+        // A workspace without published tabs or folder state takes this device's as its starting point.
+        val tabs = previous.optJSONArray("openTabs")?.let { list -> ids(list) { it is Note } }.orEmpty()
+        if (tabs.isNotEmpty()) {
+            val active = previous.opt("activeNoteId") as? String
+            metadata.put("openTabs", JSONArray(tabs)).put("activeNoteId", active?.takeIf { it in tabs } ?: tabs.first())
+        }
+        previous.optJSONArray("collapsedFolders")?.let { list -> metadata.put("collapsedFolders", JSONArray(ids(list) { it is Folder })) }
+        val published = previous.optJSONObject("nodes") ?: return
+        val nodes = metadata.getJSONObject("nodes")
+        for (id in nodes.keys()) {
+            val old = published.optJSONObject(id) ?: continue
+            for (key in listOf("createdAt", "updatedAt")) (old.opt(key) as? Number)?.let { nodes.getJSONObject(id).put(key, it.toLong()) }
+        }
+    }
+
+    /** What every synced device must agree on: the note tree, without view state, edit times or note text. */
+    private fun structure(workspace: Workspace): Map<String, Any?> = mapOf(
+        "nodes" to workspace.nodes.mapValues { (_, node) ->
+            listOf(node.name, if (node is Note) "note" else "folder", node.parentId, (node as? Folder)?.children)
+        },
+        "rootIds" to workspace.rootIds,
+    )
+
+    private fun structure(metadata: JSONObject): Map<String, Any?> {
+        fun JSONArray.strings() = List(length()) { getString(it) }
+        val nodes = metadata.optJSONObject("nodes") ?: JSONObject()
+        return mapOf(
+            "nodes" to nodes.keys().asSequence().associateWith { id ->
+                val node = nodes.getJSONObject(id)
+                listOf(node.optString("name"), node.optString("type"), node.opt("parentId") as? String, node.optJSONArray("children")?.strings())
+            },
+            "rootIds" to metadata.optJSONArray("rootIds")?.strings(),
+        )
+    }
+
+    /**
+     * Content edits keep one recoverable copy per note every ten minutes; a copy per autosave filled `.noter/trash`
+     * with folders that Syncthing had to send to every device. Renames and deletions always keep a copy.
+     */
+    private fun backupIsRecent(path: String): Boolean = synchronized(recentBackups) {
+        recentBackups["${saf.rootDoc}/$path"]?.let { System.nanoTime() - it < BACKUP_INTERVAL_NS } == true
+    }
+
+    private fun rememberBackup(path: String) = synchronized(recentBackups) { recentBackups["${saf.rootDoc}/$path"] = System.nanoTime() }
 
     fun load(): Loaded {
         val initial = snapshot()
@@ -369,7 +427,66 @@ class Vault(private val saf: Saf) {
         return PreservedEdits(snapshot, folder, changed.size)
     }
 
-    fun save(workspace: Workspace, expected: String): String {
+    /**
+     * Saves the edits made since [base], the workspace this device last loaded or saved. If synced files changed
+     * meanwhile, notes this device did not edit keep their incoming text, and each note it did edit is written only if
+     * it is still unchanged since [base]. The result then differs from the disk revision, so the device loads the
+     * incoming changes once it is idle.
+     */
+    fun save(workspace: Workspace, expected: String, base: Workspace? = null): String {
+        if (base == null) return saveExact(workspace, expected)
+        val initial = snapshot()
+        val previous = initial.manifest
+        val current = revisionOf(initial.contents, previous.bytes)
+        if (current == expected) return saveExact(workspace, expected)
+        fun baseText(id: String) = (base.nodes[id] as? Note)?.markdown
+        fun edited(id: String) = (workspace.nodes[id] as? Note)?.markdown?.takeIf { it != baseText(id) }
+        fun conflict(id: String) = SyncConflictException(
+            "“${workspace.nodes[id]?.name ?: "A note"}” also changed on another device. Reload to keep both versions; your edits are still here.",
+        )
+        if (structure(workspace) != structure(base)) {
+            // New, renamed, moved or deleted notes need the tree this device last saw.
+            if (structure(previous.workspace) != structure(base)) {
+                throw SyncConflictException("Notes were added, renamed or moved on another device. Reload before saving these changes; your edits are still here.")
+            }
+            val merged = LinkedHashMap(workspace.nodes)
+            for ((id, path) in previous.paths) {
+                val note = merged[id] as? Note ?: continue
+                val incoming = initial.contents[path]
+                if (edited(id) != null) {
+                    if (incoming != baseText(id)) throw conflict(id)
+                } else if (incoming != null) merged[id] = note.copy(markdown = incoming)
+            }
+            return saveExact(workspace.copy(nodes = merged), current) + ":merged"
+        }
+        // Only note text or settings changed here: write those notes where they now live.
+        val publishedNodes = previous.workspace.optJSONObject("nodes")
+        val writes = ArrayList<Pair<String, String>>()
+        for (id in workspace.nodes.keys) {
+            val text = edited(id) ?: continue
+            if (text.toByteArray().size > MAX_NOTE) throw VaultException("Keep each note below 10 MB.")
+            val path = previous.paths[id]?.takeIf { publishedNodes?.optJSONObject(id)?.optString("type") == "note" } ?: throw conflict(id)
+            if (initial.contents[path] != baseText(id)) throw conflict(id)
+            writes += path to text
+        }
+        val trash = ".noter/trash/${System.currentTimeMillis()}-${UUID.randomUUID()}"
+        for ((path, text) in writes) {
+            val old = checkNotNull(initial.contents[path])
+            if (!backupIsRecent(path)) {
+                saf.writeAtomic("$trash/$path", old.toByteArray(), mustBeAbsent = true)
+                rememberBackup(path)
+            }
+            saf.writeAtomic(path, text.toByteArray(), old.toByteArray())
+        }
+        if (workspace.settings != base.settings && previous.bytes.isNotEmpty()) {
+            val root = JSONObject(decode(previous.bytes))
+            root.getJSONObject("workspace").put("settings", workspace.settings.toJson())
+            saf.writeAtomic(MANIFEST, root.toString(2).toByteArray(), previous.bytes)
+        }
+        return revision(true) + ":merged"
+    }
+
+    private fun saveExact(workspace: Workspace, expected: String): String {
         val initial = snapshot()
         val disk = initial.disk
         val previous = initial.manifest
@@ -400,8 +517,10 @@ class Vault(private val saf: Saf) {
             if (previousNodes?.optJSONObject(id)?.optString("type") != "note") continue
             val note = workspace.nodes[id] as? Note
             val text = initial.contents[old] ?: continue
-            if (paths[id] == old && note != null && text == note.markdown) continue
+            val moved = paths[id] != old || note == null
+            if (!moved && (text == note?.markdown || backupIsRecent(old))) continue
             saf.writeAtomic("$trash/$old", text.toByteArray(), mustBeAbsent = true)
+            if (!moved) rememberBackup(old)
         }
         if (revision(true) != expected) {
             throw SyncConflictException("Files changed while preparing the save. Your edits are still in memory.")
