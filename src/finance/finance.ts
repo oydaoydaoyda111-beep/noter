@@ -13,6 +13,7 @@ import { createReportView } from './report-view';
 import { monthRange } from './reports';
 import { editTransactions } from './bulk-editor';
 import { removeTransactions, transactionSelection } from './bulk';
+import { balancesAfterTransactions, groupTransactionsByDate, projectTransactionBalances, summarizeTransactions } from './ledger';
 import type { Settings } from '../types';
 import { formatFinanceAmount, formatFinanceDate } from '../settings/model';
 
@@ -23,6 +24,7 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
   let busy = false, loaded = false, loadError = false;
   let query = '', accountFilter = '', categoryFilter = '', from = '', until = '';
   let page = 0;
+  let grouping: 'date' | '' = 'date';
   const selected = new Set<string>();
   const status = el('p', 'finance-status'); status.setAttribute('role', 'status');
   const body = el('div', 'finance-body'); root.append(body, status);
@@ -118,6 +120,21 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     const payee = text('payee', 'Payee / payer', original?.payee ?? '', 'text', false);
     suggestions(payee, 'payees', source.transactions.map(row => row.payee));
     const note = text('note', 'Note', original?.note ?? '', 'text', false);
+    const preview = el('div', 'finance-balance-preview'); preview.setAttribute('role', 'status'); preview.setAttribute('aria-live', 'polite'); preview.setAttribute('aria-atomic', 'true'); form.append(preview);
+    const draftId = original && !duplicate ? original.id : crypto.randomUUID();
+    function updatePreview() {
+      preview.replaceChildren(el('span', 'finance-account-label', 'Balance after saving'));
+      try {
+        const cents = money(amount.value); if (cents <= 0) throw new Error('Enter a positive amount to see the balance.');
+        const values = projectTransactionBalances(source, { id: draftId, date: date.value, cents: kind === 'income' ? cents : -cents, account: account.value, category: '', subcategory: '', payee: '', note: '' }, to?.value);
+        for (const name of new Set([account.value, ...(to ? [to.value] : [])])) {
+          const value = values.get(name), item = el('div', 'finance-balance-preview-row');
+          item.append(el('span', '', name), el('strong', value !== null && value !== undefined && value < 0 ? 'negative' : 'positive', value === null || value === undefined ? 'Out of range' : format(value))); preview.append(item);
+        }
+        preview.append(el('small', 'finance-local', 'Projected current balance, including all account transactions.'));
+      } catch (error) { preview.append(el('span', 'finance-local', !amount.value.trim() ? 'Enter an amount to see the balance.' : error instanceof Error ? error.message : 'Check the transaction details.')); }
+    }
+    amount.addEventListener('input', updatePreview); date.addEventListener('input', updatePreview); account.addEventListener('change', updatePreview); to?.addEventListener('change', updatePreview); updatePreview();
     const error = el('p', 'finance-error'); error.setAttribute('role', 'alert'); form.append(error);
     if (kind === 'transfer') form.append(el('p', 'dialog-description', 'Both account entries are saved together. Editing or deleting this transfer updates both entries.'));
     const actions = el('div', 'dialog-actions');
@@ -188,7 +205,23 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     for (const id of selected) if (!available.has(id)) selected.delete(id);
     const pageSize = getSettings().financePageSize;
     const totalPages = Math.max(1, Math.ceil(rows.length / pageSize)); page = Math.min(page, totalPages - 1);
-    const head = el('div', 'finance-history-heading'); head.append(el('h2', '', 'Transactions'), el('span', '', `${rows.length.toLocaleString()} entries · Net ${format(rows.reduce((sum, row) => sum + row.cents, 0))}`)); root.append(head);
+    const filtered = !!(needle || accountFilter || categoryFilter || from || until);
+    const head = el('div', 'finance-history-heading'), title = el('div', 'finance-history-title');
+    title.append(el('h2', '', 'Transactions'), el('span', 'finance-local', `${rows.length.toLocaleString()} ${filtered ? 'matching ' : ''}entries`));
+    const groupLabel = el('label', 'finance-group-label', 'Group by'), group = el('select', 'field-input'); group.setAttribute('aria-label', 'Group transactions');
+    for (const [value, label] of [['date', 'Date'], ['', 'No grouping']]) { const option = el('option', '', label); option.value = value; group.append(option); }
+    group.value = grouping;
+    group.onchange = () => { grouping = group.value === 'date' ? 'date' : ''; renderHistory(root); root.querySelector<HTMLSelectElement>('[aria-label="Group transactions"]')?.focus(); };
+    groupLabel.append(group); head.append(title, groupLabel); root.append(head);
+    const totals = el('section', 'finance-ledger-summary'); totals.setAttribute('aria-label', filtered ? 'Filtered transaction totals' : 'All transaction totals');
+    try {
+      const summary = summarizeTransactions(rows);
+      for (const [label, key] of [['Incoming', 'incoming'], ['Outgoing', 'outgoing'], ['Net', 'net']] as const) {
+        const card = el('div', 'finance-ledger-total');
+        card.append(el('span', 'finance-account-label', label), el('strong', summary[key] < 0 || key === 'outgoing' ? 'negative' : 'positive', format(summary[key]))); totals.append(card);
+      }
+    } catch (error) { totals.append(el('p', 'finance-error', error instanceof Error ? error.message : 'Could not calculate transaction totals.')); }
+    root.append(totals, el('p', 'finance-ledger-scope finance-local', `${filtered ? 'Filtered totals' : 'All transaction totals'} · All matching pages · Includes transfers and opening balances`));
     const selection = el('div', 'finance-bulk-actions'); selection.setAttribute('aria-label', 'Transaction selection');
     const selectLabel = el('label', 'finance-bulk-toggle'), selectAll = el('input'); selectAll.type = 'checkbox'; selectAll.disabled = busy || !rows.length; selectAll.setAttribute('aria-label', 'Select all matching transactions');
     const count = rows.filter(row => selected.has(row.id)).length; selectAll.checked = !!rows.length && count === rows.length; selectAll.indeterminate = count > 0 && count < rows.length;
@@ -203,23 +236,42 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     root.append(selection);
     if (!rows.length) { root.append(el('p', 'finance-no-results', 'No transactions match these filters.')); return; }
     const scroll = el('div', 'finance-table-scroll'), table = el('table', 'finance-table'), thead = el('thead'), tr = el('tr');
-    for (const title of ['Select', 'Date', 'Description', 'Account', 'Category', 'Amount', 'Actions']) { const th = el('th', '', title); th.scope = 'col'; tr.append(th); } thead.append(tr); table.append(thead);
-    const tbody = el('tbody');
-    for (const row of rows.slice(page * pageSize, page * pageSize + pageSize)) {
-      const tr = el('tr');
-      tr.classList.toggle('is-selected', selected.has(row.id));
-      const selectionCell = el('td', 'finance-selection-cell'), checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(row.id); checkbox.disabled = busy; checkbox.dataset.transactionId = row.id; checkbox.setAttribute('aria-label', `Select ${row.payee || row.note || 'transaction'} on ${row.date}`);
-      checkbox.onchange = () => { for (const id of transactionSelection(finance!, new Set([row.id]))) { if (checkbox.checked) selected.add(id); else selected.delete(id); } renderHistory(root); root.querySelector<HTMLInputElement>(`[data-transaction-id="${CSS.escape(row.id)}"]`)?.focus(); };
-      selectionCell.append(checkbox); tr.append(selectionCell);
-      const values = [formatFinanceDate(row.date, getSettings().financeDateFormat), row.payee || row.note || 'Transaction', row.account, [row.category, row.subcategory].filter(Boolean).join(' / '), format(row.cents)];
-      values.forEach((value, index) => { const td = el('td', index === 4 ? `finance-amount ${row.cents < 0 ? 'negative' : 'positive'}` : '', value); td.dataset.label = ['Date', 'Description', 'Account', 'Category', 'Amount'][index]; if (index === 1 && row.payee && row.note) td.append(el('small', 'finance-row-note', row.note)); if (index === 1 && row.transferId) td.append(el('small', 'finance-row-note', 'Linked transfer')); tr.append(td); });
-      const actions = el('td', 'finance-row-actions');
-      const kind = row.transferId ? 'transfer' : row.cents < 0 ? 'expense' : 'income';
-      actions.append(action('Edit', () => transactionDialog(kind, row)), action('Repeat', () => transactionDialog(kind, row, true)), action('Delete', () => void remove(row))); tr.append(actions); tbody.append(tr);
+    const runningBalances = balancesAfterTransactions(finance.transactions);
+    for (const title of ['Select', 'Date', 'Description', 'Account', 'Category', 'Amount', 'Balance after', 'Actions']) { const th = el('th', '', title); th.scope = 'col'; if (title === 'Balance after') th.title = 'Account balance after this entry in date order. Same-day entries follow stored ledger order. Includes transactions outside these filters.'; tr.append(th); } thead.append(tr); table.append(thead);
+    const pageRows = rows.slice(page * pageSize, page * pageSize + pageSize), visible = new Set(pageRows.map(row => row.id));
+    const groups = grouping ? groupTransactionsByDate(rows).filter(item => item.rows.some(row => visible.has(row.id))) : [{ date: '', rows: pageRows }];
+    for (const group of groups) {
+      const tbody = el('tbody');
+      const shown = group.rows.filter(row => visible.has(row.id));
+      if (grouping) {
+        tbody.dataset.date = group.date;
+        const header = el('tr', 'finance-date-group'), cell = el('th'); cell.colSpan = 8; cell.scope = 'rowgroup';
+        const heading = el('div', 'finance-date-heading'), title = el('span', 'finance-date-title');
+        title.append(el('strong', '', formatFinanceDate(group.date, getSettings().financeDateFormat)), el('span', 'finance-local', shown.length === group.rows.length ? `${group.rows.length.toLocaleString()} entries` : `${shown.length.toLocaleString()} of ${group.rows.length.toLocaleString()} entries shown`));
+        const total = el('span', 'finance-date-total');
+        try { const net = summarizeTransactions(group.rows).net; total.textContent = `Net ${format(net)}${shown.length < group.rows.length ? ' · full date' : ''}`; total.classList.add(net < 0 ? 'negative' : 'positive'); }
+        catch { total.textContent = 'Total exceeds supported range'; }
+        heading.append(title, total); cell.append(heading); header.append(cell); tbody.append(header);
+      }
+      for (const row of shown) {
+        const tr = el('tr'); tr.dataset.transactionId = row.id;
+        tr.classList.toggle('is-selected', selected.has(row.id));
+        const selectionCell = el('td', 'finance-selection-cell'), checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(row.id); checkbox.disabled = busy; checkbox.dataset.transactionId = row.id; checkbox.setAttribute('aria-label', `Select ${row.payee || row.note || 'transaction'} on ${row.date}`);
+        checkbox.onchange = () => { for (const id of transactionSelection(finance!, new Set([row.id]))) { if (checkbox.checked) selected.add(id); else selected.delete(id); } renderHistory(root); root.querySelector<HTMLInputElement>(`input[data-transaction-id="${CSS.escape(row.id)}"]`)?.focus(); };
+        selectionCell.append(checkbox); tr.append(selectionCell);
+        const values = [formatFinanceDate(row.date, getSettings().financeDateFormat), row.payee || row.note || 'Transaction', row.account, [row.category, row.subcategory].filter(Boolean).join(' / '), format(row.cents)];
+        values.forEach((value, index) => { const td = el('td', index === 4 ? `finance-amount ${row.cents < 0 ? 'negative' : 'positive'}` : '', value); td.dataset.label = ['Date', 'Description', 'Account', 'Category', 'Amount'][index]; if (index === 1 && row.payee && row.note) td.append(el('small', 'finance-row-note', row.note)); if (index === 1 && row.transferId) td.append(el('small', 'finance-row-note', 'Linked transfer')); tr.append(td); });
+        const remaining = runningBalances.get(row.id), balanceCell = el('td', `finance-amount finance-running-balance${remaining !== null && remaining !== undefined && remaining < 0 ? ' negative' : ''}`, remaining === null || remaining === undefined ? 'Out of range' : format(remaining)); balanceCell.dataset.label = 'Balance after'; tr.append(balanceCell);
+        const actions = el('td', 'finance-row-actions');
+        const kind = row.transferId ? 'transfer' : row.cents < 0 ? 'expense' : 'income';
+        actions.append(action('Edit', () => transactionDialog(kind, row)), action('Repeat', () => transactionDialog(kind, row, true)), action('Delete', () => void remove(row))); tr.append(actions); tbody.append(tr);
+      }
+      table.append(tbody);
     }
-    table.append(tbody); scroll.append(table); root.append(scroll);
+    scroll.append(table); root.append(scroll);
     const pagination = el('div', 'finance-pagination');
-    const previous = action('Previous', () => { page--; renderHistory(root); }), next = action('Next', () => { page++; renderHistory(root); }); previous.disabled = page === 0; next.disabled = page >= totalPages - 1;
+    const turnPage = (step: number, label: string) => { page += step; renderHistory(root); const control = root.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`); if (control && !control.disabled) control.focus(); else root.querySelector<HTMLSelectElement>('[aria-label="Group transactions"]')?.focus(); };
+    const previous = action('Previous', () => turnPage(-1, 'Previous')), next = action('Next', () => turnPage(1, 'Next')); previous.disabled = page === 0; next.disabled = page >= totalPages - 1;
     pagination.append(previous, el('span', '', `Page ${page + 1} of ${totalPages}`), next); root.append(pagination);
   }
   async function bulkRemove(ids: Set<string>) {

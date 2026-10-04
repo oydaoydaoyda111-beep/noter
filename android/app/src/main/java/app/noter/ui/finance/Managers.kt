@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
@@ -58,8 +57,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import app.noter.finance.Finance
 import app.noter.finance.addCategory
 import app.noter.finance.archiveAccount
@@ -70,6 +67,7 @@ import app.noter.finance.isTransferCategory
 import app.noter.finance.mergeCategories
 import app.noter.finance.renameCategory
 import app.noter.finance.updateAccount
+import app.noter.ui.FullScreenDialog
 import app.noter.ui.MessageDialog
 import app.noter.ui.NoterColors
 import kotlinx.coroutines.launch
@@ -109,9 +107,9 @@ private fun ManagerFrame(
     onClose: () -> Unit,
     content: LazyListScope.() -> Unit,
 ) {
-    Dialog(onDismissRequest = { if (!applier.saving) onClose() }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    FullScreenDialog(onDismissRequest = { if (!applier.saving) onClose() }) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Box(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
+            Box(Modifier.fillMaxSize().imePadding()) {
                 Column(Modifier.fillMaxSize()) {
                     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = onClose, enabled = !applier.saving) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close $title") }
@@ -141,7 +139,7 @@ private fun ManagerFrame(
                     onClick = { if (!applier.saving) onAdd() },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
                     text = { Text(addLabel) },
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp).semantics { contentDescription = addLabel },
                 )
             }
         }

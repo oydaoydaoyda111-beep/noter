@@ -69,7 +69,11 @@ internal fun Instrumentation.checkNoteSearchUi() {
                 for (i in 0 until node.childCount) node.getChild(i)?.let(::describe)
             }
             uiAutomation.rootInActiveWindow?.let(::describe)
-            error("Search UI accessibility element did not appear: ${visible.take(30)}")
+            uiAutomation.takeScreenshot()?.let { bitmap ->
+                File(targetContext.getExternalFilesDir(null), "note-search-failure.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                bitmap.recycle()
+            }
+            error("Search UI accessibility element did not appear: ${visible.take(80)}")
         }
         fun click(label: String) {
             uiAutomation.waitForIdle(100, 2000)

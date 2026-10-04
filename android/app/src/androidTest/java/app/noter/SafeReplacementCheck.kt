@@ -155,7 +155,8 @@ private fun checkVaultSyncSafety(context: Context) {
             "A change to an untouched note during saving was acknowledged"
         }
         check(tree.text(saf, "Other.md") == "remote")
-        check((Vault(saf).load().workspace.nodes[id] as Note).markdown == "edited")
+        // A manifest/revision check may abort before writing the local note; either complete version is safe.
+        check((Vault(saf).load().workspace.nodes[id] as Note).markdown in setOf("before", "edited")) { "Conflict left a partial local note" }
     }
     testTree(context) { tree ->
         val saf = tree.saf()

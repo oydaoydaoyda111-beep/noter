@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -63,8 +62,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import app.noter.finance.Defaults
 import app.noter.finance.Finance
 import app.noter.finance.TRANSFER_CATEGORY
@@ -77,6 +74,7 @@ import app.noter.finance.registerCategory
 import app.noter.finance.saveTransaction
 import app.noter.finance.today
 import app.noter.model.Settings
+import app.noter.ui.FullScreenDialog
 import app.noter.ui.NoterColors
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -183,9 +181,9 @@ fun TransactionEditor(
         else -> MaterialTheme.colorScheme.primary
     }
 
-    Dialog(onDismissRequest = { if (!saving) onClose() }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    FullScreenDialog(onDismissRequest = { if (!saving) onClose() }) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
+            Column(Modifier.fillMaxSize().imePadding()) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = onClose, enabled = !saving) { Icon(Icons.Default.Close, contentDescription = "Close transaction editor") }
                     Text(

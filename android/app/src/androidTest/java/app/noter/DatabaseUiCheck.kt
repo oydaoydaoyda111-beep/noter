@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -28,6 +29,8 @@ import app.noter.model.databaseMarkdown
 import app.noter.ui.EditorPane
 import app.noter.ui.NoterTheme
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** Exercises actual Compose controls and a synced reload using only a synthetic note buffer. */
 internal fun Instrumentation.checkDatabaseUi() {
@@ -106,6 +109,16 @@ internal fun Instrumentation.checkDatabaseUi() {
             }
             uiAutomation.rootInActiveWindow?.let(::describe)
             error("Database state '$label' did not appear: view=${database().viewId}, filter=${database().filter}, visible=${labels.take(30)}")
+        }
+        fun awaitReloadFrame() {
+            val rendered = CountDownLatch(1)
+            runOnMainSync {
+                Choreographer.getInstance().postFrameCallback {
+                    Choreographer.getInstance().postFrameCallback { rendered.countDown() }
+                }
+            }
+            check(rendered.await(5, TimeUnit.SECONDS)) { "Synced editor reload did not render" }
+            waitForIdleSync()
         }
         fun screenshot(name: String) {
             uiAutomation.waitForIdle(100, 2000)
@@ -293,6 +306,7 @@ internal fun Instrumentation.checkDatabaseUi() {
             note = note.copy(markdown = "Synced introduction.\n\n${databaseMarkdown(incoming)}\nKeep this ending.")
             generation++
         }
+        awaitReloadFrame()
         click("Save record")
         text("This database changed outside this view.")
         text("Unsaved mobile draft")
@@ -314,6 +328,7 @@ internal fun Instrumentation.checkDatabaseUi() {
             note = note.copy(markdown = "Synced introduction.\n\n${databaseMarkdown(incoming)}\nKeep this ending.")
             generation++
         }
+        awaitReloadFrame()
         click("Save view")
         text("This database changed outside this view.")
         text("Unsaved view name")

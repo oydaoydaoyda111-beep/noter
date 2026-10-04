@@ -19,8 +19,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -29,9 +27,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import app.noter.model.*
+import app.noter.ui.FullScreenDialog
 import app.noter.ui.MessageDialog
 import app.noter.ui.NameDialog
 import app.noter.ui.finance.DateDialog
@@ -133,15 +130,8 @@ fun DatabaseDialog(data: NoteDatabase, onChange: (NoteDatabase) -> Unit, onClose
 
 @Composable
 private fun DialogFrame(title: String, onClose: () -> Unit, actions: @Composable RowScope.() -> Unit = {}, content: @Composable ColumnScope.() -> Unit) {
-    val host = LocalView.current
-    val bars = WindowInsets.systemBars
-    val height = with(LocalDensity.current) {
-        val pixels = host.height.takeIf { it > 0 } ?: host.resources.displayMetrics.heightPixels
-        (pixels - bars.getTop(this) - bars.getBottom(this)).coerceAtLeast(1).toDp()
-    }
-    // Compose's full-width dialog measures against display height, including space used by system bars.
-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(Modifier.height(height).fillMaxWidth(), color = MaterialTheme.colorScheme.background) {
+    FullScreenDialog(onDismissRequest = onClose) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.fillMaxSize().imePadding()) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Close $title") }

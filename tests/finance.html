@@ -44,11 +44,60 @@ async function closeAfter(action) {
 }
 const save = () => closeAfter(() => submit()), cancel = () => closeAfter(dialog => control('Cancel', dialog).click());
 function selectRow(id) { control(`Select ${id.startsWith('expense') ? `Cafe ${id.split('-')[1]}` : 'transaction'} on ${month}-01`, root).click(); }
+const ledgerTotals = () => [...root.querySelectorAll('.finance-ledger-total strong')].map(item => item.textContent);
+function checkLedgerTotals(incoming, outgoing, net, label) {
+  equal(JSON.stringify(ledgerTotals()), JSON.stringify([incoming, outgoing, net]), label);
+}
+const transactionRows = () => root.querySelectorAll('.finance-history tbody tr[data-transaction-id]');
+function group(date) { const body = root.querySelector(`.finance-history tbody[data-date="${date}"]`); if (!body) throw new Error(`Missing date group: ${date}`); return body; }
+function transactionRow(id) { const row = root.querySelector(`tr[data-transaction-id="${id}"]`); if (!row) throw new Error(`Missing transaction row: ${id}`); return row; }
+const previewAmounts = () => [...document.querySelectorAll('dialog[open] .finance-balance-preview strong')].map(item => item.textContent);
 
 try {
   app = createFinance(root, () => ({ ...defaultSettings, financePageSize: 25 }), () => {}, () => {});
-  await pause(); equal(root.querySelectorAll('.finance-history tbody tr').length, 25, 'first transaction page');
+  await pause(); equal(transactionRows().length, 25, 'first transaction page');
   const report = root.querySelector('.finance-reports'), savedLogs = disk.length;
+  equal(transactionRow('expense-0').querySelector('.finance-running-balance').textContent, '-1.00', 'first entry shows account balance after that transaction');
+  control('Edit', transactionRow('expense-0')).click();
+  equal(JSON.stringify(previewAmounts()), JSON.stringify(['-35.00']), 'editing existing expense previews replacement without double counting'); await cancel();
+  control('Repeat', transactionRow('expense-0')).click();
+  equal(JSON.stringify(previewAmounts()), JSON.stringify(['-36.00']), 'repeating an expense previews an additional transaction'); await cancel();
+  control('− Expense', root).click(); input(named('amount'), '2.00', 'input');
+  equal(JSON.stringify(previewAmounts()), JSON.stringify(['-37.00']), 'new expense preview updates as amount is typed');
+  input(named('account'), 'Savings'); equal(JSON.stringify(previewAmounts()), JSON.stringify(['3.00']), 'expense preview follows chosen account');
+  input(named('amount'), 'invalid', 'input'); equal(previewAmounts().length, 0, 'invalid amount removes stale balance preview');
+  equal(!!document.querySelector('dialog[open] .finance-balance-preview .finance-local')?.textContent, true, 'invalid balance preview gives a hint'); await cancel();
+  control('⇄ Transfer', root).click(); input(named('amount'), '2.00', 'input');
+  equal(JSON.stringify(previewAmounts()), JSON.stringify(['-37.00', '7.00']), 'transfer preview updates both account balances');
+  input(named('destination'), 'Checking'); equal(previewAmounts().length, 0, 'invalid transfer clears stale account previews'); await cancel();
+  equal(disk.length, savedLogs, 'opening and canceling balance previews never changes synced logs');
+  equal(control('Group transactions', root).value, 'date', 'transactions group by date by default');
+  equal(root.querySelector('.finance-ledger-summary').getAttribute('aria-label'), 'All transaction totals', 'unfiltered totals accessible name');
+  checkLedgerTotals('5.00', '35.00', '-30.00', 'ledger totals include transfers across every matching page');
+  const firstGroup = group(`${month}-01`), groupHeading = firstGroup.querySelector('.finance-date-group th');
+  equal(groupHeading.scope, 'rowgroup', 'date heading identifies table row group'); equal(groupHeading.colSpan, 8, 'date heading spans ledger columns');
+  equal(groupHeading.textContent.includes('25 of 32 entries shown'), true, 'date group describes a partial page');
+  equal(firstGroup.querySelector('.finance-date-total').textContent.includes('-30.00'), true, 'date total includes rows outside current page');
+  selectRow('expense-0'); control('Group transactions', root).focus(); input(control('Group transactions', root), '');
+  equal(root.querySelectorAll('.finance-date-group').length, 0, 'flat list hides date headings');
+  equal(root.querySelector('[data-transaction-id="expense-0"] input').checked, true, 'changing grouping preserves selection');
+  equal(document.activeElement.getAttribute('aria-label'), 'Group transactions', 'changing grouping keeps keyboard focus');
+  checkLedgerTotals('5.00', '35.00', '-30.00', 'selection and flat grouping preserve filtered totals');
+  input(control('Group transactions', root), 'date'); control('Clear selection', root).click(); control('Next', root).click();
+  equal(transactionRows().length, 7, 'second grouped page contains remaining transaction rows');
+  equal(transactionRow('out').querySelector('.finance-running-balance').textContent, '-35.00', 'running balance includes preceding transactions across pages');
+  equal(transactionRow('in').querySelector('.finance-running-balance').textContent, '5.00', 'incoming transfer shows destination account balance');
+  equal(group(`${month}-01`).querySelector('.finance-date-group').textContent.includes('7 of 32 entries shown'), true, 'second grouped page describes remaining entries');
+  checkLedgerTotals('5.00', '35.00', '-30.00', 'pagination preserves complete filtered totals'); control('Previous', root).click();
+  input(control('Accounts', root), 'Savings'); checkLedgerTotals('5.00', '0.00', '5.00', 'account filter includes matching side of a transfer');
+  equal(root.querySelector('.finance-ledger-summary').getAttribute('aria-label'), 'Filtered transaction totals', 'active filter totals accessible name');
+  control('Clear filters', root).click(); input(control('Categories', root), 'Food'); checkLedgerTotals('0.00', '30.00', '-30.00', 'category filter recalculates ledger totals');
+  input(control('Accounts', root), 'Savings'); checkLedgerTotals('0.00', '0.00', '0.00', 'empty combined filters have zero totals');
+  equal(root.querySelectorAll('.finance-date-group').length, 0, 'empty filter has no date headings');
+  control('Clear filters', root).click();
+  input(root.querySelectorAll('.finance-filters input[type="date"]')[0], `${month}-02`); checkLedgerTotals('0.00', '0.00', '0.00', 'from date filter recalculates ledger totals');
+  control('Clear filters', root).click(); checkLedgerTotals('5.00', '35.00', '-30.00', 'clear filters restores full totals');
+  equal(disk.length, savedLogs, 'grouping filtering and selection never append to synced logs');
   report.querySelector('summary').click(); equal(report.open, true, 'reports disclosure opens');
   const totals = () => [...report.querySelectorAll('.finance-report-total strong')].map(item => item.textContent);
   equal(JSON.stringify(totals()), JSON.stringify(['0.00', '30.00', '-30.00']), 'monthly cash flow excludes transfers');
@@ -68,6 +117,8 @@ try {
   equal(document.activeElement.getAttribute('aria-label'), 'Report month', 'month selector keeps keyboard focus');
   input(control('Report month', report), month);
   input(control('Search transactions', root), 'Cafe 1', 'input'); selectRow('expense-1');
+  equal(transactionRow('expense-1').querySelector('.finance-running-balance').textContent, '-2.00', 'filtered running balance includes hidden earlier transactions');
+  checkLedgerTotals('0.00', '11.00', '-11.00', 'search totals cover all matching descriptions');
   equal(report.querySelector('.finance-report-total:nth-child(2) strong').textContent, '30.00', 'reports independent of ledger filters');
   control('View month transactions', report).click();
   equal(control('Accounts', root).value, 'Checking', 'report drills into chosen account');
@@ -75,6 +126,7 @@ try {
   const dates = [...root.querySelectorAll('.finance-filters input[type="date"]')].map(item => item.value), end = new Date(`${month}-01T12:00:00Z`); end.setUTCMonth(end.getUTCMonth() + 1, 0);
   equal(JSON.stringify(dates), JSON.stringify([`${month}-01`, end.toISOString().slice(0, 10)]), 'drilldown covers complete calendar month');
   equal(root.querySelectorAll('[data-transaction-id]:checked').length, 0, 'drilldown clears bulk selection');
+  checkLedgerTotals('0.00', '35.00', '-35.00', 'report drilldown recalculates ledger account and date totals');
   equal(document.activeElement.getAttribute('aria-label'), 'Search transactions', 'drilldown focuses ledger');
   equal(report.open, true, 'report disclosure survives refresh'); equal(disk.length, savedLogs, 'reports never append to synced logs');
   control('Clear filters', root).click(); report.open = false;
@@ -140,7 +192,24 @@ try {
   control('Select all matching transactions', root).click(); control('Edit selected transactions', root).click(); named('change-note').click(); input(named('note'), 'Keep draft'); failure = true; submit(); await pause();
   equal(named('note').value, 'Keep draft', 'failed bulk edit preserves draft'); equal(state().transactions.some(row => row.note === 'Keep draft'), false, 'failed bulk edit keeps acknowledged records');
   await cancel(); failure = false; await app.reload();
-  report.querySelector('summary').focus({ preventScroll: true }); report.scrollIntoView({ block: 'start' });
+  report.open = false;
+  control('+ Income', root).click(); input(named('date'), `${month}-02`); input(named('amount'), '123.45'); input(named('payee'), 'Synthetic salary'); await save();
+  checkLedgerTotals('123.45', '30.00', '93.45', 'saved income updates full ledger totals');
+  equal(root.querySelectorAll('.finance-date-group').length, 2, 'different dates produce separate row groups');
+  equal(group(`${month}-02`).querySelectorAll('tr[data-transaction-id]').length, 1, 'newest date group contains its matching transaction');
+  equal(group(`${month}-01`).querySelector('.finance-date-group').textContent.includes('24 of 30 entries shown'), true, 'page boundary counts within the older date');
+  equal(group(`${month}-01`).querySelector('.finance-date-total').textContent.includes('-30.00'), true, 'older date total includes the next page');
+  const groupingLogs = disk.length;
+  input(control('Group transactions', root), ''); app.refresh(); equal(control('Group transactions', root).value, '', 'flat grouping survives refresh');
+  await app.reload(); equal(control('Group transactions', root).value, '', 'flat grouping survives reload');
+  checkLedgerTotals('123.45', '30.00', '93.45', 'reload preserves saved income in ledger totals');
+  input(control('Group transactions', root), 'date'); await app.reload(); equal(control('Group transactions', root).value, 'date', 'date grouping survives reload');
+  equal(disk.length, groupingLogs, 'grouping preference never appends to synced logs');
+  const dateFilters = root.querySelectorAll('.finance-filters input[type="date"]');
+  input(dateFilters[0], `${month}-02`); input(dateFilters[1], `${month}-02`);
+  checkLedgerTotals('123.45', '0.00', '123.45', 'inclusive date range totals only matching day');
+  equal(transactionRows().length, 1, 'inclusive date filter contains one matching income');
+  control('Clear filters', root).click(); control('Group transactions', root).focus({ preventScroll: true }); root.querySelector('.finance-history').scrollIntoView({ block: 'start' });
   document.body.dataset.financeCheck = 'passed'; document.getElementById('result').textContent = `${checks} finance checks passed.`;
 } catch (error) { document.body.dataset.financeCheck = 'failed'; document.getElementById('result').textContent = error.stack; }
 </script>

@@ -32,13 +32,21 @@ import org.json.JSONObject
 
 /** Runs against real Android JSON/document APIs without a separate test framework. */
 class StorageContractCheck : Instrumentation() {
+    private var financeUiOnly = false
+
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
+        financeUiOnly = arguments?.getString("check") == "finance-ui"
         start()
     }
 
     override fun onStart() {
         try {
+            if (financeUiOnly) {
+                checkFinanceUi()
+                finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "Android Finance navigation and keyboard checks passed.\n") })
+                return
+            }
             checkFinanceFormat()
             checkSettingsFormat()
             checkVaultFormat()
@@ -47,8 +55,9 @@ class StorageContractCheck : Instrumentation() {
             checkNoteSearchUi()
             checkDatabaseFormat()
             checkDatabaseUi()
+            checkFinanceUi()
             checkForegroundPolling()
-            finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "Shared file storage, note search, Android databases and foreground polling checks passed.\n") })
+            finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "Shared file storage, note search, Android databases, Finance navigation and foreground polling checks passed.\n") })
         } catch (error: Throwable) {
             finish(Activity.RESULT_CANCELED, Bundle().apply {
                 putString("stream", error.stackTraceToString())
@@ -174,7 +183,10 @@ class StorageContractCheck : Instrumentation() {
         check(loaded.workspace.rootIds == listOf("personal", "inbox"))
         val changed = WorkspaceOps.edit(loaded.workspace, "overview", fixture("Personal/Overview.md") + "\nEdited on Android.\n")
         val revision = vault.save(changed, loaded.revision)
-        check(Vault(saf).load().workspace == changed) { "Note, IDs, order, or settings changed after saving and reopening" }
+        // Text-only saves keep published node timestamps stable to avoid Syncthing manifest conflicts.
+        val edited = (changed.nodes.getValue("overview") as Note).copy(updatedAt = (loaded.workspace.nodes.getValue("overview") as Note).updatedAt)
+        val expected = changed.copy(nodes = changed.nodes + ("overview" to edited))
+        check(Vault(saf).load().workspace == expected) { "Note, IDs, order, or settings changed after saving and reopening" }
         saf.writeAtomic("Inbox.md", (fixture("Inbox.md") + "\nIncoming desktop edit.\n").toByteArray())
         val conflict = runCatching { vault.save(changed, revision) }.exceptionOrNull()
         check(conflict is SyncConflictException) { "Incoming synced changes were overwritten" }

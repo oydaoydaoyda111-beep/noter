@@ -148,7 +148,9 @@ internal fun Instrumentation.checkDatabaseFormat() {
         val changedWorkspace = WorkspaceOps.edit(reopened.workspace, databaseId, changedMarkdown)
         vault.save(changedWorkspace, reopened.revision)
         val changedReload = Vault(saf).load()
-        check(changedReload.workspace == changedWorkspace) { "Reopened database edits did not persist" }
+        // Text-only database edits preserve the published note timestamp, as ordinary Markdown edits do.
+        val expectedNote = (changedWorkspace.nodes.getValue(databaseId) as Note).copy(updatedAt = (reopened.workspace.nodes.getValue(databaseId) as Note).updatedAt)
+        check(changedReload.workspace == changedWorkspace.copy(nodes = changedWorkspace.nodes + (databaseId to expectedNote))) { "Reopened database edits did not persist" }
         val reopenedDatabase = databaseBlocks((changedReload.workspace.nodes[databaseId] as Note).markdown).single().database
         check(reopenedDatabase.viewId == changedDatabase.viewId && reopenedDatabase.views.last().name == "Mobile tasks")
         check(reopenedDatabase.visibleColumns().none { it.id == "score" })
