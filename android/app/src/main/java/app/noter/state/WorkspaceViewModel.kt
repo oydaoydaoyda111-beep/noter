@@ -64,9 +64,10 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         if (active && pollJob?.isActive == true) return
         pollJob?.cancel()
         pollJob = if (active) viewModelScope.launch {
+            checkExternalChanges(force = true)
             while (true) {
-                checkExternalChanges()
                 delay(POLL_MS)
+                checkExternalChanges()
             }
         } else null
     }
@@ -188,11 +189,11 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch { flush() }
     }
 
-    private suspend fun checkExternalChanges() {
+    private suspend fun checkExternalChanges(force: Boolean = false) {
         val target = vault ?: return
         if (screen != Screen.Ready || dirty || conflict != null || recovering || lock.isLocked) return
         val changed = try {
-            withContext(Dispatchers.IO) { target.revision() != revision }
+            withContext(Dispatchers.IO) { target.revision(force) != revision }
         } catch (problem: CancellationException) {
             throw problem
         } catch (_: Exception) {

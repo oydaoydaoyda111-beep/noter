@@ -2,7 +2,7 @@ import { copyText, openExternal } from '../desktop/platform';
 import { el, button } from '../ui/dom';
 import { icon } from '../ui/icons';
 import { askDialog } from '../ui/dialog';
-import { domToMarkdown, inlineDom, markdownToDom, safeUrl } from './markdown';
+import { codeText, domToMarkdown, inlineDom, markdownToDom, safeUrl } from './markdown';
 import { bookmark, caretAt, currentBlock, restoreBookmark, selectionRange, setRange, textBeforeCaret } from './selection';
 import { createHistory } from './history';
 import { codeLanguage, codeLanguages, highlightCodeBlocks } from './syntax';
@@ -21,6 +21,10 @@ function blankParagraph(): HTMLParagraphElement {
 
 function emptyBlock(block: HTMLElement): boolean {
   return !(block.textContent ?? '').replace(/[\u200b\s]/g, '');
+}
+
+function visibleText(text: string | null): string {
+  return (text ?? '').replace(/\u200b/g, '');
 }
 
 export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: (markdown: string) => void) {
@@ -125,7 +129,7 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
           if (!current || !root.contains(pre)) return;
           clearTimeout(current.timer); copy.disabled = true;
           try {
-            await copyText(pre.textContent ?? '');
+            await copyText(codeText(pre));
             label.textContent = 'Copied'; copy.replaceChild(icon('check'), copy.firstChild!);
             copy.dataset.state = 'copied';
           } catch {
@@ -328,7 +332,9 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     }
     if (style === 'pre') {
       const pre = el('pre'); pre.dataset.language = 'code';
-      const code = el('code', '', block.textContent?.replace(/\u200b/g, '') ?? '');
+      const text = block.tagName === 'PRE' ? codeText(block) : (block.textContent ?? '').replace(/\u200b/g, '');
+      const code = el('code', '', text);
+      if (!text || text.endsWith('\n')) code.append(el('br'));
       pre.append(code);
       if (block.tagName === 'LI' || block.parentElement?.tagName === 'BLOCKQUOTE') block = exitStructured(block);
       block.replaceWith(pre); caretAt(code, true);
@@ -344,15 +350,28 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
       }
     } else if (style === 'blockquote') {
       if (!block.closest('blockquote')) { const quote = el('blockquote'); block.replaceWith(quote); quote.append(block); }
-      restoreBookmark(root, position);
+      placeCaret(block, position);
     } else {
       if (block.tagName === 'LI' || block.parentElement?.tagName === 'BLOCKQUOTE') block = exitStructured(block);
       const next = el(style);
-      if (block.tagName === 'PRE') next.textContent = block.textContent;
+      if (block.tagName === 'PRE') next.textContent = codeText(block);
       else next.append(...block.childNodes);
-      block.replaceWith(next); restoreBookmark(root, position);
+      block.replaceWith(next); placeCaret(next, position);
     }
     change(); rememberSelection();
+  }
+
+  // Chromium cannot place a caret in a block without a line box, so typing would land in the previous block.
+  function placeCaret(block: HTMLElement, position: ReturnType<typeof bookmark>) {
+    if (emptyBlock(block) && !block.querySelector('br')) { block.replaceChildren(el('br')); caretAt(block); }
+    else restoreBookmark(root, position);
+  }
+
+  // A caret placed after an inline element is moved back inside it by Chromium; a zero-width text node keeps typing outside.
+  function caretAfterMark(mark: Node) {
+    const tail = document.createTextNode('\u200b');
+    mark.parentNode?.insertBefore(tail, mark.nextSibling);
+    const range = document.createRange(); range.setStart(tail, 1); range.collapse(true); setRange(range);
   }
 
   function applyMark(tag: Mark) {
@@ -364,7 +383,12 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     const selector = tag === 'strong' ? 'strong,b' : tag === 'em' ? 'em,i' : 'code';
     if (range.collapsed) {
       const existing = element?.closest(selector);
-      if (existing && root.contains(existing)) {
+      const after = existing ? range.cloneRange() : null;
+      after?.setEnd(existing!, existing!.childNodes.length);
+      if (existing && root.contains(existing) && after && visibleText(existing.textContent) && !visibleText(after.toString())) {
+        // Toggling at the end of formatted text ends the format for what is typed next.
+        caretAfterMark(existing);
+      } else if (existing && root.contains(existing)) {
         const position = bookmark(root);
         existing.replaceWith(...existing.childNodes); restoreBookmark(root, position);
       } else {
@@ -495,7 +519,8 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     }
     const last = fragment.lastChild;
     replacement.deleteContents(); replacement.insertNode(fragment);
-    if (last) { const after = document.createRange(); after.setStartAfter(last); after.collapse(true); setRange(after); }
+    if (last instanceof Element) caretAfterMark(last);
+    else if (last) { const after = document.createRange(); after.setStartAfter(last); after.collapse(true); setRange(after); }
   }
 
   function shortcuts() {
@@ -524,11 +549,23 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     }
   }
 
+  function textAfterCaret(block: HTMLElement): string {
+    const range = selectionRange(root);
+    if (!range) return '';
+    const after = range.cloneRange(); after.collapse(false); after.setEnd(block, block.childNodes.length);
+    return after.toString();
+  }
+
   function insertText(text: string) {
     const range = selectionRange(root);
     if (!range) return;
     range.deleteContents();
     const node = document.createTextNode(text); range.insertNode(node); caretAt(node, true);
+    const pre = node.parentElement?.closest('pre');
+    if (pre && codeText(pre).endsWith('\n')) {
+      const code = pre.querySelector('code') ?? pre;
+      if (code.lastChild?.nodeName !== 'BR') code.append(el('br'));
+    }
   }
 
   function enter(event: KeyboardEvent) {
@@ -611,10 +648,11 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
   document.addEventListener('selectionchange', rememberSelection);
   root.addEventListener('keydown', event => {
     if (event.isComposing) return;
-    if ((event.target as Element).closest('.database-block') && !((event.ctrlKey || event.metaKey) && ['z', 'y'].includes(event.key.toLowerCase()))) return;
+    // Windows reports AltGr as Ctrl+Alt; those keys type characters rather than shortcuts.
+    const mod = (event.ctrlKey || event.metaKey) && !event.altKey;
+    if ((event.target as Element).closest('.database-block') && !(mod && ['z', 'y'].includes(event.key.toLowerCase()))) return;
     if (slashMenu.handleKey(event)) return;
     if (event.key === 'Escape' && !floating.hidden) { event.preventDefault(); dismissFloating(); return; }
-    const mod = event.ctrlKey || event.metaKey;
     if (mod && ['b', 'i', 'k', 'z', 'y'].includes(event.key.toLowerCase())) {
       event.preventDefault();
       switch (event.key.toLowerCase()) {
@@ -638,7 +676,7 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
         event.preventDefault(); history.record(true); exitStructured(block); change(); rememberSelection();
       }
     }
-    if (event.key === 'ArrowDown' && block?.tagName === 'PRE' && range?.collapsed && textBeforeCaret(block, range).length === block.textContent?.length) {
+    if (event.key === 'ArrowDown' && block?.tagName === 'PRE' && range?.collapsed && !textAfterCaret(block)) {
       if (!block.nextElementSibling) block.after(blankParagraph());
       event.preventDefault(); caretAt(block.nextElementSibling!);
     }
@@ -646,10 +684,13 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
   root.addEventListener('paste', event => {
     if ((event.target as Element).closest('.database-block')) return;
     event.preventDefault();
-    const text = event.clipboardData?.getData('text/plain') ?? '';
+    const pasted = (event.clipboardData?.getData('text/plain') ?? '').replace(/\r\n?/g, '\n');
+    const inCode = !!currentBlock(root)?.closest('pre');
+    // Excel and Word table cells copy with a final line break; a single line still pastes inline.
+    const text = inCode ? pasted : pasted.replace(/\n$/, '');
     if (!text) return;
     history.record(true);
-    if (currentBlock(root)?.closest('pre') || !text.includes('\n')) insertText(text);
+    if (inCode || !text.includes('\n')) insertText(text);
     else {
       const range = selectionRange(root);
       const block = currentBlock(root);

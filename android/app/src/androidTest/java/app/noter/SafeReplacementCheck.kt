@@ -12,8 +12,10 @@ import android.provider.DocumentsContract.Document
 import android.provider.DocumentsProvider
 import app.noter.storage.Saf
 import app.noter.storage.Vault
+import app.noter.storage.SyncConflictException
 import app.noter.model.Note
 import app.noter.model.WorkspaceOps
+import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.util.UUID
@@ -24,6 +26,7 @@ fun withTestSaf(context: Context, test: (Saf) -> Unit) {
 }
 
 fun checkSafeReplacement(context: Context) {
+    checkVaultSyncSafety(context)
     testTree(context) { tree ->
         val saf = tree.saf()
         saf.writeAtomic("Original.md", "before".toByteArray())
@@ -91,6 +94,93 @@ fun checkSafeReplacement(context: Context) {
         saf.append(log, "{\"fourth\":4}\n".toByteArray())
         check(tree.text(saf, log) == "{\"first\":1}\n{\"second\":2}\n{\"third\":3}\n{\"fourth\":4}\n")
     }
+    testTree(context) { tree ->
+        val saf = tree.saf()
+        val log = ".noter/finance/log-test.jsonl"
+        val previous = "{\"first\":1}\n".toByteArray()
+        saf.writeAtomic(log, previous)
+        check(runCatching { saf.append(log, "{\"next\":2}\n".toByteArray(), "changed".toByteArray()) }.exceptionOrNull() is SyncConflictException)
+        check(saf.read(saf.resolve(log)!!.doc).contentEquals(previous))
+        tree.provider.truncateNextAppend = true
+        check(runCatching { saf.append(log, "{\"next\":2}\n".toByteArray(), previous) }.isFailure)
+        check(saf.list(saf.resolve(".noter/trash")!!.doc).any { saf.read(it.doc).contentEquals(previous) }) {
+            "A provider that truncated append lost the previous completed log"
+        }
+    }
+}
+
+private fun checkVaultSyncSafety(context: Context) {
+    testTree(context) { tree ->
+        val saf = tree.saf()
+        saf.writeAtomic("Test.md", "before".toByteArray())
+        val vault = Vault(saf)
+        val loaded = vault.load()
+        val id = loaded.workspace.nodes.values.filterIsInstance<Note>().single().id
+        tree.provider.change(saf.resolve("Test.md")!!.doc, "remote".toByteArray(), true)
+        check(vault.revision(true) != loaded.revision) { "Equal-size incoming content with unchanged timestamps was not detected" }
+        check(runCatching { vault.save(WorkspaceOps.edit(loaded.workspace, id, "local!"), loaded.revision) }.exceptionOrNull() is SyncConflictException)
+        check(tree.text(saf, "Test.md") == "remote") { "Incoming content was overwritten" }
+        check(runCatching { saf.read(saf.resolve("Test.md")!!.doc, 3) }.isFailure) { "The provider bypassed the byte limit" }
+        for (path in listOf("../Test.md", "/Test.md", "a//Test.md", "a\\Test.md")) check(runCatching { saf.resolve(path) }.isFailure)
+        check(runCatching { saf.writeAtomic("Test.md", "unexpected".toByteArray(), mustBeAbsent = true) }.exceptionOrNull() is SyncConflictException)
+    }
+    testTree(context) { tree ->
+        val saf = tree.saf()
+        saf.writeAtomic("Test.md", "before".toByteArray())
+        Vault(saf).load()
+        val compact = JSONObject(tree.text(saf, ".noter/workspace.json")).toString().toByteArray()
+        saf.writeAtomic(".noter/workspace.json", compact)
+        val vault = Vault(saf)
+        val loaded = vault.load()
+        check(saf.read(saf.resolve(".noter/workspace.json")!!.doc).contentEquals(compact)) { "Opening rewrote unchanged shared metadata" }
+        vault.save(loaded.workspace, loaded.revision)
+        check(saf.read(saf.resolve(".noter/workspace.json")!!.doc).contentEquals(compact)) { "A no-op save rewrote unchanged shared metadata" }
+        saf.delete(saf.resolve("Test.md")!!.doc)
+        check(runCatching { Vault(saf).load() }.exceptionOrNull() is SyncConflictException) { "A missing synced note silently discarded its ID" }
+        check(saf.read(saf.resolve(".noter/workspace.json")!!.doc).contentEquals(compact))
+        val unsupported = JSONObject(String(compact)).apply { getJSONObject("workspace").put("version", 2) }.toString().toByteArray()
+        saf.writeAtomic(".noter/workspace.json", unsupported)
+        check(runCatching { Vault(saf).load() }.isFailure)
+        check(saf.read(saf.resolve(".noter/workspace.json")!!.doc).contentEquals(unsupported))
+    }
+    testTree(context) { tree ->
+        val saf = tree.saf()
+        saf.writeAtomic("Test.md", "before".toByteArray())
+        saf.writeAtomic("Other.md", "before".toByteArray())
+        val vault = Vault(saf)
+        val loaded = vault.load()
+        val id = loaded.workspace.nodes.values.filterIsInstance<Note>().first { it.name == "Test" }.id
+        tree.provider.promotionFailure = { tree.provider.change(saf.resolve("Other.md")!!.doc, "remote".toByteArray(), true) }
+        check(runCatching { vault.save(WorkspaceOps.edit(loaded.workspace, id, "edited"), loaded.revision) }.exceptionOrNull() is SyncConflictException) {
+            "A change to an untouched note during saving was acknowledged"
+        }
+        check(tree.text(saf, "Other.md") == "remote")
+        check((Vault(saf).load().workspace.nodes[id] as Note).markdown == "edited")
+    }
+    testTree(context) { tree ->
+        val saf = tree.saf()
+        saf.writeAtomic("Test.md", "before".toByteArray())
+        val vault = Vault(saf)
+        val loaded = vault.load()
+        val id = loaded.workspace.nodes.values.filterIsInstance<Note>().single().id
+        tree.provider.deleteFailure = { throw AssertionError("Injected interruption before old-source cleanup") }
+        check(runCatching { vault.save(WorkspaceOps.rename(loaded.workspace, id, "Renamed"), loaded.revision) }.exceptionOrNull() is AssertionError)
+        val reopened = Vault(tree.saf()).load().workspace
+        check((reopened.nodes[id] as Note).name == "Renamed") { "Interrupted rename lost the stable note ID" }
+        check(tree.text(saf, "Renamed.md") == "before" && tree.text(saf, "Test.md") == "before")
+    }
+    testTree(context) { tree ->
+        val saf = tree.saf()
+        val vault = Vault(saf)
+        val loaded = vault.load()
+        val names = listOf("COM1", "COM١", "NUL", "A/B", "Résumé 📝")
+        var workspace = loaded.workspace
+        for (name in names) workspace = WorkspaceOps.addNote(workspace, name, null).first
+        vault.save(workspace, loaded.revision)
+        check(saf.list(saf.rootDoc).map { it.name }.toSet() == setOf(".noter", "_COM1.md", "COM١.md", "_NUL.md", "A_B.md", "Résumé 📝.md")) {
+            "Portable filename generation differs from desktop"
+        }
+    }
 }
 
 private fun testTree(context: Context, test: (TestTree) -> Unit) {
@@ -129,6 +219,8 @@ private class TestDocumentsProvider(private val directory: File) : DocumentsProv
     var promotionFailure: (() -> Unit)? = null
     var promotionName = "Test.md"
     var failNextAppend = false
+    var truncateNextAppend = false
+    var deleteFailure: (() -> Unit)? = null
 
     init { items["root"] = Item("root", "", "root", true, directory) }
 
@@ -177,7 +269,8 @@ private class TestDocumentsProvider(private val directory: File) : DocumentsProv
             item.file.appendText("{\"interrupted\":")
             throw FileNotFoundException("Injected partial append")
         }
-        return ParcelFileDescriptor.open(item.file, ParcelFileDescriptor.parseMode(mode))
+        val actualMode = if (mode == "wa" && truncateNextAppend) { truncateNextAppend = false; "wt" } else mode
+        return ParcelFileDescriptor.open(item.file, ParcelFileDescriptor.parseMode(actualMode))
     }
 
     override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
@@ -207,6 +300,11 @@ private class TestDocumentsProvider(private val directory: File) : DocumentsProv
     }
 
     override fun deleteDocument(documentId: String) {
+        if (items[documentId]?.name == "Test.md") {
+            val failure = deleteFailure
+            deleteFailure = null
+            failure?.invoke()
+        }
         val item = items.remove(documentId) ?: throw FileNotFoundException()
         check(!item.isDir || items.values.none { it.parent == documentId })
         if (!item.isDir) check(item.file.delete())
@@ -215,5 +313,12 @@ private class TestDocumentsProvider(private val directory: File) : DocumentsProv
     fun put(name: String, bytes: ByteArray) {
         val id = createDocument("root", "application/octet-stream", name)
         items.getValue(id).file.writeBytes(bytes)
+    }
+
+    fun change(documentId: String, bytes: ByteArray, preserveModified: Boolean) {
+        val file = items.getValue(documentId).file
+        val modified = file.lastModified()
+        file.writeBytes(bytes)
+        if (preserveModified) check(file.setLastModified(modified))
     }
 }

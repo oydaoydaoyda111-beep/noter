@@ -1,16 +1,15 @@
 package app.noter.finance
 
 import org.json.JSONArray
-import org.json.JSONException
 import org.json.JSONObject
 
 // Finance is stored as one append-only log per device in .noter/finance/log-<device>.jsonl.
-// Each device appends only to its own file, so Syncthing never produces conflicting copies.
+// Each device appends only to its own file, reducing competing writes during normal sync.
 // Every line is one batch of changes; replaying all batches ordered by (ts, dev, seq) gives
 // the current data, with the latest change winning for each transaction or setting.
 // The desktop client implements the same format in src/finance/log.ts; keep both in step.
 
-private val META_KEYS = listOf("accounts", "categories", "categoryDefinitions", "defaults", "sourceName", "templateSha256")
+private val META_KEYS = listOf("accounts", "categories", "categoryDefinitions", "defaults", "sourceName", "templateSha256", "budgets")
 
 class LogFile(val name: String, val text: String)
 
@@ -26,8 +25,31 @@ private fun logInvalid(): Nothing =
 
 private fun JSONObject.long(key: String): Long = safeInteger(opt(key)) ?: logInvalid()
 
+private fun sameJson(left: Any?, right: Any?): Boolean = when {
+    left is Number && right is Number -> left.toDouble() == right.toDouble()
+    left is JSONArray && right is JSONArray -> left.length() == right.length() && (0 until left.length()).all { sameJson(left.opt(it), right.opt(it)) }
+    left is JSONObject && right is JSONObject -> left.length() == right.length() && left.keys().asSequence().all { right.has(it) && sameJson(left.opt(it), right.opt(it)) }
+    else -> left == right
+}
+
+private fun validMeta(key: String, value: Any?) {
+    if (value == JSONObject.NULL && key in listOf("defaults", "categoryDefinitions", "budgets")) return
+    when (key) {
+        "accounts" -> {
+            val names = HashSet<String>()
+            for (account in accountsFromJson(value)) if (account.name.isEmpty() || !names.add(account.name)) logInvalid()
+        }
+        "categories" -> value.strings()
+        "categoryDefinitions" -> definitionsFromJson(value)
+        "defaults" -> defaultsFromJson(value)
+        "budgets" -> validateFinance(Finance(listOf(Account("validation", "")), emptyList(), emptyList(), "", ByteArray(0), budgets = budgetsFromJson(value)))
+        "sourceName", "templateSha256" -> if (value !is String) logInvalid()
+        else -> logInvalid()
+    }
+}
+
 private fun parseBatch(line: String): Batch {
-    val json = try { JSONObject(line) } catch (_: JSONException) { logInvalid() }
+    val json = try { strictJsonObject(line) } catch (_: FinanceException) { logInvalid() }
     if (safeInteger(json.opt("v")) != 1L) logInvalid()
     val dev = json.opt("dev") as? String ?: logInvalid()
     val opsJson = json.optJSONArray("ops") ?: logInvalid()
@@ -40,8 +62,16 @@ private fun parseBatch(line: String): Batch {
                 val id = op.opt("id") as? String ?: logInvalid()
                 val tx = op.opt("tx")
                 if (id.isEmpty() || !(tx == JSONObject.NULL || (tx is JSONObject && tx.opt("id") == id))) logInvalid()
+                if (tx is JSONObject) {
+                    val row = transactionFromJson(tx)
+                    if (!validDate(row.date) || row.cents == 0L || row.cents !in -MAX_SAFE..MAX_SAFE || row.account.isEmpty()) logInvalid()
+                }
             }
-            "meta" -> if (op.opt("key") !in META_KEYS) logInvalid()
+            "meta" -> {
+                val key = op.opt("key") as? String ?: logInvalid()
+                if (key !in META_KEYS || !op.has("value")) logInvalid()
+                validMeta(key, op.opt("value"))
+            }
             else -> logInvalid()
         }
         op
@@ -61,7 +91,12 @@ fun parseLogs(files: List<LogFile>, device: String): ParsedLogs {
         for (line in lines.dropLast(1)) {
             if (line.isBlank()) continue
             val batch = parseBatch(line)
-            seen["${batch.dev}\u0000${batch.seq}"] = batch
+            val identity = "${batch.dev}\u0000${batch.seq}"
+            val previous = seen[identity]
+            if (previous != null && (previous.ts != batch.ts || !sameJson(JSONArray(previous.ops), JSONArray(batch.ops)))) {
+                throw FinanceException("Finance logs contain conflicting batches from the same device. Both versions have been kept. Resolve the conflicting log copies or restore a valid backup before editing.")
+            }
+            if (previous == null) seen[identity] = batch
             clock = maxOf(clock, batch.ts)
             if (batch.dev == device) seq = maxOf(seq, batch.seq)
         }
@@ -107,6 +142,7 @@ fun replayFinance(batches: List<Batch>): FinanceState? {
         template = ByteArray(0),
         defaults = present("defaults")?.let(::defaultsFromJson),
         categoryDefinitions = present("categoryDefinitions")?.let(::definitionsFromJson),
+        budgets = present("budgets")?.let(::budgetsFromJson),
     )
     return FinanceState(finance, present("templateSha256") as? String ?: "")
 }
@@ -117,6 +153,7 @@ private fun metaValue(finance: Finance, key: String, templateSha256: String): An
     "categoryDefinitions" -> finance.categoryDefinitions
     "defaults" -> finance.defaults
     "sourceName" -> finance.sourceName
+    "budgets" -> finance.budgets
     else -> templateSha256
 }
 
@@ -126,6 +163,7 @@ private fun metaJson(value: Any?, key: String): Any = when (key) {
     "categories" -> JSONArray(value as List<String>)
     "categoryDefinitions" -> (value as List<FinanceCategory>?)?.let(::definitionsToJson) ?: JSONObject.NULL
     "defaults" -> (value as Defaults?)?.let(::defaultsToJson) ?: JSONObject.NULL
+    "budgets" -> (value as List<Budget>?)?.let(::budgetsToJson) ?: JSONObject.NULL
     else -> value as String
 }
 
@@ -134,6 +172,7 @@ fun diffFinance(base: FinanceState?, next: Finance, templateSha256: String): Lis
     val ops = ArrayList<JSONObject>()
     if (base == null) ops += JSONObject().put("k", "reset")
     for (key in META_KEYS) {
+        if (key == "budgets" && base?.finance?.budgets == null && next.budgets == null) continue
         val value = metaValue(next, key, templateSha256)
         if (base == null || metaValue(base.finance, key, base.templateSha256) != value) {
             ops += JSONObject().put("k", "meta").put("key", key).put("value", metaJson(value, key))

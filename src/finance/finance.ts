@@ -8,6 +8,11 @@ import { categoryCatalog, registerCategory } from './categories';
 import { manageAccounts } from './account-manager';
 import { manageCategories } from './category-manager';
 import { createCategorySelectors } from './category-selectors';
+import { createBudgetView } from './budget-view';
+import { createReportView } from './report-view';
+import { monthRange } from './reports';
+import { editTransactions } from './bulk-editor';
+import { removeTransactions, transactionSelection } from './bulk';
 import type { Settings } from '../types';
 import { formatFinanceAmount, formatFinanceDate } from '../settings/model';
 
@@ -18,8 +23,14 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
   let busy = false, loaded = false, loadError = false;
   let query = '', accountFilter = '', categoryFilter = '', from = '', until = '';
   let page = 0;
+  const selected = new Set<string>();
   const status = el('p', 'finance-status'); status.setAttribute('role', 'status');
   const body = el('div', 'finance-body'); root.append(body, status);
+  const budgets = createBudgetView(() => finance!, commit, format);
+  const reports = createReportView(() => finance!, format, (month, account) => {
+    query = categoryFilter = ''; accountFilter = account; [from, until] = monthRange(month); page = 0; selected.clear(); render();
+    root.querySelector('.finance-history')?.scrollIntoView({ block: 'start' }); root.querySelector<HTMLInputElement>('input[type="search"]')?.focus({ preventScroll: true });
+  });
   function message(text: string, error = false) { status.textContent = text; status.classList.toggle('is-error', error); }
   function action(label: string, callback: () => void, primary = false) {
     const control = button(label, primary ? 'button-primary' : 'button-secondary'); control.textContent = label; control.onclick = callback; control.disabled = busy; return control;
@@ -53,6 +64,7 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
       busy = true; render(); message('Reading workbook…');
       const next = await importWorkbook(file.bytes, file.name);
       await persistFinance(next); finance = next; page = 0;
+      selected.clear();
       query = accountFilter = categoryFilter = from = until = '';
       message(`Imported ${next.transactions.length.toLocaleString()} transactions and ${next.accounts.length} accounts. Saved on this device.`);
     } catch (error) { message(error instanceof Error ? error.message : String(error), true); }
@@ -148,9 +160,10 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     summary.append(card('Total balance', [...balance.values()].reduce((sum, cents) => sum + cents, 0)));
     for (const account of finance.accounts) summary.append(card(`${account.name}${account.archived ? ' · Archived' : ''}`, balance.get(account.name) ?? 0, getSettings().financeShowAccountNotes ? account.note : undefined)); body.append(summary);
     const entry = el('div', 'finance-entry'); entry.append(action('− Expense', () => transactionDialog('expense'), true), action('+ Income', () => transactionDialog('income')), action('⇄ Transfer', () => transactionDialog('transfer')), action('Manage accounts', () => manageAccounts(() => finance!, commit, format, () => getSettings().financeDefaultAccount, setDefaultAccount)), action('Manage categories', () => manageCategories(() => finance!, commit))); body.append(entry);
+    reports.refresh(busy); body.append(reports.root); budgets.refresh(busy); body.append(budgets.root);
     const filters = el('div', 'finance-filters');
     const history = el('div', 'finance-history');
-    function redraw() { page = 0; renderHistory(history); }
+    function redraw() { page = 0; selected.clear(); renderHistory(history); }
     const search = el('input', 'field-input'); search.type = 'search'; search.placeholder = 'Search transactions…'; search.setAttribute('aria-label', 'Search transactions'); search.value = query; search.oninput = () => { query = search.value; redraw(); }; filters.append(search);
     function filter(label: string, values: string[], value: string, update: (value: string) => void) {
       const select = el('select', 'field-input'); select.setAttribute('aria-label', label);
@@ -163,7 +176,7 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     for (const [label, value, update] of [['From date', from, (value: string) => { from = value; }], ['Until date', until, (value: string) => { until = value; }]] as const) {
       const wrapper = el('label', 'finance-date-label', label); const input = el('input', 'field-input'); input.type = 'date'; input.value = value; input.onchange = () => { update(input.value); redraw(); }; wrapper.append(input); filters.append(wrapper);
     }
-    filters.append(action('Clear filters', () => { query = accountFilter = categoryFilter = from = until = ''; page = 0; render(); }));
+    filters.append(action('Clear filters', () => { query = accountFilter = categoryFilter = from = until = ''; page = 0; selected.clear(); render(); }));
     body.append(filters, history, el('p', 'finance-local', `Source: ${finance.sourceName} · Saved in your workspace folder · Amounts use two decimal places · Excel backups preserve the other sheets`)); renderHistory(history);
   }
   function renderHistory(root: HTMLElement) {
@@ -171,15 +184,33 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     root.replaceChildren();
     const needle = query.trim().toLocaleLowerCase();
     const rows = finance.transactions.filter(row => (!accountFilter || row.account === accountFilter) && (!categoryFilter || row.category === categoryFilter) && (!from || row.date >= from) && (!until || row.date <= until) && (!needle || [row.date, formatFinanceDate(row.date, getSettings().financeDateFormat), row.account, row.category, row.subcategory, row.payee, row.note, format(row.cents)].some(value => value.toLocaleLowerCase().includes(needle)))).sort((a, b) => b.date.localeCompare(a.date));
+    const available = new Set(finance.transactions.map(row => row.id));
+    for (const id of selected) if (!available.has(id)) selected.delete(id);
     const pageSize = getSettings().financePageSize;
     const totalPages = Math.max(1, Math.ceil(rows.length / pageSize)); page = Math.min(page, totalPages - 1);
     const head = el('div', 'finance-history-heading'); head.append(el('h2', '', 'Transactions'), el('span', '', `${rows.length.toLocaleString()} entries · Net ${format(rows.reduce((sum, row) => sum + row.cents, 0))}`)); root.append(head);
+    const selection = el('div', 'finance-bulk-actions'); selection.setAttribute('aria-label', 'Transaction selection');
+    const selectLabel = el('label', 'finance-bulk-toggle'), selectAll = el('input'); selectAll.type = 'checkbox'; selectAll.disabled = busy || !rows.length; selectAll.setAttribute('aria-label', 'Select all matching transactions');
+    const count = rows.filter(row => selected.has(row.id)).length; selectAll.checked = !!rows.length && count === rows.length; selectAll.indeterminate = count > 0 && count < rows.length;
+    selectAll.onchange = () => { if (selectAll.checked) { for (const id of transactionSelection(finance!, new Set(rows.map(row => row.id)))) selected.add(id); } else selected.clear(); renderHistory(root); root.querySelector<HTMLInputElement>('[aria-label="Select all matching transactions"]')?.focus(); };
+    selectLabel.append(selectAll, document.createTextNode('Select all matching'));
+    selection.append(selectLabel);
+    const selectionCount = el('span', 'finance-local', selected.size ? `${selected.size} entries selected` : 'Selection includes all matching pages'); selectionCount.setAttribute('role', 'status'); selection.append(selectionCount);
+    if (selected.size) {
+      selection.append(action('Edit selected transactions', () => editTransactions(() => finance!, new Set(selected), commit, () => { selected.clear(); render(); })), action('Delete selected transactions', () => void bulkRemove(new Set(selected))), action('Clear selection', () => { selected.clear(); renderHistory(root); root.querySelector<HTMLInputElement>('[aria-label="Select all matching transactions"]')?.focus(); }));
+      selection.children[2].textContent = 'Edit selected'; selection.children[3].textContent = 'Delete selected';
+    }
+    root.append(selection);
     if (!rows.length) { root.append(el('p', 'finance-no-results', 'No transactions match these filters.')); return; }
     const scroll = el('div', 'finance-table-scroll'), table = el('table', 'finance-table'), thead = el('thead'), tr = el('tr');
-    for (const title of ['Date', 'Description', 'Account', 'Category', 'Amount', 'Actions']) { const th = el('th', '', title); th.scope = 'col'; tr.append(th); } thead.append(tr); table.append(thead);
+    for (const title of ['Select', 'Date', 'Description', 'Account', 'Category', 'Amount', 'Actions']) { const th = el('th', '', title); th.scope = 'col'; tr.append(th); } thead.append(tr); table.append(thead);
     const tbody = el('tbody');
     for (const row of rows.slice(page * pageSize, page * pageSize + pageSize)) {
       const tr = el('tr');
+      tr.classList.toggle('is-selected', selected.has(row.id));
+      const selectionCell = el('td', 'finance-selection-cell'), checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(row.id); checkbox.disabled = busy; checkbox.dataset.transactionId = row.id; checkbox.setAttribute('aria-label', `Select ${row.payee || row.note || 'transaction'} on ${row.date}`);
+      checkbox.onchange = () => { for (const id of transactionSelection(finance!, new Set([row.id]))) { if (checkbox.checked) selected.add(id); else selected.delete(id); } renderHistory(root); root.querySelector<HTMLInputElement>(`[data-transaction-id="${CSS.escape(row.id)}"]`)?.focus(); };
+      selectionCell.append(checkbox); tr.append(selectionCell);
       const values = [formatFinanceDate(row.date, getSettings().financeDateFormat), row.payee || row.note || 'Transaction', row.account, [row.category, row.subcategory].filter(Boolean).join(' / '), format(row.cents)];
       values.forEach((value, index) => { const td = el('td', index === 4 ? `finance-amount ${row.cents < 0 ? 'negative' : 'positive'}` : '', value); td.dataset.label = ['Date', 'Description', 'Account', 'Category', 'Amount'][index]; if (index === 1 && row.payee && row.note) td.append(el('small', 'finance-row-note', row.note)); if (index === 1 && row.transferId) td.append(el('small', 'finance-row-note', 'Linked transfer')); tr.append(td); });
       const actions = el('td', 'finance-row-actions');
@@ -191,7 +222,14 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     const previous = action('Previous', () => { page--; renderHistory(root); }), next = action('Next', () => { page++; renderHistory(root); }); previous.disabled = page === 0; next.disabled = page >= totalPages - 1;
     pagination.append(previous, el('span', '', `Page ${page + 1} of ${totalPages}`), next); root.append(pagination);
   }
+  async function bulkRemove(ids: Set<string>) {
+    if (!finance || busy) return;
+    const count = transactionSelection(finance, ids).size;
+    const confirmed = await askDialog({ title: `Delete ${count} selected entries?`, description: 'Linked transfers include both account entries, even when one is outside the filter. All selected entries will be deleted and balances recalculated.', submit: 'Delete selected', danger: true });
+    try { if (confirmed && finance && await commit(removeTransactions(finance, ids))) { selected.clear(); render(); } }
+    catch (error) { message(error instanceof Error ? error.message : 'Could not delete selected transactions.', true); }
+  }
   render();
   void loadFinance().then(value => { finance = value; loaded = true; render(); }).catch(error => { loaded = true; loadError = true; render(); message(`${error instanceof Error ? error.message : String(error)} Reload to try again.`, true); });
-  return { show() { root.hidden = false; render(); }, hide() { root.hidden = true; }, refresh() { render(); }, async reload() { if (busy) throw new Error('Wait for Finance to finish saving.'); finance = await loadFinance(); loadError = false; render(); }, isBusy() { return busy; }, accounts() { return finance?.accounts.filter(account => !account.archived).map(account => account.name) ?? []; }, focusSearch() { root.querySelector<HTMLInputElement>('input[type="search"]')?.focus(); } };
+  return { show() { root.hidden = false; render(); }, hide() { root.hidden = true; }, refresh() { render(); }, async reload() { if (busy) throw new Error('Wait for Finance to finish saving.'); finance = await loadFinance(); selected.clear(); loadError = false; render(); }, isBusy() { return busy; }, accounts() { return finance?.accounts.filter(account => !account.archived).map(account => account.name) ?? []; }, focusSearch() { root.querySelector<HTMLInputElement>('input[type="search"]')?.focus(); } };
 }

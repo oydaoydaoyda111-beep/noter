@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Noter editor regression check</title>
+<body data-editor-check="pending">
+<div id="toolbar"></div>
+<div class="editor-page"><div id="editor" class="editor"></div></div>
+<pre id="result"></pre>
+<script type="module">
+import '../src/styles/tokens.css';
+import '../src/styles/editor.css';
+import { createEditor } from '../src/editor/editor.ts';
+import { codeText, markdownToDom } from '../src/editor/markdown.ts';
+import { currentBlock, setRange } from '../src/editor/selection.ts';
+
+const root = document.getElementById('editor');
+const toolbar = document.getElementById('toolbar');
+const editor = createEditor(root, toolbar, () => {});
+let note = 0;
+let checks = 0;
+function equal(actual, expected, label) {
+  if (actual !== expected) throw new Error(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  checks++;
+}
+function loadCode(text) {
+  editor.load(`code-${++note}`, `Before\n\n\`\`\`\`javascript\n${text}\n\`\`\`\`\n\nAfter`);
+  root.focus();
+}
+const pre = () => root.querySelector('pre');
+function caret(block, offset = block.textContent.length) {
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  range.setStart(block.querySelector('code') ?? block, 0);
+  while (walker.nextNode()) {
+    if (offset <= walker.currentNode.length) { range.setStart(walker.currentNode, offset); break; }
+    offset -= walker.currentNode.length;
+  }
+  range.collapse(true); setRange(range);
+  document.dispatchEvent(new Event('selectionchange'));
+}
+function key(key, options = {}) {
+  const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options });
+  root.dispatchEvent(event); return event;
+}
+function insert(text) {
+  equal(document.execCommand('insertText', false, text), true, 'native text insertion');
+}
+function paste(text) {
+  const data = new DataTransfer(); data.setData('text/plain', text);
+  root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+}
+const pause = () => new Promise(resolve => setTimeout(resolve, 220));
+
+try {
+  for (const text of ['', 'line', 'line\n', 'line\n\n', '\tconst text = "\u200b\u00a0<script>";\n', 'print("```")\n']) {
+    loadCode(text);
+    equal(codeText(pre()), text, 'loaded code');
+    const saved = editor.markdown;
+    equal(codeText(markdownToDom(saved).querySelector('pre')), text, 'saved and reloaded code');
+    equal(saved.startsWith('Before\n\n') && saved.endsWith('\n\nAfter'), true, 'surrounding Markdown');
+  }
+
+  loadCode(''); caret(pre());
+  const pasted = '\tconst text = "\u200b\u00a0";\n\n';
+  paste(pasted.replace(/\n/g, '\r\n'));
+  await pause();
+  equal(codeText(pre()), pasted, 'Windows clipboard, Unicode and trailing blank lines');
+  equal(codeText(markdownToDom(editor.markdown).querySelector('pre')), pasted, 'pasted code round trip');
+  key('z', { ctrlKey: true }); equal(codeText(pre()), '', 'undo paste');
+  key('z', { ctrlKey: true, shiftKey: true }); equal(codeText(pre()), pasted, 'redo paste');
+
+  loadCode('first'); caret(pre());
+  const firstLineHeight = pre().getBoundingClientRect().height;
+  const lineHeight = parseFloat(getComputedStyle(pre().querySelector('code')).lineHeight);
+  key('Enter');
+  equal(codeText(pre()), 'first\n', 'Enter adds one newline');
+  equal(Math.abs(pre().getBoundingClientRect().height - firstLineHeight - lineHeight) < 1, true, 'one visible blank code line');
+  insert('second'); key('Enter'); key('Enter'); await pause();
+  equal(codeText(pre()), 'first\nsecond\n\n', 'typing and repeated Enter');
+  equal(codeText(markdownToDom(editor.markdown).querySelector('pre')), 'first\nsecond\n\n', 'typed code round trip');
+
+  loadCode('beforeafter'); caret(pre(), 6); key('Enter');
+  equal(codeText(pre()), 'before\nafter', 'Enter in the middle of code');
+  loadCode('last\n'); caret(pre());
+  equal(document.execCommand('delete'), true, 'native Backspace');
+  await pause(); equal(codeText(pre()), 'last', 'deleting a trailing newline');
+
+  loadCode('last\n'); caret(pre(), 4);
+  equal(key('ArrowDown').defaultPrevented, false, 'ArrowDown reaches the real trailing blank line');
+  caret(pre()); equal(key('ArrowDown').defaultPrevented, true, 'ArrowDown exits at code end');
+  equal(currentBlock(root)?.tagName, 'P', 'code exit paragraph');
+
+  for (const style of ['h2', 'blockquote', 'pre']) {
+    editor.load(`block-${++note}`, 'First'); root.focus(); caret(root.firstElementChild); key('Enter');
+    const select = toolbar.querySelector('select'); select.value = style; select.dispatchEvent(new Event('change'));
+    insert('Next');
+    equal(root.firstElementChild.textContent, 'First', 'formatting leaves previous paragraph intact');
+    equal(root.querySelector(style).textContent, 'Next', 'typing in empty formatted block');
+  }
+
+  editor.load(`mark-${++note}`, 'Start'); root.focus(); caret(root.firstElementChild); insert(' ');
+  key('b', { ctrlKey: true }); insert('bold'); key('b', { ctrlKey: true }); insert(' plain');
+  equal(editor.markdown, 'Start **bold** plain', 'ending bold preserves existing formatting');
+  equal(key('b', { ctrlKey: true, altKey: true }).defaultPrevented, false, 'AltGr is not a formatting shortcut');
+  await pause();
+  document.body.dataset.editorCheck = 'passed';
+  document.getElementById('result').textContent = `${checks} editor checks passed.`;
+} catch (error) {
+  document.body.dataset.editorCheck = 'failed';
+  document.getElementById('result').textContent = error.stack;
+}
+</script>
+</body>
+</html>

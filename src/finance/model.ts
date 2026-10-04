@@ -1,12 +1,16 @@
+import { validateBudgets } from './budgets.ts';
+
 export interface Transaction {
   id: string; date: string; cents: number; account: string; category: string;
   subcategory: string; payee: string; note: string; transferId?: string;
 }
+export interface Budget { month: string; category: string; cents: number }
 export interface Finance {
   version: 1; accounts: { name: string; note: string; archived?: boolean }[]; transactions: Transaction[];
   categories: string[]; sourceName: string; template: Uint8Array;
   defaults?: { account: string; category: string };
   categoryDefinitions?: { name: string; subcategories: string[] }[];
+  budgets?: Budget[];
 }
 export function money(value: string): number {
   if (!/^-?\d+(?:\.\d{1,2})?$/.test(value.trim())) throw new Error('Enter an amount with at most two decimal places.');
@@ -62,6 +66,7 @@ export function validateFinanceFile(value: unknown): Finance {
   }
   if (data.defaults && (typeof data.defaults.account !== 'string' || typeof data.defaults.category !== 'string')) invalid();
   if (data.categoryDefinitions !== undefined && (!Array.isArray(data.categoryDefinitions) || !data.categoryDefinitions.every(item => item && typeof item.name === 'string' && Array.isArray(item.subcategories) && item.subcategories.every(name => typeof name === 'string')))) invalid();
+  if (data.budgets !== undefined) validateBudgets(data.budgets);
   for (const row of data.transactions) if (row.transferId) {
     const pair = data.transactions.filter(item => item.transferId === row.transferId);
     if (pair.length !== 2 || pair[0].cents !== -pair[1].cents || pair[0].account === pair[1].account || pair[0].date !== pair[1].date) invalid();

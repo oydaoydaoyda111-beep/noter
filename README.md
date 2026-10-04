@@ -4,7 +4,7 @@ A desktop and Android workspace for Markdown notes, embedded databases, and pers
 
 ## Run and build
 
-Requirements: Node.js 24, Rust through [rustup](https://rust-lang.org/tools/install/), and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/) (Xcode on macOS).
+Requirements: Node.js 24, Rust through [rustup](https://rust-lang.org/tools/install/), and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/): Xcode on macOS; on Windows, Visual Studio Build Tools with the **Desktop development with C++** workload and the default `x86_64-pc-windows-msvc` Rust toolchain. Windows 11 already includes WebView2.
 
 ```sh
 npm ci
@@ -14,7 +14,11 @@ npm run desktop:build
 
 `desktop:dev` starts Vite on port 1420 and launches the native app. Production builds embed the frontend and work offline without a development server. The launcher also finds Rust in `~/.cargo/bin` without requiring a shell-profile change.
 
-Build outputs are in `src-tauri/target/release/bundle/`. On macOS `desktop:build` produces `Noter.app`; `npm run desktop:package` also creates a DMG using macOS disk-image tools without Finder automation. Build Windows/Linux packages on their corresponding platforms; those targets have not been verified here. The local macOS build is ad-hoc signed, not notarized for public distribution.
+Build outputs are in `src-tauri/target/release/bundle/`. On macOS `desktop:build` produces `Noter.app`; `npm run desktop:package` also creates a DMG using macOS disk-image tools without Finder automation. The local macOS build is ad-hoc signed, not notarized for public distribution.
+
+On Windows, `desktop:build` produces a per-user installer, `src-tauri/target/release/bundle/nsis/Noter_<version>_x64-setup.exe`, which needs no administrator rights. The first build downloads the NSIS tools. The installer is unsigned, so SmartScreen may ask you to confirm it. Linux packages have not been verified. To test with the optional private workbook in PowerShell: `$env:BANK_TEST_WORKBOOK='C:\path\bank.xlsx'; npm test`.
+
+Windows specifics: the desktop app reads notes saved as UTF-8 with a byte-order mark or as UTF-16 (the Windows PowerShell 5.1 default), keeps their bytes until you edit them, then saves UTF-8. Saves wait briefly while Syncthing or Excel holds a file open, replace notes marked read-only, and handle renames that only change letter case. A drive root such as `D:\` can be a workspace; system folders like `System Volume Information` are ignored. F5, Ctrl+R and Ctrl+P do nothing, so they cannot reload or print the app. Files dropped on the window are ignored.
 
 ```sh
 npm test
@@ -27,6 +31,12 @@ npm run build
 For Android, open `android/` in Android Studio and run the app on your device or emulator. With a configured JDK 17 and Android SDK, `android/gradlew.bat -p android :app:assembleDebug` builds `android/app/build/outputs/apk/debug/app-debug.apk` on Windows. Choose the local folder synchronized by Syncthing using Android's folder picker.
 
 Tap the search icon in Android's Notes screen to find notes by name, content, or folder path. All, Names, Contents, and Folders filters match desktop search. Results include previews and open the note when tapped. Search includes current edits, keeps editor selection and undo when closed, and does not add index files to the synced workspace.
+
+Desktop Finance includes monthly category budgets with spending, remaining amounts and overspending indicators. Use **Set budget** to add or edit a limit; **Copy previous month** copies missing limits. Budgets count expenses across accounts, excluding income and transfers, and are included in Excel backups. Select transaction checkboxes or **Select all matching** to edit category/subcategory, account, date, payee or note in bulk, or delete selected entries. Selection spans pages and clears when filters change. Linked transfers are selected/deleted as pairs; bulk editing supports their date, payee and note. Unchecked fields and amounts are kept.
+
+Budget metadata uses the shared Finance JSONL logs. Android's current source reads and preserves it without budget controls; rebuild/update Android before syncing budget-enabled logs, as earlier app builds reject unknown metadata keys.
+
+Open **Finance → Monthly reports** on desktop to choose a calendar month and account. Reports show income, expenses, net income, previous-month totals, a six-month trend and income/expense category shares. **View transactions** opens that month and account in the ledger, clearing its other filters and selection. Reports exclude linked transfers, the reserved transfer category and opening balances categorized as **Initial** (case-insensitive). Positive entries count as income; negative entries count as expenses. Reports are calculated from existing files and do not add storage or log operations. Their filters are independent of transaction and budget filters.
 
 Tap the table icon in Android's Notes screen to create a database, or open a note containing a desktop database and tap **Open database**. Android supports table, board, and calendar views; record creation, editing, duplication and deletion; property management; search, exact property filters and sorting. Use **Database actions → Saved views** to create, rename, delete or switch views. New views copy the current layout, filters and columns. **Filters and sorting** also lets you show or hide table columns; at least one column and one saved view must remain. Changes use note autosave and Undo/Redo. **Edit Markdown** opens the original source. Desktop option colors, column widths, saved view settings and IDs are retained; color/width controls and bulk record editing remain desktop-only.
 
@@ -76,5 +86,7 @@ Existing hidden files, symlinks, non-Markdown files, and `node_modules` are not 
 ## Compatibility checks
 
 `npm test` checks the shared file fixtures and native frontend persistence commands. `npm run desktop:test` saves and reopens the same Markdown/manifest fixture through Rust, and tests Finance tail recovery. To run Android's checks, build `:app:assembleDebugAndroidTest`, install both debug APKs on an emulator, then run `adb shell am instrument -w app.noter.test/app.noter.StorageContractCheck`. The native check covers the same manifest, Markdown and Finance fixtures, stale saves, replacement failures, recovery, foreground polling and note search. Search UI checks use synthetic notes and cover filters, opening results, clearing, Back, and preserving editor undo.
+
+`npm test` also checks desktop editor and Finance interactions in an installed Chrome, Edge or Chromium browser using synthetic data and a temporary browser profile. Set `NOTER_TEST_BROWSER` to the browser executable path to choose one explicitly. If no browser is found, those checks report skips.
 
 Existing notes JSON backups can still be restored in desktop Settings → Workspace. Existing Excel Finance backups can still be imported on desktop. The notes backup does not contain Finance.

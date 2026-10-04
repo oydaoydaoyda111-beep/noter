@@ -1,4 +1,4 @@
-import type { Finance } from './model.ts';
+import type { Budget, Finance } from './model.ts';
 
 export interface FinanceCategory { name: string; subcategories: string[] }
 export const transferCategory = 'Transfer to other account';
@@ -21,6 +21,7 @@ export function categoryCatalog(finance: Finance): FinanceCategory[] {
     add(category.name); for (const subcategory of category.subcategories) add(category.name, subcategory);
   }
   for (const row of finance.transactions) add(row.category, row.subcategory);
+  for (const budget of finance.budgets ?? []) add(budget.category);
   add(transferCategory);
   return [...result].map(([name, subcategories]) => ({ name, subcategories: [...subcategories].sort() })).sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -63,6 +64,7 @@ export function renameCategory(finance: Finance, previous: string, rawName: stri
   const next = withCatalog(finance, catalog);
   next.transactions = finance.transactions.map(row => row.category !== previous ? row : subcategory === undefined ? { ...row, category: name } : row.subcategory === subcategory ? { ...row, subcategory: name } : row);
   if (subcategory === undefined && finance.defaults?.category === previous) next.defaults = { ...finance.defaults, category: name };
+  if (subcategory === undefined && finance.budgets) next.budgets = finance.budgets.map(budget => budget.category === previous ? { ...budget, category: name } : budget);
   return next;
 }
 export function mergeCategories(finance: Finance, source: string, target: string): Finance {
@@ -72,6 +74,16 @@ export function mergeCategories(finance: Finance, source: string, target: string
   const next = withCatalog(finance, catalog.filter(item => item.name !== source));
   next.transactions = finance.transactions.map(row => row.category === source ? { ...row, category: target } : row);
   if (finance.defaults?.category === source) next.defaults = { ...finance.defaults, category: target };
+  if (finance.budgets) {
+    const budgets = new Map<string, Budget>();
+    for (const budget of finance.budgets) {
+      const category = budget.category === source ? target : budget.category, id = `${budget.month}\0${category}`;
+      const cents = budget.cents + (budgets.get(id)?.cents ?? 0);
+      if (!Number.isSafeInteger(cents)) throw new Error('Combined budget limits exceed the supported amount range.');
+      budgets.set(id, { ...budget, category, cents });
+    }
+    next.budgets = [...budgets.values()];
+  }
   return next;
 }
 export function deleteCategory(finance: Finance, name: string, subcategory?: string): Finance {
@@ -80,5 +92,6 @@ export function deleteCategory(finance: Finance, name: string, subcategory?: str
   const next = withCatalog(finance, subcategory === undefined ? catalog.filter(item => item.name !== name) : catalog.map(item => item.name === name ? { ...item, subcategories: item.subcategories.filter(value => value !== subcategory) } : item));
   next.transactions = finance.transactions.map(row => row.category !== name ? row : subcategory === undefined ? { ...row, category: '', subcategory: '' } : row.subcategory === subcategory ? { ...row, subcategory: '' } : row);
   if (subcategory === undefined && finance.defaults?.category === name) next.defaults = { ...finance.defaults, category: '' };
+  if (subcategory === undefined && finance.budgets) next.budgets = finance.budgets.filter(budget => budget.category !== name);
   return next;
 }

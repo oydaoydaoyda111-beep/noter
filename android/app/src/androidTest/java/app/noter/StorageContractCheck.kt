@@ -102,6 +102,15 @@ class StorageContractCheck : Instrumentation() {
         sameFinance(state.finance, expectedFinance)
         check(state.templateSha256 == expected.getString("templateSha256"))
         validateFinance(state.finance)
+        check(state.finance.budgets?.single() == app.noter.finance.Budget("2026-10", "Food", 5000))
+        check(state.finance.copy(template = byteArrayOf(1)).budgets == state.finance.budgets)
+        val renamedBudgets = app.noter.finance.renameCategory(state.finance, "Food", "Dining")
+        check(renamedBudgets.budgets?.single()?.category == "Dining")
+        val mergedBudgets = app.noter.finance.mergeCategories(renamedBudgets.copy(budgets = renamedBudgets.budgets.orEmpty() + app.noter.finance.Budget("2026-10", "Meals", 3000)), "Dining", "Meals")
+        check(mergedBudgets.budgets?.single()?.cents == 8000L)
+        check(app.noter.finance.deleteCategory(mergedBudgets, "Meals").budgets?.isEmpty() == true)
+        for (budget in listOf(app.noter.finance.Budget("2026-13", "Food", 10), app.noter.finance.Budget("2026-10", "Food", MAX_SAFE + 1), app.noter.finance.Budget("2026-10", "Transfer to other account", 10))) rejects { validateFinance(state.finance.copy(budgets = listOf(budget))) }
+        rejects { validateFinance(state.finance.copy(budgets = state.finance.budgets.orEmpty() + state.finance.budgets.orEmpty())) }
         val emitted = diffFinance(null, state.finance, state.templateSha256)
         val replayed = checkNotNull(replayFinance(listOf(app.noter.finance.Batch(1003, "mobile-b", 2, emitted))))
         sameFinance(replayed.finance, expectedFinance)
@@ -135,7 +144,7 @@ class StorageContractCheck : Instrumentation() {
 
     private fun sameFinance(actual: Finance, expected: Finance) {
         check(actual.accounts == expected.accounts && actual.transactions == expected.transactions)
-        check(actual.categories == expected.categories && actual.categoryDefinitions == expected.categoryDefinitions)
+        check(actual.categories == expected.categories && actual.categoryDefinitions == expected.categoryDefinitions && actual.budgets == expected.budgets)
         check(actual.defaults == expected.defaults && actual.sourceName == expected.sourceName)
     }
 

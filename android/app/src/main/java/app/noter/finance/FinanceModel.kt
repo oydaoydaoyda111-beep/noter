@@ -29,6 +29,7 @@ data class Transaction(
 data class Defaults(val account: String, val category: String)
 
 data class FinanceCategory(val name: String, val subcategories: List<String>)
+data class Budget(val month: String, val category: String, val cents: Long)
 
 class Finance(
     val accounts: List<Account>,
@@ -38,6 +39,7 @@ class Finance(
     val template: ByteArray,
     val defaults: Defaults? = null,
     val categoryDefinitions: List<FinanceCategory>? = null,
+    val budgets: List<Budget>? = null,
 ) {
     fun copy(
         accounts: List<Account> = this.accounts,
@@ -45,7 +47,9 @@ class Finance(
         categories: List<String> = this.categories,
         defaults: Defaults? = this.defaults,
         categoryDefinitions: List<FinanceCategory>? = this.categoryDefinitions,
-    ) = Finance(accounts, transactions, categories, sourceName, template, defaults, categoryDefinitions)
+        budgets: List<Budget>? = this.budgets,
+        template: ByteArray = this.template,
+    ) = Finance(accounts, transactions, categories, sourceName, template, defaults, categoryDefinitions, budgets)
 }
 
 fun newId(): String = UUID.randomUUID().toString()
@@ -158,6 +162,7 @@ fun categoryCatalog(finance: Finance): List<FinanceCategory> {
         category.subcategories.forEach { add(category.name, it) }
     }
     finance.transactions.forEach { add(it.category, it.subcategory) }
+    finance.budgets?.forEach { add(it.category) }
     add(TRANSFER_CATEGORY)
     return result.map { (name, subs) -> FinanceCategory(name, subs.sorted()) }.sortedBy { it.name }
 }
@@ -214,7 +219,8 @@ fun renameCategory(finance: Finance, previous: String, rawName: String, subcateg
         }
     }
     val defaults = finance.defaults?.let { if (subcategory == null && it.category == previous) it.copy(category = name) else it }
-    return withCatalog(finance, catalog).copy(transactions = transactions, defaults = defaults)
+    val budgets = finance.budgets?.map { if (subcategory == null && it.category == previous) it.copy(category = name) else it }
+    return withCatalog(finance, catalog).copy(transactions = transactions, defaults = defaults, budgets = budgets)
 }
 
 fun mergeCategories(finance: Finance, source: String, target: String): Finance {
@@ -228,9 +234,21 @@ fun mergeCategories(finance: Finance, source: String, target: String): Finance {
         if (it.name == target) it.copy(subcategories = (to.subcategories + from.subcategories).distinct()) else it
     }
     val defaults = finance.defaults?.let { if (it.category == source) it.copy(category = target) else it }
+    val budgets = finance.budgets?.let { limits ->
+        val result = LinkedHashMap<Pair<String, String>, Budget>()
+        for (budget in limits) {
+            val category = if (budget.category == source) target else budget.category
+            val id = budget.month to category
+            val cents = budget.cents + (result[id]?.cents ?: 0L)
+            if (cents !in 1..MAX_SAFE) throw FinanceException("Combined budget limits exceed the supported amount range.")
+            result[id] = budget.copy(category = category, cents = cents)
+        }
+        result.values.toList()
+    }
     return withCatalog(finance, merged).copy(
         transactions = finance.transactions.map { if (it.category == source) it.copy(category = target) else it },
         defaults = defaults,
+        budgets = budgets,
     )
 }
 
@@ -248,7 +266,8 @@ fun deleteCategory(finance: Finance, name: String, subcategory: String? = null):
         }
     }
     val defaults = finance.defaults?.let { if (subcategory == null && it.category == name) it.copy(category = "") else it }
-    return withCatalog(finance, next).copy(transactions = transactions, defaults = defaults)
+    val budgets = finance.budgets?.filter { subcategory != null || it.category != name }
+    return withCatalog(finance, next).copy(transactions = transactions, defaults = defaults, budgets = budgets)
 }
 
 // Display

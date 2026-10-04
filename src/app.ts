@@ -115,6 +115,7 @@ export async function startApp(mount: HTMLElement) {
   async function saveNow() {
     clearTimeout(saveTimer);
     if (loaded.warning && !changedSinceLoad) return false;
+    if (!unsaved) return true;
     const version = editVersion;
     try {
       const success = await storage.save(store.workspace);
@@ -282,6 +283,23 @@ export async function startApp(mount: HTMLElement) {
   title.addEventListener('blur', () => { commitTitle(); if (store.activeNote) title.value = store.activeNote.name; });
   title.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); commitTitle(); editor.focus(); } });
 
+  // WebView2 (Windows) keeps browser keys and menus that would reload or print the whole app,
+  // dropping undo history and edits still waiting for autosave; dropped files would replace the app.
+  document.addEventListener('keydown', event => {
+    const mod = (event.ctrlKey || event.metaKey) && !event.altKey;
+    if (event.key === 'F5' || (mod && ['r', 'p'].includes(event.key.toLowerCase()))) event.preventDefault();
+  }, true);
+  document.addEventListener('contextmenu', event => {
+    if (!(event.target as Element).closest('input, textarea, [contenteditable="true"]')) event.preventDefault();
+  });
+  for (const type of ['dragover', 'drop'] as const) document.addEventListener(type, event => {
+    if (event.dataTransfer?.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = 'none'; }
+  });
+  // Chromium steps a focused number field when the wheel turns over it; scrolling must not change saved values.
+  document.addEventListener('wheel', event => {
+    if (event.target instanceof HTMLInputElement && event.target.type === 'number' && event.target === document.activeElement) event.target.blur();
+  }, { passive: true });
+
   document.addEventListener('keydown', event => {
     if (document.querySelector('dialog[open]')) return;
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
@@ -364,5 +382,4 @@ export async function startApp(mount: HTMLElement) {
   applySettings(store.workspace.settings); tree.render(); tabs.render(); renderNote(); renderCount();
   try { const startup = store.workspace.settings.startupSection; if ((startup === 'last' ? await readLastSection() : startup) === 'finance') section(true); } catch { if (store.workspace.settings.startupSection === 'finance') section(true); }
   if (loaded.warning) { warning.textContent = loaded.warning; warning.hidden = false; }
-  else saveNow();
 }

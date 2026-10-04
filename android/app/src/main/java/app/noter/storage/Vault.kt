@@ -11,6 +11,7 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
@@ -28,28 +29,51 @@ private const val MANIFEST = ".noter/workspace.json"
 
 /**
  * Markdown files plus `.noter/workspace.json`, in the same layout as the desktop vault so both clients can share a synced folder.
- * Unlike desktop, revisions hash file metadata (path, size, modified time) rather than content, to avoid reading every note over SAF.
+ * Revisions verify note contents; routine polling uses metadata hints between bounded full audits.
  */
 class Vault(private val saf: Saf) {
     class Loaded(val workspace: Workspace, val revision: String)
     data class PreservedEdits(val snapshot: String, val folder: String?, val notes: Int)
 
     private class Manifest(val workspace: JSONObject, val paths: Map<String, String>, val bytes: ByteArray)
+    private class Snapshot(val disk: TreeMap<String, Entry>, val contents: TreeMap<String, String?>, val manifest: Manifest)
 
-    /** Markdown of every note as of the last load/save; valid because the revision check guarantees the disk matches it. */
-    private var known: Map<String, String> = emptyMap()
+    private var pollingMetadata: String? = null
+    private var pollingRevision: String? = null
+    private var lastFullCheck = 0L
+
+    private fun visiblePath(path: String) {
+        saf.validatePath(path)
+        if (path.split('/').any { it.startsWith('.') || it == "node_modules" }) {
+            throw VaultException("Workspace note paths must be visible portable files. Your files have been kept.")
+        }
+    }
 
     private fun readManifest(): Manifest {
-        val entry = saf.resolve(MANIFEST)?.takeIf { !it.isDir } ?: return Manifest(JSONObject(), emptyMap(), ByteArray(0))
+        val entry = saf.resolve(MANIFEST) ?: return Manifest(JSONObject(), emptyMap(), ByteArray(0))
+        if (entry.isDir) throw VaultException("Workspace metadata is a folder. Your files have been kept.")
         val bytes = saf.read(entry.doc)
         try {
-            val root = JSONObject(String(bytes, Charsets.UTF_8))
-            val paths = root.optJSONObject("paths") ?: JSONObject()
-            return Manifest(
-                root.optJSONObject("workspace") ?: JSONObject(),
-                paths.keys().asSequence().associateWith { paths.getString(it) },
-                bytes,
-            )
+            val root = strictJsonObject(decode(bytes))
+            val workspace = root.getJSONObject("workspace")
+            if ((workspace.opt("version") as? Number)?.toDouble() != 1.0) {
+                throw VaultException("This workspace version is not supported. Your files have been kept.")
+            }
+            val nodes = workspace.getJSONObject("nodes")
+            val paths = root.getJSONObject("paths")
+            if (nodes.length() != paths.length()) throw JSONException("Mismatched paths")
+            val used = HashSet<String>()
+            val mapping = LinkedHashMap<String, String>()
+            for (id in paths.keys()) {
+                val path = paths.opt(id) as? String ?: throw JSONException("Invalid path type")
+                visiblePath(path)
+                val node = nodes.getJSONObject(id)
+                val type = node.opt("type") as? String ?: throw JSONException("Invalid node type")
+                if (id.isEmpty() || node.opt("id") != id || type !in setOf("note", "folder") || !used.add(path.lowercase()) ||
+                    (type == "note" && !path.lowercase().endsWith(".md"))) throw JSONException("Invalid paths")
+                mapping[id] = path
+            }
+            return Manifest(workspace, mapping, bytes)
         } catch (_: JSONException) {
             throw VaultException("Workspace metadata could not be read. Your files have been kept.")
         }
@@ -57,11 +81,16 @@ class Vault(private val saf: Saf) {
 
     private fun scan(): TreeMap<String, Entry> {
         val result = TreeMap<String, Entry>()
+        val used = HashSet<String>()
         var total = 0L
         fun walk(doc: String, prefix: String) {
             for (entry in saf.list(doc)) {
                 if (entry.name.startsWith(".") || entry.name == "node_modules") continue
                 val key = prefix + entry.name
+                if (entry.isDir || entry.name.lowercase().endsWith(".md")) {
+                    visiblePath(key)
+                    if (!used.add(key.lowercase())) throw VaultException("Two workspace files differ only by letter case. Rename one so every device can read this folder.")
+                }
                 if (entry.isDir) {
                     result[key] = entry
                     walk(entry.doc, "$key/")
@@ -78,7 +107,7 @@ class Vault(private val saf: Saf) {
         return result
     }
 
-    private fun revisionOf(disk: Map<String, Entry>, metadata: ByteArray): String {
+    private fun metadataRevision(disk: Map<String, Entry>, metadata: ByteArray): String {
         val hash = MessageDigest.getInstance("SHA-256")
         for ((path, entry) in disk) {
             hash.update(path.toByteArray())
@@ -90,7 +119,56 @@ class Vault(private val saf: Saf) {
         return hash.digest().joinToString("") { "%02x".format(it) }
     }
 
-    fun revision(): String = revisionOf(scan(), readManifest().bytes)
+    private fun revisionOf(contents: Map<String, String?>, metadata: ByteArray): String {
+        val hash = MessageDigest.getInstance("SHA-256")
+        fun length(size: Int) = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(size.toLong()).array()
+        for ((path, content) in contents) {
+            val name = path.toByteArray()
+            hash.update(length(name.size))
+            hash.update(name)
+            hash.update(if (content == null) 0.toByte() else 1.toByte())
+            if (content != null) {
+                val bytes = content.toByteArray()
+                hash.update(length(bytes.size))
+                hash.update(bytes)
+            }
+        }
+        hash.update(metadata)
+        return hash.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun snapshot(disk: TreeMap<String, Entry> = scan(), manifest: Manifest = readManifest()): Snapshot {
+        val contents = TreeMap<String, String?>()
+        var total = 0L
+        for ((path, entry) in disk) {
+            if (entry.isDir) contents[path] = null else {
+                val bytes = saf.read(entry.doc, MAX_NOTE)
+                total += bytes.size
+                if (total > MAX_TOTAL) throw VaultException("Choose a workspace with less than 100 MB of Markdown content.")
+                contents[path] = decode(bytes)
+            }
+        }
+        return Snapshot(disk, contents, manifest)
+    }
+
+    private fun remember(snapshot: Snapshot, revision: String) {
+        pollingMetadata = metadataRevision(snapshot.disk, snapshot.manifest.bytes)
+        pollingRevision = revision
+        lastFullCheck = System.nanoTime()
+    }
+
+    fun revision(force: Boolean = false): String {
+        val disk = scan()
+        val manifest = readManifest()
+        val hint = metadataRevision(disk, manifest.bytes)
+        if (!force && hint == pollingMetadata && System.nanoTime() - lastFullCheck < 60_000_000_000L) {
+            pollingRevision?.let { return it }
+        }
+        val current = snapshot(disk, manifest)
+        val value = revisionOf(current.contents, manifest.bytes)
+        remember(current, value)
+        return value
+    }
 
     private fun decode(bytes: ByteArray): String = try {
         Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
@@ -109,7 +187,16 @@ class Vault(private val saf: Saf) {
 
     private fun JSONObject?.time(key: String): Long? = this?.optLong(key, 0L)?.takeIf { it > 0 }
 
-    private fun metadataBytes(workspace: Workspace, paths: Map<String, String>): ByteArray {
+    private fun sameJson(actual: Any?, expected: Any?): Boolean = when (expected) {
+        is JSONObject -> actual is JSONObject && actual.length() == expected.length() &&
+            expected.keys().asSequence().all { sameJson(actual.opt(it), expected.opt(it)) }
+        is JSONArray -> actual is JSONArray && actual.length() == expected.length() &&
+            (0 until expected.length()).all { sameJson(actual.opt(it), expected.opt(it)) }
+        is Number -> actual is Number && actual.toString().toBigDecimal().compareTo(expected.toString().toBigDecimal()) == 0
+        else -> actual == expected
+    }
+
+    private fun metadataBytes(workspace: Workspace, paths: Map<String, String>, previous: Manifest? = null): ByteArray {
         val nodes = JSONObject()
         for (node in workspace.nodes.values) {
             val json = JSONObject()
@@ -132,13 +219,25 @@ class Vault(private val saf: Saf) {
             .put("openTabs", JSONArray(workspace.openTabs))
             .put("activeNoteId", workspace.activeNoteId ?: JSONObject.NULL)
             .put("collapsedFolders", JSONArray(workspace.collapsedFolders))
-        return JSONObject().put("workspace", metadata).put("paths", JSONObject(paths)).toString(2).toByteArray()
+        val result = JSONObject().put("workspace", metadata).put("paths", JSONObject(paths))
+        if (previous != null && previous.bytes.isNotEmpty() && sameJson(result, JSONObject(decode(previous.bytes)))) {
+            return previous.bytes
+        }
+        return result.toString(2).toByteArray()
     }
 
     fun load(): Loaded {
-        val disk = scan()
-        val previous = readManifest()
-        val before = revisionOf(disk, previous.bytes)
+        val initial = snapshot()
+        val disk = initial.disk
+        val previous = initial.manifest
+        val before = revisionOf(initial.contents, previous.bytes)
+        for ((id, path) in previous.paths) {
+            val entry = disk[path]
+            val folder = previous.workspace.getJSONObject("nodes").getJSONObject(id).getString("type") == "folder"
+            if (entry == null || entry.isDir != folder) {
+                throw SyncConflictException("Workspace files are still arriving or a referenced path changed. Wait for synchronization to finish and reload. Your metadata and files have been kept.")
+            }
+        }
         val reverse = previous.paths.entries.associate { it.value to it.key }
         val ids = HashSet<String>()
         val pathToId = LinkedHashMap<String, String>()
@@ -155,7 +254,6 @@ class Vault(private val saf: Saf) {
         val childIds = HashMap<String, MutableList<String>>()
         for ((path, id) in pathToId) childIds.getOrPut(path.substringBeforeLast('/', "")) { mutableListOf() }.add(id)
         val nodes = LinkedHashMap<String, Node>()
-        val texts = HashMap<String, String>()
         for ((path, entry) in disk) {
             val id = pathToId.getValue(path)
             val original = originals.optJSONObject(id)
@@ -166,8 +264,7 @@ class Vault(private val saf: Saf) {
             nodes[id] = if (entry.isDir) {
                 Folder(id, name, parent, created, updated, ordered(original?.optJSONArray("children"), childIds[path].orEmpty()))
             } else {
-                val markdown = decode(saf.read(entry.doc))
-                texts[id] = markdown
+                val markdown = checkNotNull(initial.contents[path])
                 Note(id, name.dropLast(3), parent, created, updated, markdown)
             }
         }
@@ -188,14 +285,15 @@ class Vault(private val saf: Saf) {
             settings = normalizeSettings(previous.workspace.optJSONObject("settings")),
         )
         val stable = pathToId.entries.associate { it.value to it.key }
-        val bytes = metadataBytes(workspace, stable)
+        val bytes = metadataBytes(workspace, stable, previous)
         val changed = "Files changed while opening the folder. Wait for synchronization and reload."
-        if (revisionOf(scan(), previous.bytes) != before) throw SyncConflictException(changed)
-        saf.writeAtomic(MANIFEST, bytes)
-        val expected = revisionOf(disk, bytes)
-        val actual = revisionOf(scan(), bytes)
+        if (revision(true) != before) throw SyncConflictException(changed)
+        saf.writeAtomic(MANIFEST, bytes, previous.bytes.takeIf { it.isNotEmpty() }, previous.bytes.isEmpty())
+        val expected = revisionOf(initial.contents, bytes)
+        val verified = snapshot()
+        val actual = revisionOf(verified.contents, verified.manifest.bytes)
         if (actual != expected) throw SyncConflictException(changed)
-        known = texts
+        remember(verified, actual)
         return Loaded(workspace, actual)
     }
 
@@ -205,7 +303,7 @@ class Vault(private val saf: Saf) {
         val name = if (trimmed.isEmpty() || trimmed.startsWith(".")) "Untitled" else trimmed
         val upper = name.substringBefore('.').uppercase()
         val reserved = upper in setOf("CON", "PRN", "AUX", "NUL") ||
-            (upper.length == 4 && (upper.startsWith("COM") || upper.startsWith("LPT")) && upper.last().isDigit())
+            (upper.length == 4 && (upper.startsWith("COM") || upper.startsWith("LPT")) && upper.last() in '0'..'9')
         return if (reserved) "_$name" else name
     }
 
@@ -260,7 +358,7 @@ class Vault(private val saf: Saf) {
         val snapshot = ".noter/recovery/$token/workspace.json"
         fun writeVerified(path: String, content: ByteArray) {
             if (saf.resolve(path) != null) throw VaultException("A recovery destination already exists. Your edits are still in memory.")
-            saf.writeAtomic(path, content)
+            saf.writeAtomic(path, content, mustBeAbsent = true)
             if (!saf.read(saf.resolve(path)?.doc ?: throw VaultException("A recovery file is missing.")).contentEquals(content)) {
                 throw VaultException("A recovery file could not be verified. Your edits are still in memory.")
             }
@@ -272,21 +370,28 @@ class Vault(private val saf: Saf) {
     }
 
     fun save(workspace: Workspace, expected: String): String {
-        val disk = scan()
-        val previous = readManifest()
-        if (revisionOf(disk, previous.bytes) != expected) {
+        val initial = snapshot()
+        val disk = initial.disk
+        val previous = initial.manifest
+        if (revisionOf(initial.contents, previous.bytes) != expected) {
             throw SyncConflictException("Files changed outside Noter. Reload the folder before saving; your unsaved edits are still here.")
         }
         val paths = LinkedHashMap<String, String>()
         plan(workspace, workspace.rootIds, "", paths, HashSet(), previous)
         if (paths.size != workspace.nodes.size) throw VaultException("Invalid workspace hierarchy.")
         val oldPaths = previous.paths.values.toSet()
+        var total = 0L
         for ((id, path) in paths) {
-            if (disk.containsKey(path) && path !in oldPaths) {
+            if (saf.resolve(path) != null && path !in oldPaths) {
                 throw SyncConflictException("A file already uses that name. Reload the folder before saving.")
             }
             val node = workspace.nodes.getValue(id)
-            if (node is Note && node.markdown.toByteArray().size > MAX_NOTE) throw VaultException("Keep each note below 10 MB.")
+            if (node is Note) {
+                val size = node.markdown.toByteArray().size
+                if (size > MAX_NOTE) throw VaultException("Keep each note below 10 MB.")
+                total += size
+                if (total > MAX_TOTAL) throw VaultException("Choose a workspace with less than 100 MB of Markdown content.")
+            }
         }
         // Keep changed/deleted files in recoverable trash before moving or replacing them.
         val trash = ".noter/trash/${System.currentTimeMillis()}-${UUID.randomUUID()}"
@@ -294,30 +399,56 @@ class Vault(private val saf: Saf) {
         for ((id, old) in previous.paths) {
             if (previousNodes?.optJSONObject(id)?.optString("type") != "note") continue
             val note = workspace.nodes[id] as? Note
-            if (paths[id] == old && note != null && known[id] == note.markdown) continue
-            val source = saf.resolve(old)?.takeIf { !it.isDir } ?: continue
-            val bytes = saf.read(source.doc)
-            if (paths[id] != old || note == null || String(bytes, Charsets.UTF_8) != note.markdown) saf.writeAtomic("$trash/$old", bytes)
+            val text = initial.contents[old] ?: continue
+            if (paths[id] == old && note != null && text == note.markdown) continue
+            saf.writeAtomic("$trash/$old", text.toByteArray(), mustBeAbsent = true)
         }
-        if (revisionOf(scan(), previous.bytes) != expected) {
+        if (revision(true) != expected) {
             throw SyncConflictException("Files changed while preparing the save. Your edits are still in memory.")
         }
-        // Write destinations first, then remove old paths that are no longer in use.
-        for ((id, relative) in paths) {
-            when (val node = workspace.nodes.getValue(id)) {
-                is Folder -> saf.ensureDir(relative)
-                is Note -> if (relative != previous.paths[id] || known[id] != node.markdown) saf.writeAtomic(relative, node.markdown.toByteArray())
+        fun checkManifest(bytes: ByteArray) {
+            if (!readManifest().bytes.contentEquals(bytes)) {
+                throw SyncConflictException("Workspace metadata changed while saving. Your edits are still in memory.")
             }
         }
+        val intended = TreeMap(initial.contents)
+        // Publish destinations and metadata before deleting any renamed/deleted originals.
+        for ((id, relative) in paths) {
+            checkManifest(previous.bytes)
+            when (val node = workspace.nodes.getValue(id)) {
+                is Folder -> {
+                    saf.ensureDir(relative)
+                    intended[relative] = null
+                }
+                is Note -> {
+                    val old = initial.contents[relative]
+                    if (old != node.markdown) saf.writeAtomic(relative, node.markdown.toByteArray(), old?.toByteArray(), relative !in disk)
+                    intended[relative] = node.markdown
+                }
+            }
+        }
+        val bytes = metadataBytes(workspace, paths, previous)
+        saf.writeAtomic(MANIFEST, bytes, previous.bytes.takeIf { it.isNotEmpty() }, previous.bytes.isEmpty())
         val wanted = paths.values.toSet()
         for (old in previous.paths.values.filter { it !in wanted }.sortedByDescending { it.length }) {
+            checkManifest(bytes)
             val entry = saf.resolve(old) ?: continue
+            val wasFolder = disk[old]?.isDir
+            if (wasFolder != entry.isDir || (!entry.isDir && decode(saf.read(entry.doc, MAX_NOTE)) != initial.contents[old])) {
+                throw SyncConflictException("An old note changed while saving. Both versions have been kept; reload before saving again.")
+            }
             // SAF deletes folders recursively, so only remove folders that are already empty.
-            if (!entry.isDir || saf.list(entry.doc).isEmpty()) saf.delete(entry.doc)
+            if (!entry.isDir || saf.list(entry.doc).isEmpty()) {
+                saf.delete(entry.doc)
+                intended.remove(old)
+            }
         }
-        val bytes = metadataBytes(workspace, paths)
-        saf.writeAtomic(MANIFEST, bytes)
-        known = workspace.nodes.values.filterIsInstance<Note>().associate { it.id to it.markdown }
-        return revisionOf(scan(), bytes)
+        val expectedResult = revisionOf(intended, bytes)
+        val verified = snapshot()
+        if (revisionOf(verified.contents, verified.manifest.bytes) != expectedResult) {
+            throw SyncConflictException("Files changed while saving. Reload the folder before saving again; your edits are still here.")
+        }
+        remember(verified, expectedResult)
+        return expectedResult
     }
 }

@@ -25,7 +25,7 @@ fn workspace_folder(state: State<'_, VaultState>) -> Result<Option<String>, Stri
         .lock()
         .map_err(|_| "Workspace is busy.")?
         .as_ref()
-        .map(|path| path.to_string_lossy().to_string()))
+        .map(|path| vault::display_path(path)))
 }
 #[tauri::command]
 fn read_last_section(app: tauri::AppHandle) -> Result<String, String> {
@@ -94,7 +94,7 @@ async fn choose_workspace_folder(
         .join("vault.json");
     vault::atomic_write(&config, &serde_json::to_vec(&json!({"path":path})).unwrap())?;
     *state.0.lock().map_err(|_| "Workspace is busy.")? = Some(path.clone());
-    Ok(Some(path.to_string_lossy().to_string()))
+    Ok(Some(vault::display_path(&path)))
 }
 #[tauri::command]
 async fn load_workspace(state: State<'_, VaultState>) -> Result<vault::LoadedWorkspace, String> {
@@ -160,13 +160,14 @@ async fn load_finance(
     state: State<'_, VaultState>,
 ) -> Result<Value, String> {
     let folder = root(&state)?;
+    let device = device_id(&app)?;
     let revision = vault::finance_revision(&folder)?;
-    let mut finance = vault::read_finance(&folder)?;
+    let mut finance = vault::read_finance(&folder, &device)?;
     if vault::finance_revision(&folder)? != revision {
         return Err("Finance changed while loading. Wait for synchronization and reload.".into());
     }
     finance["revision"] = json!(revision);
-    finance["device"] = json!(device_id(&app)?);
+    finance["device"] = json!(device);
     Ok(finance)
 }
 #[tauri::command]
@@ -180,13 +181,17 @@ async fn append_finance(
     line: String,
     template: Option<Vec<u8>>,
     retire_legacy: bool,
-) -> Result<String, String> {
+    expected_own_log: Option<String>,
+    expected_template: Option<String>,
+) -> Result<vault::SavedFinance, String> {
     vault::append_finance(
         &root(&state)?,
         &device_id(&app)?,
         &line,
         template.as_deref(),
         retire_legacy,
+        expected_own_log.as_deref(),
+        expected_template.as_deref(),
     )
 }
 #[tauri::command]
@@ -320,25 +325,42 @@ pub fn run() {
             let settings = MenuItemBuilder::with_id("settings", "Settings…")
                 .accelerator("CmdOrCtrl+,")
                 .build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit Noter")
-                .accelerator("CmdOrCtrl+Q")
-                .build(app)?;
-            let app_menu = SubmenuBuilder::new(app, "Noter")
-                .item(&PredefinedMenuItem::about(app, Some("About Noter"), None)?)
-                .item(&settings)
-                .separator();
-            #[cfg(target_os = "macos")]
-            let app_menu = app_menu
-                .item(&PredefinedMenuItem::hide(app, None)?)
-                .item(&PredefinedMenuItem::hide_others(app, None)?)
-                .item(&PredefinedMenuItem::show_all(app, None)?)
-                .separator();
-            let app_menu = app_menu.item(&quit).build()?;
+            let about = PredefinedMenuItem::about(app, Some("About Noter"), None)?;
             let file_menu = SubmenuBuilder::new(app, "File")
                 .items(&[&new_note, &save])
                 .separator()
-                .items(&[&folder, &reload])
-                .build()?;
+                .items(&[&folder, &reload]);
+            // macOS keeps About, Settings and Quit in the application menu; Windows and Linux
+            // expect Settings and Exit under File and About under Help.
+            #[cfg(target_os = "macos")]
+            let (leading, file_menu, trailing) = {
+                let quit = MenuItemBuilder::with_id("quit", "Quit Noter")
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(app)?;
+                let app_menu = SubmenuBuilder::new(app, "Noter")
+                    .item(&about)
+                    .item(&settings)
+                    .separator()
+                    .item(&PredefinedMenuItem::hide(app, None)?)
+                    .item(&PredefinedMenuItem::hide_others(app, None)?)
+                    .item(&PredefinedMenuItem::show_all(app, None)?)
+                    .separator()
+                    .item(&quit)
+                    .build()?;
+                (Some(app_menu), file_menu.build()?, None)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let (leading, file_menu, trailing) = {
+                let quit = MenuItemBuilder::with_id("quit", "Exit").build(app)?;
+                let file_menu = file_menu
+                    .separator()
+                    .item(&settings)
+                    .separator()
+                    .item(&quit)
+                    .build()?;
+                let help_menu = SubmenuBuilder::new(app, "Help").item(&about).build()?;
+                (None, file_menu, Some(help_menu))
+            };
             let edit_menu = SubmenuBuilder::new(app, "Edit")
                 .item(&PredefinedMenuItem::undo(app, None)?)
                 .item(&PredefinedMenuItem::redo(app, None)?)
@@ -348,11 +370,8 @@ pub fn run() {
                 .item(&PredefinedMenuItem::paste(app, None)?)
                 .item(&PredefinedMenuItem::select_all(app, None)?)
                 .build()?;
-            app.set_menu(
-                MenuBuilder::new(app)
-                    .items(&[&app_menu, &file_menu, &edit_menu])
-                    .build()?,
-            )?;
+            let menus = leading.iter().chain([&file_menu, &edit_menu]).chain(trailing.iter());
+            app.set_menu(menus.fold(MenuBuilder::new(app), |menu, item| menu.item(item)).build()?)?;
             app.on_menu_event(|app, event| {
                 if event.id().as_ref() == "quit" {
                     if let Some(window) = app.get_webview_window("main") {

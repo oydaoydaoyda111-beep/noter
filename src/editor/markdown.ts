@@ -139,7 +139,10 @@ function parseBlocks(lines: string[]): DocumentFragment {
       const pre = document.createElement('pre');
       pre.dataset.language = fence[2] || 'code';
       const code = document.createElement('code');
-      code.textContent = content.join('\n');
+      const text = content.join('\n');
+      code.textContent = text;
+      // A final line break supplies a caret line box without adding a character to saved code.
+      if (!text || text.endsWith('\n')) code.append(document.createElement('br'));
       pre.append(code); fragment.append(pre); continue;
     }
     const heading = line.match(/^\s{0,3}(#{1,3})\s+(.*)$/);
@@ -187,6 +190,9 @@ export function markdownToDom(markdown: string): DocumentFragment {
 }
 
 function clean(text: string): string { return text.replace(/\u200b/g, '').replace(/\u00a0/g, ' '); }
+
+/** Code is literal; caret placeholders must not change whitespace or Unicode characters. */
+export function codeText(pre: Element): string { return pre.textContent ?? ''; }
 
 function escapeText(text: string): string {
   return clean(text).replace(/([\\`*_\[\]#>])/g, '\\$1');
@@ -246,7 +252,7 @@ function blockMarkdown(node: Node): string {
     case 'H1': case 'H2': case 'H3': return text ? `${'#'.repeat(Number(node.tagName[1]))} ${text}` : '';
     case 'HR': return '---';
     case 'PRE': {
-      const content = clean(node.textContent ?? '');
+      const content = codeText(node);
       const language = node.getAttribute('data-language') ?? '';
       const fence = '`'.repeat(Math.max(3, longestTicks(content) + 1));
       return `${fence}${language === 'code' ? '' : language.replace(/[^\w+-]/g, '')}\n${content}\n${fence}`;

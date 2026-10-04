@@ -1,13 +1,18 @@
 package app.noter.finance
 
+import app.noter.storage.strictJsonObject as readStrictJsonObject
 import org.json.JSONArray
-import org.json.JSONException
 import org.json.JSONObject
 
 internal fun invalid(): Nothing =
     throw FinanceException("Finance files contain invalid data. Keep the files and restore a valid backup before editing.")
 
 private fun JSONObject.string(key: String): String = opt(key) as? String ?: invalid()
+
+/** Android JSONObject accepts non-JSON syntax. Validate the shared file grammar first. */
+internal fun strictJsonObject(text: String): JSONObject {
+    return try { readStrictJsonObject(text) } catch (_: Exception) { invalid() }
+}
 
 /** JSON numbers must remain exact when the desktop client reads them as JavaScript numbers. */
 internal fun safeInteger(value: Any?): Long? {
@@ -64,6 +69,12 @@ internal fun defaultsFromJson(value: Any?): Defaults =
 
 internal fun defaultsToJson(defaults: Defaults): JSONObject = JSONObject().put("account", defaults.account).put("category", defaults.category)
 
+internal fun budgetsFromJson(value: Any?): List<Budget> =
+    value.objects().map { Budget(it.string("month"), it.string("category"), it.integer("cents")) }
+
+internal fun budgetsToJson(budgets: List<Budget>): JSONArray =
+    JSONArray(budgets.map { JSONObject().put("month", it.month).put("category", it.category).put("cents", it.cents) })
+
 /** The same checks as the desktop app's validateFinanceFile; never silently drops financial entries. */
 fun validateFinance(finance: Finance): Finance {
     if (finance.accounts.isEmpty()) invalid()
@@ -76,12 +87,16 @@ fun validateFinance(finance: Finance): Finance {
     for (pair in finance.transactions.filter { it.transferId != null }.groupBy { it.transferId }.values) {
         if (pair.size != 2 || pair[0].cents != -pair[1].cents || pair[0].account == pair[1].account || pair[0].date != pair[1].date) invalid()
     }
+    val budgetIds = HashSet<Pair<String, String>>()
+    for (budget in finance.budgets.orEmpty()) {
+        if (!Regex("^\\d{4}-(0[1-9]|1[0-2])$").matches(budget.month) || budget.category.isBlank() || budget.category.length > 120 || isTransferCategory(budget.category) || budget.cents !in 1..MAX_SAFE || !budgetIds.add(budget.month to budget.category)) invalid()
+    }
     return finance
 }
 
 /** Reads the former single-file `.noter/finance.json`, used only for the one-time migration to logs. */
 fun parseLegacyFinance(text: String, template: ByteArray): Finance {
-    val data = try { JSONObject(text) } catch (_: JSONException) { invalid() }
+    val data = strictJsonObject(text)
     if (safeInteger(data.opt("version")) != 1L) invalid()
     val finance = Finance(
         accounts = accountsFromJson(data.opt("accounts")),
@@ -91,6 +106,7 @@ fun parseLegacyFinance(text: String, template: ByteArray): Finance {
         template = template,
         defaults = if (data.isNull("defaults")) null else defaultsFromJson(data.opt("defaults")),
         categoryDefinitions = if (data.has("categoryDefinitions")) definitionsFromJson(data.opt("categoryDefinitions")) else null,
+        budgets = if (data.isNull("budgets")) null else budgetsFromJson(data.opt("budgets")),
     )
     return validateFinance(finance)
 }

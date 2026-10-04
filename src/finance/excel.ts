@@ -1,7 +1,8 @@
 import { unpackWorkbook, packWorkbook } from './archive.ts';
 const strFromU8 = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 const strToU8 = (text: string) => new TextEncoder().encode(text);
-import { balances, type Finance, type Transaction } from './model.ts';
+import { balances, type Budget, type Finance, type Transaction } from './model.ts';
+import { validateBudgets } from './budgets.ts';
 import { categoryCatalog } from './categories.ts';
 
 const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -72,11 +73,17 @@ export async function importWorkbook(bytes: Uint8Array, sourceName: string): Pro
   for (const row of transactions) if (!accounts.some(account => account.name === row.account)) accounts.push({ name: row.account, note: '' });
   if (!accounts.length) throw new Error('Workbook has no accounts.');
   const categoryDefinitions: { name: string; subcategories: string[] }[] = [];
+  const budgets: Budget[] = [];
   if (files['xl/worksheets/noter-finance.xml']) {
     const metadata = children(parse(files['xl/worksheets/noter-finance.xml']), 'row').slice(1);
     const used = new Set<string>();
     metadata.forEach((row, index) => {
       const values = children(row, 'c').map(read), transaction = transactions[index];
+      if (values[0] === 'Budget') {
+        if (!/^\d+$/.test(values[3] ?? '')) throw new Error('The workbook contains an invalid budget amount.');
+        budgets.push({ month: values[1], category: values[2], cents: Number(values[3]) });
+        return;
+      }
       if (values[0] === 'Account' && values[1]) {
         const account = accounts.find(item => item.name === values[1]);
         if (account) account.archived = values[2] === 'archived';
@@ -98,6 +105,7 @@ export async function importWorkbook(bytes: Uint8Array, sourceName: string): Pro
   }
   const finance: Finance = { version: 1, accounts, transactions, categories: [...new Set([...transactions.map(row => row.category), ...categoryDefinitions.map(item => item.name)].filter(Boolean))], sourceName, template: bytes };
   if (categoryDefinitions.length) finance.categoryDefinitions = categoryDefinitions;
+  if (budgets.length) { validateBudgets(budgets); finance.budgets = budgets; }
   return finance;
 }
 
@@ -173,6 +181,10 @@ export async function exportWorkbook(finance: Finance): Promise<Uint8Array> {
     for (const subcategory of category.subcategories) metadataRows.push(['Category', category.name, subcategory]);
   }
   for (const account of finance.accounts) if (account.archived !== undefined) metadataRows.push(['Account', account.name, account.archived ? 'archived' : 'active']);
+  if (finance.budgets) {
+    validateBudgets(finance.budgets);
+    for (const budget of finance.budgets) metadataRows.push(['Budget', budget.month, budget.category, String(budget.cents)]);
+  }
   const metadataData = children(metadata, 'sheetData')[0];
   metadataRows.forEach((values, index) => {
     const row = metadata.createElementNS(ns, 'row'); row.setAttribute('r', String(index + 1));

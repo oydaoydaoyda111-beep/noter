@@ -1,4 +1,4 @@
-import type { Finance, Transaction } from './model.ts';
+import { validateFinanceFile, type Finance, type Transaction } from './model.ts';
 
 // Finance is stored as one append-only log per device in .noter/finance/log-<device>.jsonl.
 // Each device appends only to its own file, avoiding competing writes during normal sync.
@@ -6,7 +6,7 @@ import type { Finance, Transaction } from './model.ts';
 // the current data, with the latest change winning for each transaction or setting.
 // The Android client implements the same format in FinanceLog.kt; keep both in step.
 
-export const metaKeys = ['accounts', 'categories', 'categoryDefinitions', 'defaults', 'sourceName', 'templateSha256'] as const;
+export const metaKeys = ['accounts', 'categories', 'categoryDefinitions', 'defaults', 'sourceName', 'templateSha256', 'budgets'] as const;
 type MetaKey = typeof metaKeys[number];
 export type FinanceOp = { k: 'reset' } | { k: 'tx'; id: string; tx: Transaction | null } | { k: 'meta'; key: MetaKey; value: unknown };
 export interface FinanceBatch { v: 1; ts: number; dev: string; seq: number; ops: FinanceOp[] }
@@ -15,6 +15,29 @@ export type FinanceData = Omit<Finance, 'template'>;
 
 function invalid(): never { throw new Error('Finance log contains invalid data. Keep the files and restore a valid backup before editing.'); }
 const isString = (value: unknown): value is string => typeof value === 'string';
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right)) return left.length === right.length && left.every((value, index) => sameJson(value, right[index]));
+  if (!isObject(left) || !isObject(right)) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(right, key) && sameJson(left[key], right[key]));
+}
+
+function validMeta(key: MetaKey, value: unknown) {
+  if (key === 'sourceName' || key === 'templateSha256') { if (!isString(value)) invalid(); return; }
+  if ((key === 'defaults' || key === 'categoryDefinitions' || key === 'budgets') && value === null) return;
+  // Reuse the file validator, supplying only this metadata field. This also validates
+  // superseded operations rather than letting a later write hide malformed data.
+  const test: Finance = { version: 1, accounts: [{ name: 'validation', note: '' }], transactions: [], categories: [], sourceName: '', template: new Uint8Array() };
+  if (key === 'accounts' && Array.isArray(value) && value.length === 0) return;
+  Object.assign(test, { [key]: value });
+  try { validateFinanceFile(test); } catch { invalid(); }
+}
 
 export function canonicalTransaction(row: Transaction): Transaction {
   const result: Transaction = { id: row.id, date: row.date, cents: row.cents, account: row.account, category: row.category, subcategory: row.subcategory, payee: row.payee, note: row.note };
@@ -30,6 +53,7 @@ function metaValue(data: FinanceData, key: MetaKey, templateSha256: string): unk
     case 'defaults': return data.defaults ? { account: data.defaults.account, category: data.defaults.category } : null;
     case 'sourceName': return data.sourceName;
     case 'templateSha256': return templateSha256;
+    case 'budgets': return data.budgets ?? null;
   }
 }
 
@@ -38,6 +62,7 @@ export function diffFinance(base: { data: FinanceData; templateSha256: string } 
   const ops: FinanceOp[] = [];
   if (!base) ops.push({ k: 'reset' });
   for (const key of metaKeys) {
+    if (key === 'budgets' && !base?.data.budgets && !next.budgets) continue;
     const value = metaValue(next, key, templateSha256);
     if (!base || JSON.stringify(metaValue(base.data, key, base.templateSha256)) !== JSON.stringify(value)) ops.push({ k: 'meta', key, value });
   }
@@ -57,8 +82,16 @@ function validBatch(value: unknown): FinanceBatch {
   if (!batch || batch.v !== 1 || !Number.isSafeInteger(batch.ts) || !isString(batch.dev) || !batch.dev || !Number.isSafeInteger(batch.seq) || !Array.isArray(batch.ops)) invalid();
   for (const op of batch.ops) {
     if (op?.k === 'reset') continue;
-    if (op?.k === 'tx' && isString(op.id) && op.id && (op.tx === null || (typeof op.tx === 'object' && op.tx.id === op.id))) continue;
-    if (op?.k === 'meta' && (metaKeys as readonly string[]).includes(op.key)) continue;
+    if (op?.k === 'tx' && isString(op.id) && op.id && (op.tx === null || (isObject(op.tx) && op.tx.id === op.id))) {
+      if (op.tx) {
+        // Transfers are checked after replay; their partner can be in another batch.
+        const tx = { ...op.tx }; delete tx.transferId;
+        if (op.tx.transferId !== undefined && !isString(op.tx.transferId)) invalid();
+        try { validateFinanceFile({ version: 1, accounts: [{ name: op.tx.account, note: '' }], transactions: [tx], categories: [], sourceName: '', template: new Uint8Array() }); } catch { invalid(); }
+      }
+      continue;
+    }
+    if (op?.k === 'meta' && (metaKeys as readonly string[]).includes(op.key) && Object.hasOwn(op, 'value')) { validMeta(op.key, op.value); continue; }
     invalid();
   }
   return batch;
@@ -79,7 +112,12 @@ export function parseLogs(files: LogFile[], device: string): ParsedLogs {
       let parsed: unknown;
       try { parsed = JSON.parse(line); } catch { invalid(); }
       const batch = validBatch(parsed);
-      seen.set(`${batch.dev}\u0000${batch.seq}`, batch);
+      const identity = `${batch.dev}\u0000${batch.seq}`;
+      const previous = seen.get(identity);
+      if (previous && (previous.ts !== batch.ts || !sameJson(previous.ops, batch.ops))) {
+        throw new Error('Finance logs contain conflicting batches from the same device. Both versions have been kept. Resolve the conflicting log copies or restore a valid backup before editing.');
+      }
+      if (!previous) seen.set(identity, batch);
       clock = Math.max(clock, batch.ts);
       if (batch.dev === device) seq = Math.max(seq, batch.seq);
     }
@@ -94,10 +132,10 @@ export function replayFinance(batches: FinanceBatch[]): { data: FinanceData; tem
   const meta: Partial<Record<MetaKey, unknown>> = {};
   for (const batch of ordered) for (const op of batch.ops) {
     if (op.k === 'reset') { rows.clear(); for (const key of metaKeys) delete meta[key]; }
-    else if (op.k === 'tx') { if (op.tx) rows.set(op.id, op.tx); else rows.delete(op.id); }
+    else if (op.k === 'tx') { if (op.tx) rows.set(op.id, canonicalTransaction(op.tx)); else rows.delete(op.id); }
     else meta[op.key] = op.value;
   }
-  const accounts = Array.isArray(meta.accounts) ? meta.accounts as Finance['accounts'] : [];
+  const accounts = Array.isArray(meta.accounts) ? (meta.accounts as Finance['accounts']).map(account => ({ ...account })) : [];
   const transactions = [...rows.values()];
   if (!accounts.length && !transactions.length) return undefined;
   // Concurrent edits on different devices can leave references that no longer line up.
@@ -114,6 +152,7 @@ export function replayFinance(batches: FinanceBatch[]): { data: FinanceData; tem
   const data: FinanceData = { version: 1, accounts, transactions: repaired, categories: Array.isArray(meta.categories) ? meta.categories as string[] : [], sourceName: isString(meta.sourceName) ? meta.sourceName : '' };
   if (meta.defaults) data.defaults = meta.defaults as Finance['defaults'];
   if (meta.categoryDefinitions) data.categoryDefinitions = meta.categoryDefinitions as Finance['categoryDefinitions'];
+  if (meta.budgets !== undefined && meta.budgets !== null) data.budgets = meta.budgets as Finance['budgets'];
   return { data, templateSha256: isString(meta.templateSha256) ? meta.templateSha256 : '' };
 }
 

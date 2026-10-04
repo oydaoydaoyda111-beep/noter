@@ -64,6 +64,7 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         if (active && pollJob?.isActive == true) return
         pollJob?.cancel()
         pollJob = if (active) viewModelScope.launch {
+            checkExternalChanges(force = true)
             while (true) {
                 checkExternalChanges()
                 delay(5000)
@@ -87,14 +88,16 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     /** Appends one batch to this device's log. Must run under [lock] on the IO dispatcher. */
     private fun append(target: FinanceFiles, ops: List<org.json.JSONObject>, template: ByteArray?, retireLegacy: Boolean) {
         val (line, ts) = batchLine(device, clock, seq + 1, ops)
-        revision = target.append(device, (if (needsNewline) "\n" else "") + line, template, retireLegacy)
+        target.append(device, (if (needsNewline) "\n" else "") + line, template, retireLegacy)
+        // Loading/replaying alone acknowledges other-device batches; an append may
+        // have observed incoming logs that are not represented by the current base.
         clock = ts
         seq++
         needsNewline = false
     }
 
     private fun load(target: FinanceFiles): Finance? {
-        val before = target.revision()
+        val before = target.revision(force = true)
         val raw = target.read()
         val parsed = parseLogs(raw.logs, device)
         clock = parsed.clock
@@ -103,7 +106,7 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         val template = raw.template ?: ByteArray(0)
         val templateSha256 = raw.template?.let(::sha256) ?: ""
         var state = replayFinance(parsed.batches)
-        if (target.revision() != before) throw FinanceException("Finance changed while loading. Wait for synchronization and reload.")
+        if (target.revision(force = true) != before) throw FinanceException("Finance changed while loading. Wait for synchronization and reload.")
         revision = before
         if (state == null && raw.legacy != null) {
             // One-time migration from the former single .noter/finance.json file.
@@ -139,11 +142,11 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private suspend fun checkExternalChanges() {
+    private suspend fun checkExternalChanges(force: Boolean = false) {
         val target = files ?: return
         if (busy || dialogOpen || lock.isLocked || !loaded) return
         val changed = try {
-            withContext(Dispatchers.IO) { target.revision() != revision }
+            withContext(Dispatchers.IO) { target.revision(force) != revision }
         } catch (problem: CancellationException) {
             throw problem
         } catch (_: Exception) {
@@ -198,4 +201,4 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
 }
 
 private fun Finance.withTemplate(template: ByteArray) =
-    Finance(accounts, transactions, categories, sourceName, template, defaults, categoryDefinitions)
+    copy(template = template)

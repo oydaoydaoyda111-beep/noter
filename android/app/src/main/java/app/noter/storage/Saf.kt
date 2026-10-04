@@ -8,6 +8,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
@@ -23,7 +24,7 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
     private val failedAppends = HashSet<String>()
 
     companion object {
-        // ponytail: serialize SAF recovery and replacements; use per-tree locks if contention matters.
+        // Serialize SAF recovery and replacements; use per-tree locks if contention matters.
         private val replacementLock = Any()
         private fun hash(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes)
             .joinToString("") { "%02x".format(it) }
@@ -105,7 +106,18 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
 
     private fun child(doc: String, name: String): Entry? = list(doc).firstOrNull { it.name == name }
 
+    internal fun validatePath(path: String) {
+        if (path.isEmpty() || path.split('/').any { segment ->
+                val stem = segment.substringBefore('.').uppercase()
+                val reserved = stem in setOf("CON", "PRN", "AUX", "NUL") ||
+                    (stem.length == 4 && (stem.startsWith("COM") || stem.startsWith("LPT")) && stem.last() in '0'..'9')
+                segment.isEmpty() || segment in setOf(".", "..") || reserved || segment.endsWith('.') || segment.endsWith(' ') ||
+                    segment.any { it in "\\<>:\"|?*" || it.isISOControl() }
+            }) throw IOException("Invalid workspace file path.")
+    }
+
     fun resolve(path: String): Entry? {
+        validatePath(path)
         var doc = rootDoc
         var current: Entry? = null
         for (segment in path.split('/')) {
@@ -116,6 +128,7 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
     }
 
     fun ensureDir(path: String): String {
+        validatePath(path)
         var doc = rootDoc
         for (segment in path.split('/')) {
             val existing = child(doc, segment)
@@ -129,27 +142,43 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
         return doc
     }
 
-    fun read(doc: String): ByteArray =
-        resolver.openInputStream(uri(doc))?.use { it.readBytes() } ?: throw IOException("Could not read file.")
+    fun read(doc: String, limit: Long = 100_000_000L): ByteArray =
+        resolver.openInputStream(uri(doc))?.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            while (true) {
+                val size = input.read(buffer)
+                if (size < 0) break
+                if (output.size().toLong() + size > limit) throw IOException("A workspace file exceeds its supported size. Your files have been kept.")
+                output.write(buffer, 0, size)
+            }
+            output.toByteArray()
+        } ?: throw IOException("Could not read file.")
 
     fun delete(doc: String) {
         if (!DocumentsContract.deleteDocument(resolver, uri(doc))) throw IOException("Could not delete file.")
     }
 
     /** Appends to a file, creating it and its folders when missing. */
-    fun append(path: String, bytes: ByteArray): Unit = synchronized(replacementLock) {
+    fun append(path: String, bytes: ByteArray, expected: ByteArray? = null, mustBeAbsent: Boolean = false): Unit = synchronized(replacementLock) {
+        validatePath(path)
         val slash = path.lastIndexOf('/')
         val parent = if (slash < 0) rootDoc else ensureDir(path.substring(0, slash))
         val name = path.substring(slash + 1)
         val existing = child(parent, name)
         if (existing?.isDir == true) throw IOException("A folder blocks the file \"$name\".")
+        if (mustBeAbsent && existing != null) throw SyncConflictException("A synced file now uses that name. Both versions have been kept.")
+        val baseline = existing?.let { read(it.doc) } ?: ByteArray(0)
+        if (expected != null && (existing == null || !baseline.contentEquals(expected))) {
+            throw SyncConflictException("The file changed while preparing the save. Both versions have been kept.")
+        }
         // A leading newline is the Finance parser's incomplete-tail signal, not a valid new batch.
         val leadingNewline = bytes.firstOrNull() == '\n'.code.toByte()
         if (leadingNewline || path in failedAppends) {
             val batch = if (leadingNewline) bytes.copyOfRange(1, bytes.size) else bytes
             if (existing != null) {
                 if (existing.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
-                val previous = read(existing.doc)
+                val previous = baseline
                 if (previous.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
                 if (previous.isNotEmpty() && previous.last() != '\n'.code.toByte()) {
                     writeAtomic(".noter/trash/finance-interrupted-${UUID.randomUUID()}.jsonl", previous)
@@ -161,34 +190,54 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
                 }
             }
             failedAppends.remove(path)
-            append(path, batch)
+            append(path, batch, expected, mustBeAbsent)
             return@synchronized
         }
-        if ((existing?.size ?: 0L) + bytes.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
+        if (baseline.size.toLong() + bytes.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
         val target = existing?.let { uri(it.doc) }
             ?: DocumentsContract.createDocument(resolver, uri(parent), "application/octet-stream", name)
             ?: throw IOException("Could not create \"$name\".")
+        if (listRaw(parent).none { it.name == name && it.doc == DocumentsContract.getDocumentId(target) }) {
+            throw IOException("The document provider changed the log filename. Workspace files have been kept.")
+        }
         try {
             (resolver.openOutputStream(target, "wa") ?: throw IOException("Could not write \"$name\".")).use { it.write(bytes) }
+            if (!read(DocumentsContract.getDocumentId(target)).contentEquals(baseline + bytes)) {
+                throw IOException("The appended log could not be verified. Reload before another edit; workspace files have been kept.")
+            }
             failedAppends.remove(path)
         } catch (problem: Exception) {
             failedAppends.add(path)
+            // Some providers truncate despite the append mode; keep acknowledged batches before returning failure.
+            if (baseline.isNotEmpty()) {
+                val after = runCatching { read(DocumentsContract.getDocumentId(target)) }.getOrNull()
+                if (after != null && (after.size < baseline.size || !after.copyOfRange(0, baseline.size).contentEquals(baseline))) {
+                    try {
+                        writeAtomic(".noter/trash/finance-append-recovery-${UUID.randomUUID()}.jsonl", baseline, mustBeAbsent = true)
+                    } catch (recovery: Exception) {
+                        recovery.addSuppressed(problem)
+                        throw recovery
+                    }
+                }
+            }
             throw problem
         }
     }
 
     /** SAF has no atomic replace. Keep the old document until a completed sibling can take its name. */
-    fun writeAtomic(path: String, bytes: ByteArray, expected: ByteArray? = null): Unit = synchronized(replacementLock) {
+    fun writeAtomic(path: String, bytes: ByteArray, expected: ByteArray? = null, mustBeAbsent: Boolean = false): Unit = synchronized(replacementLock) {
+        validatePath(path)
         val slash = path.lastIndexOf('/')
         val parent = if (slash < 0) rootDoc else ensureDir(path.substring(0, slash))
         val name = path.substring(slash + 1)
         val existing = child(parent, name)
+        if (mustBeAbsent && existing != null) throw SyncConflictException("A synced file now uses that name. Both versions have been kept.")
         val oldBytes = existing?.let {
             if (it.isDir) throw IOException("A folder blocks the file \"$name\".")
             read(it.doc)
         }
         if (expected != null && (oldBytes == null || !oldBytes.contentEquals(expected))) {
-            throw IOException("The file changed while preparing the save. Both versions have been kept.")
+            throw SyncConflictException("The file changed while preparing the save. Both versions have been kept.")
         }
         if (existing != null) {
             if (oldBytes!!.contentEquals(bytes)) return@synchronized
@@ -208,18 +257,21 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
         try {
             val current = listRaw(parent).firstOrNull { it.name == name }
             if (current?.doc != existing?.doc || (current != null && !read(current.doc).contentEquals(oldBytes))) {
-                throw IOException("The file changed while preparing the save. Your new content has been kept beside it.")
+                throw SyncConflictException("The file changed while preparing the save. Your new content has been kept beside it.")
             }
             if (existing != null) {
                 record = journal(parent, name, temporary, stem, hash(oldBytes!!))
                 backup = DocumentsContract.renameDocument(resolver, uri(existing.doc), "$stem.old")
                     ?: throw IOException("Could not preserve the existing file.")
             }
-            if (listRaw(parent).any { it.name == name }) throw IOException("A synced file now uses that name. Both versions have been kept.")
+            if (listRaw(parent).any { it.name == name }) throw SyncConflictException("A synced file now uses that name. Both versions have been kept.")
             val installed = DocumentsContract.renameDocument(resolver, temporary, name)
                 ?: throw IOException("Could not replace \"$name\". Your new content has been kept in a hidden .noter-write-*.new file beside it.")
             if (listRaw(parent).none { it.name == name && it.doc == DocumentsContract.getDocumentId(installed) }) {
                 throw IOException("The document provider changed the saved filename. Both versions have been kept.")
+            }
+            if (!read(DocumentsContract.getDocumentId(installed)).contentEquals(bytes)) {
+                throw SyncConflictException("The saved file changed before verification. Both versions have been kept.")
             }
             record?.let { if (!it.delete()) throw IOException("Could not retire the private file recovery record.") }
             backup?.let { runCatching { DocumentsContract.deleteDocument(resolver, it) } }

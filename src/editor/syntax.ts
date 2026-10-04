@@ -32,6 +32,7 @@ export function highlightCodeBlocks(root: HTMLElement): boolean {
     if (language !== 'code' && codeLanguages.some(([name]) => name === language)) {
       next.innerHTML = hljs.highlight(text, { language, ignoreIllegals: true }).value;
     } else next.textContent = text;
+    if (!text || text.endsWith('\n')) next.append(document.createElement('br'));
     // Token markup is decorative; Markdown serialization and copying read only text.
     if (!code || pre.childNodes.length !== 1 || code.innerHTML !== next.innerHTML) {
       pre.replaceChildren(next); changed = true;

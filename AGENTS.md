@@ -11,8 +11,8 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - Use npm and the committed `package-lock.json`. Install dependencies with `npm ci`.
 - Use a Node.js version supported by the locked Vite release; Node.js 24 works with this project.
 - `npm run desktop:dev` launches Tauri with its fixed Vite port 1420.
-- `npm run desktop:build` builds native bundles; platform prerequisites are required.
-- `npm run desktop:package` builds the app and creates a DMG on macOS without Finder automation.
+- `npm run desktop:build` builds native bundles; platform prerequisites are required. On Windows it builds the per-user NSIS installer.
+- `npm run desktop:package` builds the app and creates a DMG on macOS without Finder automation; on other platforms it exits immediately with guidance.
 - `npm run desktop:test` runs Rust vault regression tests.
 - `npm run dev` also launches the desktop app.
 - `npm run check` checks TypeScript without generating files.

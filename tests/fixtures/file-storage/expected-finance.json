@@ -14,7 +14,8 @@
     "categories": ["Food", "Transfer to other account"],
     "sourceName": "synthetic.xlsx",
     "defaults": { "account": "Cash", "category": "Food" },
-    "categoryDefinitions": [{ "name": "Food", "subcategories": ["Café"] }]
+    "categoryDefinitions": [{ "name": "Food", "subcategories": ["Café"] }],
+    "budgets": [{ "month": "2026-10", "category": "Food", "cents": 5000 }]
   },
   "templateSha256": ""
 }

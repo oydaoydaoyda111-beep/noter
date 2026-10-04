@@ -11,7 +11,7 @@ use std::{
 use uuid::Uuid;
 type Result<T> = std::result::Result<T, String>;
 const MAX_NOTE: u64 = 10_000_000;
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, PartialEq, Serialize, Deserialize)]
 struct Manifest {
     workspace: Value,
     paths: BTreeMap<String, String>,
@@ -49,9 +49,55 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     }
     Ok(joined)
 }
+/// The canonical Windows path (`\\?\C:\…`) in the form people recognize; other platforms are unchanged.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy().to_string();
+    let simple = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\").filter(|rest| rest.get(1..2) == Some(":")) {
+        rest.to_string()
+    } else {
+        return text;
+    };
+    // Verbatim paths can name components that Win32 paths cannot express.
+    let expressible = simple.len() < 260 && !simple.split('\\').any(|part| part.ends_with(['.', ' ']));
+    if cfg!(windows) && expressible { simple } else { text }
+}
+/// Syncthing, Excel and other Windows programs briefly open files without delete sharing,
+/// which makes replacing or removing them fail until the handle closes. Retry those briefly.
+fn retry_in_use<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match operation() {
+            Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33)) && Instant::now() < deadline => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
+fn in_use_error(context: &str, path: &Path, problem: std::io::Error) -> String {
+    if cfg!(windows) && matches!(problem.raw_os_error(), Some(5 | 32 | 33)) {
+        format!("{context}: {} is open in another program, such as Syncthing or Excel. Close it or wait for synchronization, then save again ({problem}).", display_path(path))
+    } else {
+        error(context, problem)
+    }
+}
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if fs::read(path).is_ok_and(|previous| previous == bytes) {
         return Ok(());
+    }
+    // Windows refuses to replace read-only files; macOS and Linux ignore the mode when renaming.
+    #[cfg(windows)]
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            let _ = fs::set_permissions(path, permissions);
+        }
     }
     let parent = path.parent().ok_or("Invalid file location.")?;
     fs::create_dir_all(parent).map_err(|e| error("Could not create folder", e))?;
@@ -65,7 +111,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|e| error("Could not write file", e))?;
-        fs::rename(&temporary, path).map_err(|e| error("Could not replace file", e))
+        retry_in_use(|| fs::rename(&temporary, path))
+            .map_err(|e| in_use_error("Could not replace file", path, e))
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
@@ -74,15 +121,87 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn manifest(bytes: Option<&[u8]>) -> Result<Manifest> {
     match bytes {
-        Some(bytes) => serde_json::from_slice(bytes)
-            .map_err(|_| "Workspace metadata could not be read. Your files have been kept.".into()),
+        Some(bytes) => {
+            let manifest: Manifest = serde_json::from_slice(bytes).map_err(|_| {
+                "Workspace metadata could not be read. Your files have been kept.".to_string()
+            })?;
+            if manifest.workspace["version"] != json!(1) {
+                return Err("Unsupported workspace metadata version. Your files have been kept; use a compatible Noter version.".into());
+            }
+            let nodes = manifest.workspace["nodes"].as_object().ok_or(
+                "Workspace metadata could not be read. Your files have been kept.",
+            )?;
+            let mut used = HashSet::new();
+            if nodes.len() != manifest.paths.len() {
+                return Err("Workspace metadata has missing file paths. Your files have been kept.".into());
+            }
+            for (id, relative) in &manifest.paths {
+                let node = nodes.get(id).ok_or("Invalid workspace file metadata. Your files have been kept.")?;
+                if node["id"] != *id
+                    || !matches!(node["type"].as_str(), Some("note" | "folder"))
+                    || !node["name"].is_string()
+                    || relative.contains('\\')
+                    || relative.split('/').any(|part| !portable_segment(part) || part == "node_modules")
+                    || (node["type"] == "note" && !relative.to_lowercase().ends_with(".md"))
+                    || !used.insert(relative.to_lowercase())
+                {
+                    return Err("Invalid or conflicting workspace file metadata. Your files have been kept.".into());
+                }
+            }
+            Ok(manifest)
+        }
         None => Ok(Manifest::default()),
     }
+}
+// Paths are unique ignoring letter case on disk and in metadata, so case-only renames (from Explorer,
+// Finder, or an interrupted save) still match their note IDs.
+fn by_lowercase<'a, T>(entries: impl Iterator<Item = (&'a String, T)>) -> BTreeMap<String, T> {
+    entries.map(|(path, value)| (path.to_lowercase(), value)).collect()
+}
+fn complete_snapshot(root: &Path, disk: &BTreeMap<String, Option<String>>, previous: &Manifest) -> Result<()> {
+    let disk = by_lowercase(disk.iter());
+    for (id, relative) in &previous.paths {
+        safe_path(root, relative)?;
+        let matches = match disk.get(&relative.to_lowercase()) {
+            Some(Some(_)) => previous.workspace["nodes"][id]["type"] == "note",
+            Some(None) => previous.workspace["nodes"][id]["type"] == "folder",
+            None => false,
+        };
+        if !matches {
+            return Err("SYNC_CONFLICT: Some workspace files are missing or do not match their metadata. Wait for synchronization to finish and reload. Your files and note IDs have been kept.".into());
+        }
+    }
+    Ok(())
+}
+fn manifest_bytes(next: &Manifest, previous: &Manifest, original: Option<&[u8]>) -> Result<Vec<u8>> {
+    if next == previous {
+        if let Some(bytes) = original {
+            return Ok(bytes.to_vec());
+        }
+    }
+    serde_json::to_vec_pretty(next).map_err(|e| error("Could not prepare metadata", e))
+}
+/// Operating-system folders at a drive root (and Windows' protected hidden+system files) are never notes,
+/// and some of them cannot even be listed, which would otherwise make a drive-root workspace unreadable.
+fn system_entry(name: &str, _entry: &fs::DirEntry) -> bool {
+    if name.eq_ignore_ascii_case("$RECYCLE.BIN") || name.eq_ignore_ascii_case("System Volume Information") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const HIDDEN_SYSTEM: u32 = 0x2 | 0x4;
+        if _entry.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_SYSTEM == HIDDEN_SYSTEM) {
+            return true;
+        }
+    }
+    false
 }
 fn scan(
     root: &Path,
     relative: &Path,
     files: &mut BTreeMap<String, Option<String>>,
+    used: &mut HashSet<String>,
     read_note: &impl Fn(&Path, &fs::Metadata) -> Result<String>,
 ) -> Result<()> {
     let directory = root.join(relative);
@@ -90,8 +209,10 @@ fn scan(
         fs::read_dir(&directory).map_err(|e| error("Could not read workspace folder", e))?
     {
         let entry = entry.map_err(|e| error("Could not read file", e))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name == "node_modules" {
+        let name = entry.file_name().into_string().map_err(|_| {
+            "A workspace filename is not Unicode. Rename it outside Noter before opening this folder."
+        })?;
+        if name.starts_with('.') || name == "node_modules" || system_entry(&name, &entry) {
             continue;
         }
         let kind = entry
@@ -102,9 +223,17 @@ fn scan(
         }
         let child = relative.join(&name);
         let key = child.to_string_lossy().replace('\\', "/");
+        if kind.is_dir() || (kind.is_file() && name.to_lowercase().ends_with(".md")) {
+            if !portable_segment(&name) {
+                return Err("A workspace filename is not compatible with desktop and Android. Rename it outside Noter before opening this folder.".into());
+            }
+            if !used.insert(key.to_lowercase()) {
+                return Err("Workspace filenames differ only by letter case. Rename one outside Noter before opening this folder on both devices.".into());
+            }
+        }
         if kind.is_dir() {
             files.insert(key, None);
-            scan(root, &child, files, read_note)?;
+            scan(root, &child, files, used, read_note)?;
         } else if kind.is_file() && name.to_lowercase().ends_with(".md") {
             let metadata = entry
                 .metadata()
@@ -120,13 +249,27 @@ fn scan(
     }
     Ok(())
 }
+/// Note text from UTF-8 (optionally with a BOM) or BOM-marked UTF-16, which Windows tools often write.
+/// Unchanged notes keep their original bytes; edited notes are saved as UTF-8 without a BOM.
+fn decode_note(bytes: &[u8]) -> Option<String> {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.chunks(2).map(|pair| <[u8; 2]>::try_from(pair).ok().map(unit)).collect::<Option<_>>()?;
+        String::from_utf16(&units).ok()
+    };
+    match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8(rest.to_vec()).ok(),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        _ => String::from_utf8(bytes.to_vec()).ok(),
+    }
+}
+fn read_note(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).map_err(|e| error(&format!("Could not read {}", display_path(path)), e))?;
+    decode_note(&bytes).ok_or_else(|| format!("{} is not UTF-8 or UTF-16 text. Convert or move it outside the workspace; your files have been kept.", display_path(path)))
+}
 fn files(root: &Path) -> Result<BTreeMap<String, Option<String>>> {
     let mut result = BTreeMap::new();
-    scan(root, Path::new(""), &mut result, &|path, _| {
-        fs::read_to_string(path).map_err(|_| {
-            "A Markdown file could not be read as UTF-8. Your files have been kept.".to_string()
-        })
-    })?;
+    scan(root, Path::new(""), &mut result, &mut HashSet::new(), &|path, _| read_note(path))?;
     if result
         .values()
         .filter_map(Option::as_ref)
@@ -161,6 +304,37 @@ fn read_snapshot(root: &Path) -> Result<(BTreeMap<String, Option<String>>, Optio
     };
     Ok((disk, metadata))
 }
+// A whole-workspace check cannot protect later destinations after earlier files are written.
+// Compare each target with the acknowledged snapshot immediately before changing it.
+fn unchanged_file(root: &Path, relative: &str, expected: Option<&Option<String>>) -> Result<()> {
+    let path = safe_path(root, relative)?;
+    let unchanged = match expected {
+        Some(Some(text)) => read_note(&path).is_ok_and(|current| current == *text),
+        Some(None) => fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()),
+        None => match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            _ => false,
+        },
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err("SYNC_CONFLICT: A file changed while saving. Reload the folder before saving again; your edits are still here.".into())
+    }
+}
+fn unchanged_metadata(root: &Path, expected: Option<&[u8]>) -> Result<()> {
+    let path = safe_path(root, ".noter/workspace.json")?;
+    let actual = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(problem) => return Err(error("Could not check metadata", problem)),
+    };
+    if actual.as_deref() == expected {
+        Ok(())
+    } else {
+        Err("SYNC_CONFLICT: Workspace metadata changed while saving. Wait for synchronization and reload; your edits are still here.".into())
+    }
+}
 pub fn revision(root: &Path) -> Result<String> {
     let (disk, metadata) = read_snapshot(root)?;
     Ok(snapshot_revision(
@@ -179,7 +353,7 @@ fn metadata_stamp(metadata: &fs::Metadata) -> Result<String> {
 }
 fn metadata_revision(root: &Path) -> Result<String> {
     let mut entries = BTreeMap::new();
-    scan(root, Path::new(""), &mut entries, &|_, metadata| {
+    scan(root, Path::new(""), &mut entries, &mut HashSet::new(), &|_, metadata| {
         metadata_stamp(metadata)
     })?;
     let path = safe_path(root, ".noter/workspace.json")?;
@@ -206,7 +380,7 @@ impl RevisionProbe {
     }
     fn check_at(&mut self, root: &Path, force: bool, now: Instant) -> Result<String> {
         let metadata = metadata_revision(root)?;
-        // ponytail: metadata scans avoid a watcher dependency; add a watcher if traversal gets costly.
+        // Metadata scans avoid a watcher dependency; add a watcher if traversal gets costly.
         // Full audits catch edits preserving timestamps, and saves always verify complete contents.
         if !force {
             if let Some(cached) = &self.cached {
@@ -238,17 +412,14 @@ pub fn load(root: &Path) -> Result<LoadedWorkspace> {
     let (disk, metadata) = read_snapshot(root)?;
     let before = snapshot_revision(&disk, metadata.as_deref().unwrap_or_default());
     let previous = manifest(metadata.as_deref())?;
-    let reverse: BTreeMap<_, _> = previous
-        .paths
-        .iter()
-        .map(|(id, path)| (path.clone(), id.clone()))
-        .collect();
+    complete_snapshot(root, &disk, &previous)?;
+    let reverse = by_lowercase(previous.paths.iter().map(|(id, path)| (path, id)));
     let mut paths = BTreeMap::new();
     let mut ids = HashSet::new();
     for path in disk.keys() {
         let mut id = reverse
-            .get(path)
-            .cloned()
+            .get(&path.to_lowercase())
+            .map(|id| id.to_string())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         if !ids.insert(id.clone()) {
             id = Uuid::new_v4().to_string();
@@ -302,22 +473,22 @@ pub fn load(root: &Path) -> Result<LoadedWorkspace> {
         workspace["openTabs"] = json!(first.iter().collect::<Vec<_>>());
         workspace["activeNoteId"] = json!(first);
     }
-    let mut metadata = workspace.clone();
-    for node in metadata["nodes"].as_object_mut().unwrap().values_mut() {
+    let mut output_metadata = workspace.clone();
+    for node in output_metadata["nodes"].as_object_mut().unwrap().values_mut() {
         node.as_object_mut().unwrap().remove("markdown");
     }
     let stable_paths = paths
         .iter()
         .map(|(path, id)| (id.clone(), path.clone()))
         .collect();
-    let bytes = serde_json::to_vec_pretty(&Manifest {
-        workspace: metadata,
+    let bytes = manifest_bytes(&Manifest {
+        workspace: output_metadata,
         paths: stable_paths,
-    })
-    .map_err(|e| error("Could not prepare metadata", e))?;
+    }, &previous, metadata.as_deref())?;
     if revision(root)? != before {
         return Err("SYNC_CONFLICT: Files changed while opening the folder. Wait for synchronization and reload.".into());
     }
+    unchanged_metadata(root, metadata.as_deref())?;
     atomic_write(&safe_path(root, ".noter/workspace.json")?, &bytes)?;
     let expected = snapshot_revision(&disk, &bytes);
     if revision(root)? != expected {
@@ -326,7 +497,7 @@ pub fn load(root: &Path) -> Result<LoadedWorkspace> {
     Ok(LoadedWorkspace {
         workspace,
         revision: expected,
-        path: root.to_string_lossy().to_string(),
+        path: display_path(root),
     })
 }
 fn ordered(previous: &Value, current: Vec<String>) -> Value {
@@ -343,6 +514,20 @@ fn ordered(previous: &Value, current: Vec<String>) -> Value {
         }
     }
     json!(result)
+}
+fn reserved_filename(name: &str) -> bool {
+    let upper = name.split('.').next().unwrap_or("").to_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.ends_with(|c: char| c.is_ascii_digit()))
+}
+fn portable_segment(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name.trim_end_matches(['.', ' ']) == name
+        && !name.chars().any(|c| c.is_control() || "/\\<>:\"|?*".contains(c))
+        && !reserved_filename(name)
 }
 fn filename(raw: &str) -> String {
     let name: String = raw
@@ -361,12 +546,7 @@ fn filename(raw: &str) -> String {
     } else {
         name
     };
-    let upper = name.split('.').next().unwrap_or("").to_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.ends_with(|c: char| c.is_ascii_digit()))
-    {
+    if reserved_filename(name) {
         format!("_{name}")
     } else {
         name.to_string()
@@ -507,6 +687,14 @@ pub fn preserve_edits(root: &Path, workspace: &Value, base: &Value) -> Result<Pr
     })
 }
 pub fn save(root: &Path, workspace: Value, expected: &str) -> Result<String> {
+    save_before_change(root, workspace, expected, &mut |_| {})
+}
+fn save_before_change(
+    root: &Path,
+    workspace: Value,
+    expected: &str,
+    before_change: &mut impl FnMut(&str),
+) -> Result<String> {
     let (mut disk, metadata) = read_snapshot(root)?;
     if snapshot_revision(&disk, metadata.as_deref().unwrap_or_default()) != expected {
         return Err("SYNC_CONFLICT: Files changed outside Noter. Reload the folder before saving; your unsaved edits are still here.".into());
@@ -527,9 +715,17 @@ pub fn save(root: &Path, workspace: Value, expected: &str) -> Result<String> {
         return Err("Invalid workspace hierarchy.".into());
     }
     let existing_paths: HashSet<_> = previous.paths.values().collect();
+    // Only letter case changed: the entry moves in place instead of being copied and removed.
+    let case_renames: BTreeMap<&String, &String> = paths
+        .iter()
+        .filter_map(|(id, new)| {
+            let old = previous.paths.get(id)?;
+            (old != new && old.to_lowercase() == new.to_lowercase()).then_some((new, old))
+        })
+        .collect();
     for (id, path) in &paths {
         let target = safe_path(root, path)?;
-        if target.exists() && !existing_paths.contains(path) {
+        if target.exists() && !existing_paths.contains(path) && !case_renames.contains_key(path) {
             return Err(
                 "SYNC_CONFLICT: A file already uses that name. Reload the folder before saving."
                     .into(),
@@ -567,48 +763,82 @@ pub fn save(root: &Path, workspace: Value, expected: &str) -> Result<String> {
     if revision(root)? != expected {
         return Err("SYNC_CONFLICT: Files changed while preparing the save. Your edits are still in memory.".into());
     }
-    // Write destinations first. Then remove old paths that are no longer in use.
+    // On case-insensitive volumes (Windows, default macOS) the new spelling already resolves to the
+    // old entry, so copying to it and removing the old path would delete the note. Rename parents
+    // first; each child is then found under its parent's new spelling.
+    let mut ordered_renames: Vec<_> = case_renames.iter().collect();
+    ordered_renames.sort_by_key(|(new, _)| new.matches('/').count());
+    for (new, old) in ordered_renames {
+        let (parent, name) = new.rsplit_once('/').map_or(("", new.as_str()), |(parent, name)| (parent, name));
+        let old_name = old.rsplit('/').next().unwrap_or(old);
+        if old_name != name {
+            let source = if parent.is_empty() { old_name.to_string() } else { format!("{parent}/{old_name}") };
+            before_change(new);
+            unchanged_file(root, &source, disk.get(*old))?;
+            let (from, to) = (safe_path(root, &source)?, safe_path(root, new)?);
+            retry_in_use(|| fs::rename(&from, &to)).map_err(|e| in_use_error("Could not rename note", &from, e))?;
+        }
+    }
+    for (new, old) in &case_renames {
+        if let Some(entry) = disk.remove(*old) {
+            disk.insert((*new).clone(), entry);
+        }
+    }
+    // Keep source paths until the manifest publishes the completed destinations. An
+    // interrupted rename then leaves readable copies rather than broken note IDs.
     for (id, relative) in &paths {
         let target = safe_path(root, relative)?;
         if nodes[id]["type"] == "folder" {
+            before_change(relative);
+            unchanged_file(root, relative, disk.get(relative))?;
             fs::create_dir_all(target).map_err(|e| error("Could not create note folder", e))?;
             disk.insert(relative.clone(), None);
         } else {
             let markdown = nodes[id]["markdown"].as_str().unwrap();
             if disk.get(relative).and_then(|value| value.as_deref()) != Some(markdown) {
+                before_change(relative);
+                unchanged_file(root, relative, disk.get(relative))?;
                 atomic_write(&target, markdown.as_bytes())?;
                 disk.insert(relative.clone(), Some(markdown.to_string()));
             }
         }
     }
-    let wanted: HashSet<_> = paths.values().collect();
+    // Case-renamed entries were moved above; their old spelling names the same file.
+    let wanted: HashSet<_> = paths.values().map(|path| path.to_lowercase()).collect();
     let mut old_paths: Vec<_> = previous
         .paths
         .values()
-        .filter(|path| !wanted.contains(path))
+        .filter(|path| !wanted.contains(&path.to_lowercase()))
         .collect();
     old_paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    let mut output_metadata = workspace;
+    for node in output_metadata["nodes"].as_object_mut().unwrap().values_mut() {
+        node.as_object_mut().unwrap().remove("markdown");
+    }
+    let bytes = manifest_bytes(&Manifest {
+        workspace: output_metadata,
+        paths,
+    }, &previous, metadata.as_deref())?;
+    before_change(".noter/workspace.json");
+    if revision(root)? != snapshot_revision(&disk, metadata.as_deref().unwrap_or_default()) {
+        return Err("SYNC_CONFLICT: Files changed before publishing the save. Reload the folder before saving again; your edits are still here.".into());
+    }
+    unchanged_metadata(root, metadata.as_deref())?;
+    atomic_write(&safe_path(root, ".noter/workspace.json")?, &bytes)?;
     for old in old_paths {
         let path = safe_path(root, old)?;
+        before_change(old);
+        unchanged_file(root, old, disk.get(old))?;
         if path.is_file() {
-            fs::remove_file(path).map_err(|e| error("Could not move old note", e))?;
+            retry_in_use(|| fs::remove_file(&path)).map_err(|e| in_use_error("Could not move old note", &path, e))?;
             disk.remove(old);
         } else if path.is_dir() {
-            if fs::remove_dir(path).is_ok() {
+            // A folder that is another program's working directory stays until that program moves on.
+            if retry_in_use(|| fs::remove_dir(&path)).is_ok() {
                 disk.remove(old);
             }
         }
     }
-    let mut metadata = workspace;
-    for node in metadata["nodes"].as_object_mut().unwrap().values_mut() {
-        node.as_object_mut().unwrap().remove("markdown");
-    }
-    let bytes = serde_json::to_vec_pretty(&Manifest {
-        workspace: metadata,
-        paths,
-    })
-    .map_err(|e| error("Could not prepare metadata", e))?;
-    atomic_write(&safe_path(root, ".noter/workspace.json")?, &bytes)?;
     let saved_revision = snapshot_revision(&disk, &bytes);
     if revision(root)? != saved_revision {
         return Err("SYNC_CONFLICT: Files changed while saving. Reload the folder before saving again; your edits are still here.".into());
@@ -619,6 +849,33 @@ const FINANCE_LOGS: &str = ".noter/finance";
 const FINANCE_LEGACY: &str = ".noter/finance.json";
 const FINANCE_TEMPLATE: &str = ".noter/finance-template.xlsx";
 const MAX_FINANCE_LOGS: u64 = 100_000_000;
+fn fingerprint(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(problem) => Err(error("Could not read Finance file", problem)),
+    }
+}
+fn file_fingerprint(root: &Path, relative: &str) -> Result<Option<String>> {
+    Ok(read_optional(&safe_path(root, relative)?)?.as_deref().map(fingerprint))
+}
+fn unchanged_finance(root: &Path, relative: &str, expected: Option<&str>) -> Result<()> {
+    if file_fingerprint(root, relative)?.as_deref() == expected {
+        Ok(())
+    } else {
+        Err("SYNC_CONFLICT: Finance files changed outside Noter. Reload Finance before saving; the incoming files have been kept.".into())
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFinance {
+    pub revision: String,
+    pub own_log_sha256: Option<String>,
+    pub template_sha256: Option<String>,
+}
 fn millis(metadata: &fs::Metadata) -> u128 {
     metadata
         .modified()
@@ -673,30 +930,52 @@ pub fn finance_revision(root: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 /// Raw Finance files: every device log, the legacy single-file data (until migrated), and the Excel template.
-pub fn read_finance(root: &Path) -> Result<Value> {
+pub fn read_finance(root: &Path, device: &str) -> Result<Value> {
     let mut logs = Vec::new();
+    let mut checked = Vec::new();
+    let own_name = format!("log-{device}.jsonl");
+    let mut own_log_sha256 = None;
     let mut total = 0;
     for (name, path, metadata) in finance_logs(root)? {
         total += metadata.len();
         if total > MAX_FINANCE_LOGS {
             return Err("Finance logs are larger than 100 MB.".into());
         }
-        let text = fs::read_to_string(path)
+        let text = fs::read_to_string(&path)
             .map_err(|_| "A Finance log could not be read as UTF-8. Your files have been kept.")?;
+        let sha256 = fingerprint(text.as_bytes());
+        if name == own_name {
+            own_log_sha256 = Some(sha256.clone());
+        }
+        checked.push((path, sha256));
         logs.push(json!({"name": name, "text": text}));
     }
     let legacy = match fs::read(safe_path(root, FINANCE_LEGACY)?) {
-        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
-            .map_err(|_| "Finance data could not be read. Your files have been kept.")?,
+        Ok(bytes) => {
+            checked.push((safe_path(root, FINANCE_LEGACY)?, fingerprint(&bytes)));
+            serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| "Finance data could not be read. Your files have been kept.")?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
         Err(e) => return Err(error("Could not read Finance", e)),
     };
+    let mut template_sha256 = None;
     let template = match fs::read(safe_path(root, FINANCE_TEMPLATE)?) {
-        Ok(bytes) => json!(bytes),
+        Ok(bytes) => {
+            let sha256 = fingerprint(&bytes);
+            template_sha256 = Some(sha256.clone());
+            checked.push((safe_path(root, FINANCE_TEMPLATE)?, sha256));
+            json!(bytes)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
         Err(e) => return Err(error("Could not read Finance workbook", e)),
     };
-    Ok(json!({"logs": logs, "legacy": legacy, "template": template}))
+    for (path, expected) in checked {
+        if read_optional(&path)?.as_deref().map(fingerprint).as_deref() != Some(&expected) {
+            return Err("SYNC_CONFLICT: Finance changed while loading. Wait for synchronization and reload.".into());
+        }
+    }
+    Ok(json!({"logs": logs, "legacy": legacy, "template": template, "ownLogSha256": own_log_sha256, "templateSha256": template_sha256}))
 }
 /// Appends one batch line to this device's log. A replaced workbook template is written first,
 /// so a batch that references its fingerprint never exists without the template itself.
@@ -706,7 +985,9 @@ pub fn append_finance(
     line: &str,
     template: Option<&[u8]>,
     retire_legacy: bool,
-) -> Result<String> {
+    expected_own_log: Option<&str>,
+    expected_template: Option<&str>,
+) -> Result<SavedFinance> {
     if device.is_empty() || device.len() > 64 || !device.chars().all(|c| c.is_ascii_alphanumeric())
     {
         return Err("Invalid device identifier.".into());
@@ -719,24 +1000,32 @@ pub fn append_finance(
     {
         return Err("Invalid Finance change.".into());
     }
+    let relative = format!("{FINANCE_LOGS}/log-{device}.jsonl");
+    let path = safe_path(root, &relative)?;
+    let original = read_optional(&path)?;
+    if original.as_deref().map(fingerprint).as_deref() != expected_own_log {
+        return Err("SYNC_CONFLICT: This device's Finance log changed outside Noter. Reload Finance before saving; the incoming log has been kept.".into());
+    }
+    unchanged_finance(root, FINANCE_TEMPLATE, expected_template)?;
+    let original_bytes = original.as_deref().unwrap_or_default();
+    if !original_bytes.is_empty() && original_bytes.last() != Some(&b'\n') && !line.starts_with('\n') {
+        return Err("An interrupted Finance log must be reloaded before saving.".into());
+    }
     if let Some(bytes) = template {
         if bytes.len() > 10_000_000 {
             return Err("Finance workbook is too large.".into());
         }
         atomic_write(&safe_path(root, FINANCE_TEMPLATE)?, bytes)?;
     }
-    let path = safe_path(root, &format!("{FINANCE_LOGS}/log-{device}.jsonl"))?;
     fs::create_dir_all(path.parent().ok_or("Invalid Finance location.")?)
         .map_err(|e| error("Could not create Finance folder", e))?;
     let mut recovered = false;
+    let mut committed = original_bytes.to_vec();
+    committed.extend_from_slice(body.as_bytes());
     // A leading newline signals an ignored interrupted tail, not a record separator.
     // Keep the original recoverable and replace the tail and new batch in one durable write.
     if line.starts_with('\n') {
-        let original = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(error("Could not read Finance log", e)),
-        };
+        let original = original_bytes;
         if !original.is_empty() && original.last() != Some(&b'\n') {
             let backup = safe_path(
                 root,
@@ -748,10 +1037,7 @@ pub fn append_finance(
             )?;
             atomic_write(&backup, &original)?;
             let current = safe_path(root, &format!("{FINANCE_LOGS}/log-{device}.jsonl"))?;
-            if fs::read(&current).map_err(|e| error("Could not check Finance log", e))? != original
-            {
-                return Err("SYNC_CONFLICT: Finance changed while preparing recovery. Reload Finance before saving.".into());
-            }
+            unchanged_finance(root, &relative, expected_own_log)?;
             let end = original
                 .iter()
                 .rposition(|&byte| byte == b'\n')
@@ -759,10 +1045,12 @@ pub fn append_finance(
             let mut repaired = original[..end].to_vec();
             repaired.extend_from_slice(body.as_bytes());
             atomic_write(&current, &repaired)?;
+            committed = repaired;
             recovered = true;
         }
     }
     if !recovered {
+        unchanged_finance(root, &relative, expected_own_log)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -784,9 +1072,14 @@ pub fn append_finance(
         )?;
         fs::create_dir_all(target.parent().ok_or("Invalid trash location.")?)
             .map_err(|e| error("Could not create trash folder", e))?;
-        fs::rename(&legacy, &target).map_err(|e| error("Could not retire finance.json", e))?;
+        retry_in_use(|| fs::rename(&legacy, &target))
+            .map_err(|e| in_use_error("Could not retire finance.json", &legacy, e))?;
     }
-    finance_revision(root)
+    let own_log_sha256 = Some(fingerprint(&committed));
+    let template_sha256 = template.map(fingerprint).or_else(|| expected_template.map(str::to_string));
+    unchanged_finance(root, &relative, own_log_sha256.as_deref())?;
+    unchanged_finance(root, FINANCE_TEMPLATE, template_sha256.as_deref())?;
+    Ok(SavedFinance { revision: finance_revision(root)?, own_log_sha256, template_sha256 })
 }
 
 #[cfg(test)]
@@ -846,6 +1139,122 @@ mod tests {
         .unwrap();
         let next = load(root.path()).unwrap();
         assert_eq!(next.workspace["nodes"].as_object().unwrap().len(), 2);
+    }
+    #[test]
+    fn incomplete_sync_keeps_manifest_bytes_and_note_ids_until_files_arrive() {
+        let root = tempfile::tempdir().unwrap();
+        let mut metadata = workspace();
+        metadata["nodes"]["note"].as_object_mut().unwrap().remove("markdown");
+        let bytes = serde_json::to_vec(&json!({"workspace": metadata, "paths": {
+            "folder": "Personal", "note": "Personal/✅ October 2.md"
+        }})).unwrap();
+        fs::create_dir(root.path().join(".noter")).unwrap();
+        let path = root.path().join(".noter/workspace.json");
+        fs::write(&path, &bytes).unwrap();
+        assert!(load(root.path()).err().unwrap().contains("SYNC_CONFLICT"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::create_dir(root.path().join("Personal")).unwrap();
+        assert!(load(root.path()).err().unwrap().contains("SYNC_CONFLICT"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::write(root.path().join("Personal/✅ October 2.md"), workspace()["nodes"]["note"]["markdown"].as_str().unwrap()).unwrap();
+        let loaded = load(root.path()).unwrap();
+        assert_eq!(loaded.workspace, workspace());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        save(root.path(), loaded.workspace, &loaded.revision).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn unsupported_or_conflicting_metadata_is_never_downgraded() {
+        let root = tempfile::tempdir().unwrap();
+        let loaded = load(root.path()).unwrap();
+        save(root.path(), workspace(), &loaded.revision).unwrap();
+        let path = root.path().join(".noter/workspace.json");
+        let original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut invalid = original.clone();
+        invalid["workspace"]["version"] = json!(2);
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(load(root.path()).err().unwrap().contains("Unsupported"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        invalid = original;
+        invalid["paths"]["folder"] = json!("Personal/✅ October 2.md");
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(load(root.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn incoming_edits_during_the_write_loop_are_not_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("First.md"), "First original\n").unwrap();
+        fs::write(root.path().join("Later.md"), "Later original\n").unwrap();
+        let loaded = load(root.path()).unwrap();
+        let mut local = loaded.workspace;
+        for node in local["nodes"].as_object_mut().unwrap().values_mut() {
+            node["markdown"] = json!("Local edits\n");
+        }
+        let failure = save_before_change(root.path(), local, &loaded.revision, &mut |path| {
+            if path == "Later.md" {
+                fs::write(root.path().join(path), "Incoming edit\n").unwrap();
+            }
+        }).unwrap_err();
+        assert!(failure.contains("SYNC_CONFLICT"));
+        assert_eq!(fs::read(root.path().join("Later.md")).unwrap(), b"Incoming edit\n");
+    }
+    #[test]
+    fn incoming_metadata_and_renamed_source_edits_survive_save_races() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Before.md"), "Original\n").unwrap();
+        let loaded = load(root.path()).unwrap();
+        let id = loaded.workspace["rootIds"][0].as_str().unwrap().to_string();
+        let mut local = loaded.workspace;
+        local["nodes"][&id]["name"] = json!("After");
+        let failure = save_before_change(root.path(), local, &loaded.revision, &mut |path| {
+            if path == "Before.md" {
+                fs::write(root.path().join(path), "Incoming source edit\n").unwrap();
+            }
+        }).unwrap_err();
+        assert!(failure.contains("SYNC_CONFLICT"));
+        assert_eq!(fs::read(root.path().join("Before.md")).unwrap(), b"Incoming source edit\n");
+        let reloaded = load(root.path()).unwrap();
+        assert_eq!(reloaded.workspace["nodes"][&id]["name"], "After");
+        assert_eq!(reloaded.workspace["nodes"][&id]["markdown"], "Original\n");
+        let mut local = reloaded.workspace;
+        local["nodes"][&id]["markdown"] = json!("Local second edit\n");
+        let path = root.path().join(".noter/workspace.json");
+        let bytes = fs::read(&path).unwrap();
+        let mut incoming: Value = serde_json::from_slice(&bytes).unwrap();
+        incoming["workspace"]["settings"]["fontSize"] = json!(22);
+        let bytes = serde_json::to_vec(&incoming).unwrap();
+        let failure = save_before_change(root.path(), local, &reloaded.revision, &mut |relative| {
+            if relative == ".noter/workspace.json" {
+                fs::write(&path, &bytes).unwrap();
+            }
+        }).unwrap_err();
+        assert!(failure.contains("SYNC_CONFLICT"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn interrupted_renames_keep_a_complete_authoritative_note_path() {
+        for stop in [".noter/workspace.json", "Before.md"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("Before.md"), "Original\n").unwrap();
+            let loaded = load(root.path()).unwrap();
+            let id = loaded.workspace["rootIds"][0].as_str().unwrap().to_string();
+            let mut local = loaded.workspace;
+            local["nodes"][&id]["name"] = json!("After");
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = save_before_change(root.path(), local, &loaded.revision, &mut |path| {
+                    if path == stop { panic!("simulated interruption"); }
+                });
+            }));
+            assert!(stopped.is_err());
+            assert_eq!(fs::read(root.path().join("Before.md")).unwrap(), b"Original\n");
+            assert_eq!(fs::read(root.path().join("After.md")).unwrap(), b"Original\n");
+            let reloaded = load(root.path()).unwrap();
+            assert_eq!(reloaded.workspace["nodes"][&id]["markdown"], "Original\n");
+            assert_eq!(reloaded.workspace["nodes"][&id]["name"], if stop == ".noter/workspace.json" { "Before" } else { "After" });
+        }
     }
     #[test]
     fn conflict_recovery_preserves_local_edits_and_incoming_files_as_separate_notes() {
@@ -1163,27 +1572,163 @@ mod tests {
             "broken"
         );
     }
-    #[cfg(unix)]
+    fn link_folder(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        // Junctions need neither Developer Mode nor administrator rights, so any Windows user can create one.
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr));
+        }
+    }
     #[test]
     fn symlinks_never_escape_the_workspace() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join(".noter")).unwrap();
+        fs::write(outside.path().join("Outside.md"), "Private\n").unwrap();
+        link_folder(outside.path(), &root.path().join("Linked"));
+        let loaded = load(root.path()).unwrap();
+        assert!(loaded.workspace["nodes"].as_object().unwrap().is_empty());
+        assert!(safe_path(root.path(), "Linked/Outside.md").is_err());
+        let root = tempfile::tempdir().unwrap();
+        link_folder(outside.path(), &root.path().join(".noter"));
         assert!(load(root.path()).is_err());
         assert!(!outside.path().join("workspace.json").exists());
+    }
+    #[test]
+    fn case_only_renames_keep_notes_and_folders() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("todo.md"), "Keep me\n").unwrap();
+        fs::create_dir(root.path().join("work")).unwrap();
+        fs::write(root.path().join("work/a.md"), "Inside\n").unwrap();
+        let loaded = load(root.path()).unwrap();
+        let id = |name: &str| loaded.workspace["nodes"].as_object().unwrap().values()
+            .find(|node| node["name"] == name).unwrap()["id"].as_str().unwrap().to_string();
+        let (note, folder, child) = (id("todo"), id("work"), id("a"));
+        let mut edited = loaded.workspace.clone();
+        edited["nodes"][&note]["name"] = json!("Todo");
+        edited["nodes"][&folder]["name"] = json!("Work");
+        edited["nodes"][&child]["name"] = json!("A");
+        save(root.path(), edited.clone(), &loaded.revision).unwrap();
+        let mut names: Vec<_> = fs::read_dir(root.path()).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| !name.starts_with('.')).collect();
+        names.sort();
+        assert_eq!(names, ["Todo.md", "Work"]);
+        let children: Vec<_> = fs::read_dir(root.path().join("Work")).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(children, ["A.md"]);
+        assert_eq!(fs::read_to_string(root.path().join("Todo.md")).unwrap(), "Keep me\n");
+        assert_eq!(fs::read_to_string(root.path().join("Work/A.md")).unwrap(), "Inside\n");
+        let reloaded = load(root.path()).unwrap();
+        assert_eq!(reloaded.workspace["nodes"], edited["nodes"]);
+        // An external case-only rename keeps the same note ID.
+        fs::rename(root.path().join("Todo.md"), root.path().join("TODO.md")).unwrap();
+        let renamed = load(root.path()).unwrap();
+        assert_eq!(renamed.workspace["nodes"][&note]["name"], "TODO");
+        assert_eq!(renamed.workspace["nodes"][&note]["markdown"], "Keep me\n");
+    }
+    #[test]
+    fn utf8_bom_and_utf16_notes_load_and_keep_their_bytes_until_edited() {
+        let root = tempfile::tempdir().unwrap();
+        let bom = [b"\xEF\xBB\xBF".as_slice(), "# Bom\r\n".as_bytes()].concat();
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter()
+            .chain("# Wide ✓\r\n".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        fs::write(root.path().join("Bom.md"), &bom).unwrap();
+        fs::write(root.path().join("Wide.md"), &utf16).unwrap();
+        fs::write(root.path().join("Plain.md"), "Plain\n").unwrap();
+        let loaded = load(root.path()).unwrap();
+        let notes = loaded.workspace["nodes"].as_object().unwrap();
+        let id = |name: &str| notes.values().find(|node| node["name"] == name).unwrap()["id"].as_str().unwrap().to_string();
+        assert_eq!(notes[&id("Bom")]["markdown"], "# Bom\r\n");
+        assert_eq!(notes[&id("Wide")]["markdown"], "# Wide ✓\r\n");
+        let mut edited = loaded.workspace.clone();
+        edited["nodes"][&id("Plain")]["markdown"] = json!("Edited\n");
+        let revision = save(root.path(), edited.clone(), &loaded.revision).unwrap();
+        assert_eq!(fs::read(root.path().join("Bom.md")).unwrap(), bom);
+        assert_eq!(fs::read(root.path().join("Wide.md")).unwrap(), utf16);
+        edited["nodes"][&id("Wide")]["markdown"] = json!("# Wide ✓\n\nMore\n");
+        save(root.path(), edited, &revision).unwrap();
+        assert_eq!(fs::read(root.path().join("Wide.md")).unwrap(), "# Wide ✓\n\nMore\n".as_bytes());
+        fs::write(root.path().join("Broken.md"), [0xC3, 0x28]).unwrap();
+        assert!(load(root.path()).err().unwrap().contains("Broken.md"));
+    }
+    #[test]
+    fn drive_root_system_folders_are_not_notes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("System Volume Information")).unwrap();
+        fs::write(root.path().join("System Volume Information/Tracking.md"), "x").unwrap();
+        fs::create_dir(root.path().join("$RECYCLE.BIN")).unwrap();
+        fs::write(root.path().join("$RECYCLE.BIN/$R1.md"), "deleted").unwrap();
+        fs::write(root.path().join("Note.md"), "Kept\n").unwrap();
+        let loaded = load(root.path()).unwrap();
+        let names: Vec<_> = loaded.workspace["nodes"].as_object().unwrap().values().map(|node| node["name"].clone()).collect();
+        assert_eq!(names, [json!("Note")]);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_only_hidden_system_and_busy_files_do_not_block_saves() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Locked.md"), "Original\n").unwrap();
+        fs::create_dir(root.path().join("Protected")).unwrap();
+        fs::write(root.path().join("Protected/Hidden.md"), "x").unwrap();
+        assert!(std::process::Command::new("attrib").args(["+h", "+s"]).arg(root.path().join("Protected")).status().unwrap().success());
+        let mut permissions = fs::metadata(root.path().join("Locked.md")).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(root.path().join("Locked.md"), permissions).unwrap();
+        let loaded = load(root.path()).unwrap();
+        assert_eq!(loaded.workspace["nodes"].as_object().unwrap().len(), 1);
+        let id = loaded.workspace["nodes"].as_object().unwrap().keys().next().unwrap().clone();
+        let mut edited = loaded.workspace.clone();
+        edited["nodes"][&id]["markdown"] = json!("Edited read-only note\n");
+        let revision = save(root.path(), edited.clone(), &loaded.revision).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("Locked.md")).unwrap(), "Edited read-only note\n");
+        // Syncthing (Go) opens files without delete sharing while hashing; the replace waits for it.
+        let held = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(root.path().join("Locked.md")).unwrap();
+        let release = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(300)); drop(held); });
+        edited["nodes"][&id]["markdown"] = json!("Saved after Syncthing finished\n");
+        save(root.path(), edited, &revision).unwrap();
+        release.join().unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("Locked.md")).unwrap(), "Saved after Syncthing finished\n");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn workspace_paths_are_shown_without_the_verbatim_prefix() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\Users\me\Notes")), r"C:\Users\me\Notes");
+        assert_eq!(display_path(Path::new(r"\\?\UNC\server\share\Notes")), r"\\server\share\Notes");
+        assert_eq!(display_path(Path::new(r"\\?\C:\Notes.")), r"\\?\C:\Notes.");
+        assert_eq!(display_path(Path::new(r"C:\Notes")), r"C:\Notes");
     }
     #[test]
     fn finance_logs_append_per_device_and_retire_legacy_data() {
         let root = tempfile::tempdir().unwrap();
         let empty = finance_revision(root.path()).unwrap();
-        assert_eq!(read_finance(root.path()).unwrap()["logs"], json!([]));
+        assert_eq!(read_finance(root.path(), "abc").unwrap()["logs"], json!([]));
         fs::create_dir(root.path().join(".noter")).unwrap();
         fs::write(root.path().join(".noter/finance.json"), r#"{"version":1}"#).unwrap();
         let line = "{\"v\":1,\"ts\":1,\"dev\":\"abc\",\"seq\":1,\"ops\":[]}\n";
-        let revision = append_finance(root.path(), "abc", line, Some(&[1, 2, 3]), true).unwrap();
+        let saved =
+            append_finance(root.path(), "abc", line, Some(&[1, 2, 3]), true, None, None).unwrap();
+        let revision = saved.revision.clone();
         assert_ne!(revision, empty);
-        append_finance(root.path(), "abc", &format!("\n{line}"), None, false).unwrap();
-        let loaded = read_finance(root.path()).unwrap();
+        let stale = fingerprint(b"stale");
+        let template = saved.template_sha256.as_deref();
+        let rejected = append_finance(root.path(), "abc", line, None, false, Some(&stale), template);
+        assert!(rejected.is_err_and(|message| message.starts_with("SYNC_CONFLICT")));
+        let own = saved.own_log_sha256.as_deref();
+        let saved =
+            append_finance(root.path(), "abc", &format!("\n{line}"), None, false, own, template)
+                .unwrap();
+        let loaded = read_finance(root.path(), "abc").unwrap();
+        assert_eq!(loaded["ownLogSha256"], json!(saved.own_log_sha256));
+        assert_eq!(loaded["templateSha256"], json!(saved.template_sha256));
         assert_eq!(loaded["logs"][0]["name"], "log-abc.jsonl");
         assert_eq!(loaded["logs"][0]["text"], format!("{line}{line}"));
         assert_eq!(loaded["template"], json!([1, 2, 3]));
@@ -1197,7 +1742,7 @@ mod tests {
         fs::write(root.path().join(".noter/finance/log-other.jsonl"), line).unwrap();
         assert_ne!(finance_revision(root.path()).unwrap(), revision);
         assert_eq!(
-            read_finance(root.path()).unwrap()["logs"]
+            read_finance(root.path(), "abc").unwrap()["logs"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -1208,10 +1753,11 @@ mod tests {
     fn finance_rejects_invalid_changes_and_devices() {
         let root = tempfile::tempdir().unwrap();
         let line = "{\"v\":1}\n";
-        assert!(append_finance(root.path(), "../x", line, None, false).is_err());
-        assert!(append_finance(root.path(), "abc", "{\"v\":1}", None, false).is_err());
-        assert!(append_finance(root.path(), "abc", "{\"v\":1}\n{}\n", None, false).is_err());
-        assert!(append_finance(root.path(), "abc", "not json\n", None, false).is_err());
+        let append = |device, line| append_finance(root.path(), device, line, None, false, None, None);
+        assert!(append("../x", line).is_err());
+        assert!(append("abc", "{\"v\":1}").is_err());
+        assert!(append("abc", "{\"v\":1}\n{}\n").is_err());
+        assert!(append("abc", "not json\n").is_err());
         assert!(!root.path().join(".noter/finance").exists());
     }
     #[test]
@@ -1229,7 +1775,10 @@ mod tests {
             "unfinished",
         )
         .unwrap();
-        append_finance(root.path(), "abc", &format!("\n{next}"), None, false).unwrap();
+        let interrupted = fingerprint(original.as_bytes());
+        let saved =
+            append_finance(root.path(), "abc", &format!("\n{next}"), None, false, Some(&interrupted), None)
+                .unwrap();
         let recovered = fs::read_to_string(&path).unwrap();
         assert_eq!(recovered, format!("{first}{second}{next}"));
         assert!(
@@ -1249,7 +1798,8 @@ mod tests {
             "unfinished"
         );
         // A stale recovery signal must retain records that already completed on disk.
-        append_finance(root.path(), "abc", &format!("\n{next}"), None, false).unwrap();
+        let own = saved.own_log_sha256.as_deref();
+        append_finance(root.path(), "abc", &format!("\n{next}"), None, false, own, None).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             format!("{first}{second}{next}{next}")
@@ -1268,7 +1818,9 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "interrupted").unwrap();
         fs::write(root.path().join(".noter/trash"), "not a directory").unwrap();
-        assert!(append_finance(root.path(), "abc", "\n{\"v\":1}\n", None, false).is_err());
+        let interrupted = fingerprint(b"interrupted");
+        let line = "\n{\"v\":1}\n";
+        assert!(append_finance(root.path(), "abc", line, None, false, Some(&interrupted), None).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "interrupted");
     }
     #[test]

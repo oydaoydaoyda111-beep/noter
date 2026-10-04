@@ -43,12 +43,12 @@ test('desktop persists through native files and appends only the changed Finance
   const unavailable = new Proxy({}, { get() { throw new Error('Browser storage must not be used'); } });
   globalThis.localStorage = unavailable;
   globalThis.indexedDB = unavailable;
-  let savedWorkspace;
+  let savedWorkspace, workspaceWrites = 0;
   let failAfterAppend = false;
   const diskLogs = structuredClone(logs), appended = [];
   mockIPC((command, args) => {
     if (command === 'load_workspace') return { workspace, revision: 'notes-1', path: 'synthetic-vault' };
-    if (command === 'save_workspace') { savedWorkspace = args.workspace; return 'notes-2'; }
+    if (command === 'save_workspace') { savedWorkspace = args.workspace; workspaceWrites++; return 'notes-2'; }
     if (command === 'load_finance') return { logs: diskLogs, legacy: null, template: null, revision: 'finance-1', device: 'test-install' };
     if (command === 'append_finance') {
       appended.push(args);
@@ -60,7 +60,13 @@ test('desktop persists through native files and appends only the changed Finance
   });
   assert.deepEqual(JSON.parse(JSON.stringify((await storage.load()).workspace)), workspace);
   await storage.save(workspace);
-  assert.deepEqual(savedWorkspace, workspace);
+  assert.equal(workspaceWrites, 0, 'Unchanged workspace does not rewrite synced files');
+  const edited = structuredClone(workspace); edited.nodes.inbox.markdown += '\nSynthetic saved edit\n';
+  await Promise.all([storage.save(edited), storage.save(structuredClone(edited))]);
+  assert.deepEqual(savedWorkspace, edited);
+  assert.equal(workspaceWrites, 1, 'Queued duplicate saves wait for acknowledgement and skip redundant writes');
+  await storage.save(Object.fromEntries(Object.entries(edited).reverse()));
+  assert.equal(workspaceWrites, 1, 'JSON key order does not trigger a synced write');
   const finance = await loadFinance();
   const next = { ...finance, transactions: finance.transactions.map(row => row.id === 'meal' ? { ...row, cents: -1300 } : row) };
   await persistFinance(next);

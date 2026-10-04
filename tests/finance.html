@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en" data-motion="none">
+<meta charset="utf-8">
+<title>Noter Finance regression check</title>
+<style>html,body{height:100%;overflow:hidden}#finance{height:100%;overflow:auto}#result{position:fixed;bottom:0;right:0;font-size:10px}</style>
+<body data-finance-check="pending">
+<main id="finance" class="finance-panel"></main>
+<pre id="result"></pre>
+<script type="module">
+import '../src/styles/tokens.css';
+import '../src/styles/app.css';
+import '../src/styles/finance.css';
+import { mockIPC } from '@tauri-apps/api/mocks';
+import { createFinance } from '../src/finance/finance.ts';
+import { createReportView } from '../src/finance/report-view.ts';
+import { defaultSettings, formatFinanceAmount } from '../src/settings/model.ts';
+import { batchLine, diffFinance, parseLogs, replayFinance } from '../src/finance/log.ts';
+
+const now = new Date(), month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+const transactions = Array.from({ length: 30 }, (_, index) => ({ id: `expense-${index}`, date: `${month}-01`, cents: -100, account: 'Checking', category: 'Food', subcategory: '', payee: `Cafe ${index}`, note: 'Synthetic entry' }));
+transactions.push({ id: 'out', date: `${month}-01`, cents: -500, account: 'Checking', category: 'Transfer to other account', subcategory: '', payee: '', note: '', transferId: 'transfer' }, { id: 'in', date: `${month}-01`, cents: 500, account: 'Savings', category: 'Transfer to other account', subcategory: '', payee: '', note: '', transferId: 'transfer' });
+const initial = { version: 1, accounts: [{ name: 'Checking', note: '' }, { name: 'Savings', note: '' }], transactions, categories: ['Food', 'Dining'], sourceName: 'Synthetic Finance', categoryDefinitions: [{ name: 'Food', subcategories: ['Lunch'] }, { name: 'Dining', subcategories: [] }] };
+const disk = [{ name: 'log-fixture.jsonl', text: batchLine('fixture', 0, 1, diffFinance(undefined, initial, '')).line }];
+let failure = false, app, checks = 0;
+mockIPC((command, args) => {
+  if (command === 'load_finance') return { logs: disk, template: null, legacy: null, revision: 'fixture', device: 'desktop-test' };
+  if (command === 'append_finance') {
+    if (failure) throw new Error('Synthetic save failure');
+    disk.push({ name: 'log-desktop-test.jsonl', text: args.line }); return 'saved';
+  }
+  throw new Error(`Unexpected fixture command: ${command}`);
+});
+const root = document.getElementById('finance'), pause = () => new Promise(resolve => setTimeout(resolve, 40));
+const state = () => replayFinance(parseLogs(disk, 'desktop-test').batches).data;
+function equal(actual, expected, label) { if (actual !== expected) throw new Error(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`); checks++; }
+function control(label, target = document) { const item = target.querySelector(`[aria-label="${label}"]`); if (!item) throw new Error(`Missing control: ${label}`); return item; }
+function named(name, target = document.querySelector('dialog[open]')) { return target.querySelector(`[name="${name}"]`); }
+function input(control, value, event = 'change') { control.value = value; control.dispatchEvent(new Event(event, { bubbles: true })); }
+function submit() { document.querySelector('dialog[open] form').requestSubmit(); }
+async function closeAfter(action) {
+  const dialog = document.querySelector('dialog[open]');
+  const finished = new Promise(resolve => dialog.addEventListener('close', resolve, { once: true }));
+  action(dialog); await new Promise(resolve => requestAnimationFrame(resolve)); await finished;
+}
+const save = () => closeAfter(() => submit()), cancel = () => closeAfter(dialog => control('Cancel', dialog).click());
+function selectRow(id) { control(`Select ${id.startsWith('expense') ? `Cafe ${id.split('-')[1]}` : 'transaction'} on ${month}-01`, root).click(); }
+
+try {
+  app = createFinance(root, () => ({ ...defaultSettings, financePageSize: 25 }), () => {}, () => {});
+  await pause(); equal(root.querySelectorAll('.finance-history tbody tr').length, 25, 'first transaction page');
+  const report = root.querySelector('.finance-reports'), savedLogs = disk.length;
+  report.querySelector('summary').click(); equal(report.open, true, 'reports disclosure opens');
+  const totals = () => [...report.querySelectorAll('.finance-report-total strong')].map(item => item.textContent);
+  equal(JSON.stringify(totals()), JSON.stringify(['0.00', '30.00', '-30.00']), 'monthly cash flow excludes transfers');
+  equal(report.querySelectorAll('.finance-trend-month').length, 6, 'six calendar months in chart');
+  equal(report.querySelector('progress').getAttribute('aria-label'), 'Food share of expenses', 'category share accessible name');
+  equal(report.querySelector('.finance-report-share span').textContent, '100.0%', 'category percentage');
+  input(control('Report category breakdown', report), 'income');
+  equal(report.querySelector('.finance-budget-empty').textContent, 'No income for this month and account.', 'empty income breakdown');
+  input(control('Report category breakdown', report), 'expenses');
+  input(control('Report account', report), 'Savings');
+  equal(JSON.stringify(totals()), JSON.stringify(['0.00', '0.00', '0.00']), 'account scope excludes incoming transfer');
+  equal(document.activeElement.getAttribute('aria-label'), 'Report account', 'account selector keeps keyboard focus');
+  input(control('Report account', report), 'Checking');
+  const previousDate = new Date(`${month}-01T12:00:00Z`); previousDate.setUTCMonth(previousDate.getUTCMonth() - 1);
+  input(control('Report month', report), previousDate.toISOString().slice(0, 7));
+  equal(JSON.stringify(totals()), JSON.stringify(['0.00', '0.00', '0.00']), 'empty calendar month');
+  equal(document.activeElement.getAttribute('aria-label'), 'Report month', 'month selector keeps keyboard focus');
+  input(control('Report month', report), month);
+  input(control('Search transactions', root), 'Cafe 1', 'input'); selectRow('expense-1');
+  equal(report.querySelector('.finance-report-total:nth-child(2) strong').textContent, '30.00', 'reports independent of ledger filters');
+  control('View month transactions', report).click();
+  equal(control('Accounts', root).value, 'Checking', 'report drills into chosen account');
+  equal(control('Search transactions', root).value, '', 'report drilldown clears ledger search');
+  const dates = [...root.querySelectorAll('.finance-filters input[type="date"]')].map(item => item.value), end = new Date(`${month}-01T12:00:00Z`); end.setUTCMonth(end.getUTCMonth() + 1, 0);
+  equal(JSON.stringify(dates), JSON.stringify([`${month}-01`, end.toISOString().slice(0, 10)]), 'drilldown covers complete calendar month');
+  equal(root.querySelectorAll('[data-transaction-id]:checked').length, 0, 'drilldown clears bulk selection');
+  equal(document.activeElement.getAttribute('aria-label'), 'Search transactions', 'drilldown focuses ledger');
+  equal(report.open, true, 'report disclosure survives refresh'); equal(disk.length, savedLogs, 'reports never append to synced logs');
+  control('Clear filters', root).click(); report.open = false;
+  control('Add monthly budget', root).click();
+  input(named('amount'), '20.00'); input(named('category'), 'Food'); await save();
+  equal(state().budgets[0].cents, 2000, 'budget saved to native log');
+  equal(root.querySelector('.finance-budget-row').classList.contains('is-over-budget'), true, 'budget overspending excludes transfers');
+  equal(root.querySelector('.finance-budgets progress').getAttribute('aria-label'), 'Food budget usage', 'budget progress accessible name');
+  await app.reload(); equal(root.querySelectorAll('.finance-budget-row').length, 1, 'budget survives reload');
+  control('Edit Food budget', root).click(); input(named('amount'), '40.00'); await save();
+  equal(state().budgets[0].cents, 4000, 'budget update'); equal(root.querySelector('.finance-budget-row').classList.contains('is-over-budget'), false, 'remaining budget');
+  const nextMonthDate = new Date(`${month}-01T12:00:00Z`); nextMonthDate.setUTCMonth(nextMonthDate.getUTCMonth() + 1); const nextMonth = nextMonthDate.toISOString().slice(0, 7);
+  input(root.querySelector('.finance-budgets input[type="month"]'), nextMonth); control('Copy previous month', root).click(); await pause();
+  equal(state().budgets.find(budget => budget.month === nextMonth).cents, 4000, 'copy previous month limits');
+  control('Remove Food budget', root).click(); await save(); equal(state().budgets.length, 1, 'budget removal keeps other months');
+  input(root.querySelector('.finance-budgets input[type="month"]'), month);
+
+  selectRow('expense-0'); equal(document.activeElement.dataset.transactionId, 'expense-0', 'selection preserves keyboard focus');
+  control('Next', root).click(); selectRow('expense-29');
+  control('Edit selected transactions', root).click(); named('change-payee').click(); input(named('payee'), 'Updated cafe'); await save();
+  equal(state().transactions.filter(row => row.payee === 'Updated cafe').length, 2, 'bulk editing across pages');
+  equal(state().transactions.find(row => row.id === 'expense-0').cents, -100, 'bulk edit keeps amounts');
+  equal(state().transactions.find(row => row.id === 'expense-1').payee, 'Cafe 1', 'unchecked entries unchanged');
+  equal(root.querySelectorAll('[data-transaction-id]:checked').length, 0, 'successful edit clears selection');
+  equal(document.activeElement.getAttribute('aria-label'), 'Select all matching transactions', 'successful edit restores keyboard focus');
+
+  input(control('Search transactions', root), 'Cafe', 'input');
+  control('Select all matching transactions', root).click();
+  equal(root.querySelectorAll('[data-transaction-id]:checked').length, 25, 'select matching first page');
+  equal(root.querySelector('.finance-bulk-actions [role="status"]').textContent, '30 entries selected', 'select all spans matching pages');
+  control('Edit selected transactions', root).click(); submit();
+  equal(document.querySelector('dialog[open] [role="alert"]').textContent.includes('at least one field'), true, 'empty patch rejected');
+  named('change-category').click(); control('Choose category, Uncategorized', document.querySelector('dialog[open]')).click();
+  control('Search categories', document.querySelector('.finance-picker-dialog[open]')).value = 'Dining';
+  control('Search categories', document.querySelector('.finance-picker-dialog[open]')).dispatchEvent(new Event('input'));
+  const dining = [...document.querySelectorAll('dialog[open] .finance-picker-option')].find(item => item.textContent.includes('Dining')); dining.click();
+  await save(); equal(state().transactions.filter(row => row.category === 'Dining').length, 30, 'bulk category change');
+  equal(root.querySelector('.finance-budget-info .finance-local').textContent.startsWith('0.00'), true, 'budgets update after bulk category edit');
+  input(control('Search transactions', root), 'Updated', 'input'); control('Select all matching transactions', root).click();
+  input(control('Search transactions', root), 'Cafe 1', 'input'); equal(root.querySelector('[aria-label="Edit selected transactions"]'), null, 'changing filters clears selection');
+
+  control('Clear filters', root).click(); input(control('Accounts', root), 'Checking'); control('Next', root).click(); selectRow('out');
+  equal(root.querySelector('.finance-bulk-actions [role="status"]').textContent, '2 entries selected', 'transfer partner outside filter included');
+  control('Edit selected transactions', root).click(); equal(named('change-account').disabled, true, 'transfer account edit guarded'); equal(named('change-category').disabled, true, 'transfer category edit guarded');
+  named('change-note').click(); input(named('note'), 'Transfer pair'); await save();
+  equal(state().transactions.filter(row => row.transferId && row.note === 'Transfer pair').length, 2, 'transfer bulk edit keeps pair');
+  control('Clear filters', root).click(); input(control('Search transactions', root), 'Transfer pair', 'input'); control('Select all matching transactions', root).click(); control('Delete selected transactions', root).click();
+  equal(document.querySelector('dialog[open] h2').textContent, 'Delete 2 selected entries?', 'bulk delete confirmation'); submit(); await new Promise(resolve => setTimeout(resolve, 350));
+  equal(state().transactions.filter(row => row.transferId).length, 0, 'bulk deletion removes both transfer entries');
+  await app.reload(); equal(state().budgets.length, 1, 'bulk deletion preserves budgets');
+
+  control('Clear filters', root).click(); control('Add monthly budget', root).click(); input(named('category'), 'Dining'); input(named('amount'), '50.00');
+  failure = true; submit(); await pause(); equal(document.querySelector('dialog[open] [role="alert"]').textContent.includes('draft'), true, 'failed budget save retains draft'); equal(named('amount').value, '50.00', 'failed budget save preserves value'); equal(state().budgets.length, 1, 'failed budget save keeps acknowledged state');
+  await cancel(); failure = false; await app.reload();
+  const literalCategory = '<img src=x onerror="window.reportInjection=true">';
+  const standalone = createReportView(() => ({ ...initial, transactions: [{ ...transactions[0], category: literalCategory }] }), cents => formatFinanceAmount(cents, ''), () => {});
+  standalone.refresh(false); standalone.root.open = true; root.append(standalone.root);
+  equal(standalone.root.querySelector('tbody td').textContent, literalCategory, 'untrusted category displays as literal text');
+  equal(standalone.root.querySelector('img'), null, 'category cannot create HTML elements');
+  standalone.root.remove();
+  equal(report.querySelector('tbody td').textContent, 'Dining', 'report follows saved bulk category changes');
+  report.open = true;
+  control('Select all matching transactions', root).click(); control('Edit selected transactions', root).click(); named('change-note').click(); input(named('note'), 'Keep draft'); failure = true; submit(); await pause();
+  equal(named('note').value, 'Keep draft', 'failed bulk edit preserves draft'); equal(state().transactions.some(row => row.note === 'Keep draft'), false, 'failed bulk edit keeps acknowledged records');
+  await cancel(); failure = false; await app.reload();
+  report.querySelector('summary').focus({ preventScroll: true }); report.scrollIntoView({ block: 'start' });
+  document.body.dataset.financeCheck = 'passed'; document.getElementById('result').textContent = `${checks} finance checks passed.`;
+} catch (error) { document.body.dataset.financeCheck = 'failed'; document.getElementById('result').textContent = error.stack; }
+</script>
+</body>
+</html>

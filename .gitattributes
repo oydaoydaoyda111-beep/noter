@@ -1,0 +1,12 @@
+* text=auto
+
+# Shared workspace fixtures are byte-exact cross-platform contracts.
+tests/fixtures/** text eol=lf
+android/gradlew text eol=lf
+*.bat text eol=crlf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.jar binary
+*.xlsx binary

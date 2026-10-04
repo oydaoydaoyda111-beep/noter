@@ -30,12 +30,14 @@ export function manageCategories(getFinance: () => Finance, commit: (next: Finan
     if (answer) { if (parent) expanded.add(parent); await apply(finance => addCategory(finance, answer.name, parent)); }
   }
   async function rename(name: string, subcategory?: string) {
-    const answer = await askDialog({ title: subcategory ? 'Rename subcategory' : 'Rename category', description: 'Existing transactions will use the new name. Amounts and balances stay the same.', fields: [{ name: 'name', label: 'Name', value: subcategory ?? name }], submit: 'Rename' });
+    const answer = await askDialog({ title: subcategory ? 'Rename subcategory' : 'Rename category', description: 'Existing transactions and category budgets follow the new name. Amounts and balances stay the same.', fields: [{ name: 'name', label: 'Name', value: subcategory ?? name }], submit: 'Rename' });
     if (answer) { expanded.add(subcategory ? name : answer.name.trim()); await apply(finance => renameCategory(finance, name, answer.name, subcategory)); }
   }
   async function remove(name: string, subcategory?: string) {
     const count = getFinance().transactions.filter(row => row.category === name && (subcategory === undefined || row.subcategory === subcategory)).length;
-    const answer = await askDialog({ title: `Delete “${subcategory ?? name}”?`, description: count ? `${count} transactions will keep their amounts, dates, and notes. ${subcategory ? 'Their subcategory will be cleared.' : 'Their category and subcategory will be cleared. Use Merge instead to move them to another category.'}` : 'This unused category will be removed.', submit: 'Delete', danger: true });
+    const budgets = subcategory === undefined ? (getFinance().budgets ?? []).filter(budget => budget.category === name).length : 0;
+    const description = count ? `${count} transactions will keep their amounts, dates, and notes. ${subcategory ? 'Their subcategory will be cleared.' : 'Their category and subcategory will be cleared. Use Merge instead to move them to another category.'}` : 'This unused category will be removed.';
+    const answer = await askDialog({ title: `Delete “${subcategory ?? name}”?`, description: description + (budgets ? ` Its ${budgets} monthly budget limits will also be removed.` : ''), submit: 'Delete', danger: true });
     if (answer) await apply(finance => deleteCategory(finance, name, subcategory));
   }
   function merge(name: string) {
@@ -43,7 +45,7 @@ export function manageCategories(getFinance: () => Finance, commit: (next: Finan
     const mergeDialog = el('dialog', 'dialog'); mergeDialog.setAttribute('aria-label', 'Merge category');
     const form = el('form'), select = el('select', 'field-input'); select.setAttribute('aria-label', 'Merge into category');
     for (const target of targets) { const option = el('option', '', target.name); option.value = target.name; select.append(option); }
-    form.append(el('h2', '', `Merge “${name}”`), el('p', 'dialog-description', 'Move its transactions and subcategories into the selected category. Amounts and balances stay the same.'), select);
+    form.append(el('h2', '', `Merge “${name}”`), el('p', 'dialog-description', 'Move its transactions and subcategories into the selected category. Budget limits for the same month are added together. Transaction amounts and balances stay the same.'), select);
     const actions = el('div', 'dialog-actions'), submit = el('button', 'button-primary', 'Merge categories'); submit.type = 'submit';
     actions.append(control('Cancel', () => mergeDialog.close()), submit); form.append(actions);
     const mergeError = el('p', 'finance-error'); mergeError.setAttribute('role', 'alert'); form.append(mergeError);

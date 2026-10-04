@@ -21,12 +21,24 @@ export async function preserveWorkspaceEdits(workspace: unknown) {
   if (workspaceBase === undefined) throw new Error('Open your workspace before preserving edits.');
   return invoke<PreservedEdits>('preserve_workspace_edits', { workspace, base: workspaceBase });
 }
+function sameJSON(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left)) return Array.isArray(right) && left.length === right.length && left.every((value, index) => sameJSON(value, right[index]));
+  if (Array.isArray(right)) return false;
+  const first = left as Record<string, unknown>, second = right as Record<string, unknown>, keys = Object.keys(first);
+  return keys.length === Object.keys(second).length && keys.every(key => Object.hasOwn(second, key) && sameJSON(first[key], second[key]));
+}
 export function saveWorkspaceFile(workspace: unknown) {
   const snapshot: unknown = JSON.parse(JSON.stringify(workspace));
-  const operation = workspaceQueue.catch(() => {}).then(async () => { revision = await invoke<string>('save_workspace', { workspace: snapshot, expected: revision }); workspaceBase = snapshot; });
+  const operation = workspaceQueue.catch(() => {}).then(async () => {
+    if (sameJSON(snapshot, workspaceBase)) return;
+    revision = await invoke<string>('save_workspace', { workspace: snapshot, expected: revision }); workspaceBase = snapshot;
+  });
   workspaceQueue = operation; return operation;
 }
 let financeDevice = '', financeClock = 0, financeSeq = 0, financeNewline = false;
+let financeOwnLog: string | null = null, financeTemplate: string | null = null;
 let financeNeedsReload = false;
 let financeBase: { data: FinanceData; templateSha256: string; template: Uint8Array } | undefined;
 async function sha256(bytes: Uint8Array) {
@@ -36,7 +48,13 @@ async function sha256(bytes: Uint8Array) {
 async function appendFinance(ops: FinanceOp[], template: Uint8Array | undefined, retireLegacy = false) {
   const { line, ts } = batchLine(financeDevice, financeClock, financeSeq + 1, ops);
   try {
-    financeRevision = await invoke<string>('append_finance', { line: (financeNewline ? '\n' : '') + line, template: template ? Array.from(template) : null, retireLegacy });
+    const saved = await invoke<{ revision: string; ownLogSha256: string | null; templateSha256: string | null }>('append_finance', {
+      line: (financeNewline ? '\n' : '') + line, template: template ? Array.from(template) : null, retireLegacy,
+      expectedOwnLog: financeOwnLog, expectedTemplate: financeTemplate,
+    });
+    financeOwnLog = saved.ownLogSha256; financeTemplate = saved.templateSha256;
+    // Other-device batches may arrive during this edit. Only loading/replaying can
+    // acknowledge their revision; adopting the append result could hide them forever.
   } catch (error) {
     financeNeedsReload = true;
     throw new Error(`${String(error)} Reload Finance before saving again so completed changes are preserved.`);
@@ -46,8 +64,9 @@ async function appendFinance(ops: FinanceOp[], template: Uint8Array | undefined,
 export async function loadFinanceFile() {
   await financeQueue.catch(() => {}); financeQueue = Promise.resolve();
   financeNeedsReload = true;
-  const loaded = await invoke<{ logs: LogFile[]; legacy: Record<string, unknown> | null; template: number[] | null; revision: string; device: string }>('load_finance');
+  const loaded = await invoke<{ logs: LogFile[]; legacy: Record<string, unknown> | null; template: number[] | null; revision: string; device: string; ownLogSha256: string | null; templateSha256: string | null }>('load_finance');
   financeRevision = loaded.revision; financeDevice = loaded.device;
+  financeOwnLog = loaded.ownLogSha256; financeTemplate = loaded.templateSha256;
   const parsed = parseLogs(loaded.logs, loaded.device);
   financeClock = parsed.clock; financeSeq = parsed.seq; financeNewline = parsed.ownNeedsNewline;
   const template = new Uint8Array(loaded.template ?? []);
