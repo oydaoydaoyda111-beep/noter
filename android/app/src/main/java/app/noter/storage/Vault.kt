@@ -156,10 +156,14 @@ class Vault(private val saf: Saf) {
         return Snapshot(disk, contents, manifest)
     }
 
+    /** The last verified folder contents, so text-only saves can update the revision without rereading every note. */
+    private var known: Snapshot? = null
+
     private fun remember(snapshot: Snapshot, revision: String) {
         pollingMetadata = metadataRevision(snapshot.disk, snapshot.manifest.bytes)
         pollingRevision = revision
         lastFullCheck = System.nanoTime()
+        known = snapshot
     }
 
     fun revision(force: Boolean = false): String {
@@ -345,6 +349,13 @@ class Vault(private val saf: Saf) {
         val stable = pathToId.entries.associate { it.value to it.key }
         val bytes = metadataBytes(workspace, stable, previous)
         val changed = "Files changed while opening the folder. Wait for synchronization and reload."
+        if (bytes.contentEquals(previous.bytes)) {
+            // Nothing to publish. Each SAF read is slow, so a listing (sizes and times) confirms nothing changed while
+            // reading instead of rereading every note twice; saves still verify the files they replace.
+            if (metadataRevision(scan(), readManifest().bytes) != metadataRevision(disk, previous.bytes)) throw SyncConflictException(changed)
+            remember(initial, before)
+            return Loaded(workspace, before)
+        }
         if (revision(true) != before) throw SyncConflictException(changed)
         saf.writeAtomic(MANIFEST, bytes, previous.bytes.takeIf { it.isNotEmpty() }, previous.bytes.isEmpty())
         val expected = revisionOf(initial.contents, bytes)
@@ -435,55 +446,90 @@ class Vault(private val saf: Saf) {
      */
     fun save(workspace: Workspace, expected: String, base: Workspace? = null): String {
         if (base == null) return saveExact(workspace, expected)
+        if (structure(workspace) == structure(base)) return saveText(workspace, base, expected)
         val initial = snapshot()
         val previous = initial.manifest
         val current = revisionOf(initial.contents, previous.bytes)
         if (current == expected) return saveExact(workspace, expected)
-        fun baseText(id: String) = (base.nodes[id] as? Note)?.markdown
-        fun edited(id: String) = (workspace.nodes[id] as? Note)?.markdown?.takeIf { it != baseText(id) }
-        fun conflict(id: String) = SyncConflictException(
-            "“${workspace.nodes[id]?.name ?: "A note"}” also changed on another device. Reload to keep both versions; your edits are still here.",
-        )
-        if (structure(workspace) != structure(base)) {
-            // New, renamed, moved or deleted notes need the tree this device last saw.
-            if (structure(previous.workspace) != structure(base)) {
-                throw SyncConflictException("Notes were added, renamed or moved on another device. Reload before saving these changes; your edits are still here.")
-            }
-            val merged = LinkedHashMap(workspace.nodes)
-            for ((id, path) in previous.paths) {
-                val note = merged[id] as? Note ?: continue
-                val incoming = initial.contents[path]
-                if (edited(id) != null) {
-                    if (incoming != baseText(id)) throw conflict(id)
-                } else if (incoming != null) merged[id] = note.copy(markdown = incoming)
-            }
-            return saveExact(workspace.copy(nodes = merged), current) + ":merged"
+        // New, renamed, moved or deleted notes need the tree this device last saw.
+        if (structure(previous.workspace) != structure(base)) {
+            throw SyncConflictException("Notes were added, renamed or moved on another device. Reload before saving these changes; your edits are still here.")
         }
-        // Only note text or settings changed here: write those notes where they now live.
-        val publishedNodes = previous.workspace.optJSONObject("nodes")
-        val writes = ArrayList<Pair<String, String>>()
-        for (id in workspace.nodes.keys) {
-            val text = edited(id) ?: continue
-            if (text.toByteArray().size > MAX_NOTE) throw VaultException("Keep each note below 10 MB.")
-            val path = previous.paths[id]?.takeIf { publishedNodes?.optJSONObject(id)?.optString("type") == "note" } ?: throw conflict(id)
-            if (initial.contents[path] != baseText(id)) throw conflict(id)
-            writes += path to text
+        val merged = LinkedHashMap(workspace.nodes)
+        for ((id, path) in previous.paths) {
+            val note = merged[id] as? Note ?: continue
+            val before = (base.nodes[id] as? Note)?.markdown
+            val incoming = initial.contents[path]
+            if (note.markdown != before) {
+                if (incoming != before) throw conflict(note)
+            } else if (incoming != null) merged[id] = note.copy(markdown = incoming)
+        }
+        return saveExact(workspace.copy(nodes = merged), current) + ":merged"
+    }
+
+    private fun conflict(note: Note) = SyncConflictException(
+        "“${note.name}” also changed on another device. Reload to keep both versions; your edits are still here.",
+    )
+
+    /**
+     * Writes only the edited notes (and settings) where they now live. Each SAF call is slow, so typing must not reread
+     * the whole folder. A note is replaced only if it still matches [base]; changes from other devices load on reload.
+     */
+    private fun saveText(workspace: Workspace, base: Workspace, expected: String): String {
+        val manifest = readManifest()
+        val published = manifest.workspace.optJSONObject("nodes")
+        val writes = TreeMap<String, String>()
+        val current = HashMap<String, String>()
+        for (note in workspace.nodes.values.filterIsInstance<Note>()) {
+            val before = (base.nodes[note.id] as? Note)?.markdown
+            if (note.markdown == before) continue
+            if (note.markdown.toByteArray().size > MAX_NOTE) throw VaultException("Keep each note below 10 MB.")
+            val path = manifest.paths[note.id]?.takeIf { published?.optJSONObject(note.id)?.optString("type") == "note" } ?: throw conflict(note)
+            val entry = saf.resolve(path)?.takeIf { !it.isDir } ?: throw conflict(note)
+            val text = decode(saf.read(entry.doc, MAX_NOTE))
+            if (text != before) throw conflict(note)
+            writes[path] = note.markdown
+            current[path] = text
         }
         val trash = ".noter/trash/${System.currentTimeMillis()}-${UUID.randomUUID()}"
         for ((path, text) in writes) {
-            val old = checkNotNull(initial.contents[path])
+            val old = current.getValue(path)
             if (!backupIsRecent(path)) {
                 saf.writeAtomic("$trash/$path", old.toByteArray(), mustBeAbsent = true)
                 rememberBackup(path)
             }
             saf.writeAtomic(path, text.toByteArray(), old.toByteArray())
         }
-        if (workspace.settings != base.settings && previous.bytes.isNotEmpty()) {
-            val root = JSONObject(decode(previous.bytes))
+        var publishedBytes = manifest.bytes
+        if (workspace.settings != base.settings && manifest.bytes.isNotEmpty()) {
+            val root = JSONObject(decode(manifest.bytes))
             root.getJSONObject("workspace").put("settings", workspace.settings.toJson())
-            saf.writeAtomic(MANIFEST, root.toString(2).toByteArray(), previous.bytes)
+            publishedBytes = root.toString(2).toByteArray()
+            saf.writeAtomic(MANIFEST, publishedBytes, manifest.bytes)
         }
-        return revision(true) + ":merged"
+        return acknowledge(writes, publishedBytes, expected)
+    }
+
+    /**
+     * The revision after this device's own writes. If the last verified snapshot is the state this device last loaded
+     * or saved ([expected]) and a listing shows nothing else changed since, it is the folder's revision. Otherwise
+     * other devices' changes are still to be loaded, so the result differs and the next poll reloads them.
+     */
+    private fun acknowledge(writes: Map<String, String>, manifestBytes: ByteArray, expected: String): String {
+        val previous = known?.takeIf { pollingRevision == expected } ?: return revision(true) + ":merged"
+        val contents = TreeMap(previous.contents).apply { putAll(writes) }
+        val result = revisionOf(contents, manifestBytes)
+        val disk = scan()
+        val expected = TreeMap(previous.disk)
+        for (path in writes.keys) disk[path]?.let { expected[path] = it }
+        val same = disk.keys == expected.keys && disk.all { (path, entry) ->
+            val before = expected.getValue(path)
+            before.isDir == entry.isDir && before.size == entry.size && before.modified == entry.modified
+        }
+        val manifest = readManifest()
+        if (!same || !manifest.bytes.contentEquals(manifestBytes)) return "$result:merged"
+        remember(Snapshot(disk, contents, manifest), result)
+        return result
     }
 
     private fun saveExact(workspace: Workspace, expected: String): String {
@@ -499,7 +545,8 @@ class Vault(private val saf: Saf) {
         val oldPaths = previous.paths.values.toSet()
         var total = 0L
         for ((id, path) in paths) {
-            if (saf.resolve(path) != null && path !in oldPaths) {
+            // The snapshot's listing answers this; resolving each path through SAF lists every parent folder again.
+            if (path in disk && path !in oldPaths) {
                 throw SyncConflictException("A file already uses that name. Reload the folder before saving.")
             }
             val node = workspace.nodes.getValue(id)
@@ -533,15 +580,20 @@ class Vault(private val saf: Saf) {
         val intended = TreeMap(initial.contents)
         // Publish destinations and metadata before deleting any renamed/deleted originals.
         for ((id, relative) in paths) {
-            checkManifest(previous.bytes)
             when (val node = workspace.nodes.getValue(id)) {
                 is Folder -> {
-                    saf.ensureDir(relative)
+                    if (relative !in disk) {
+                        checkManifest(previous.bytes)
+                        saf.ensureDir(relative)
+                    }
                     intended[relative] = null
                 }
                 is Note -> {
                     val old = initial.contents[relative]
-                    if (old != node.markdown) saf.writeAtomic(relative, node.markdown.toByteArray(), old?.toByteArray(), relative !in disk)
+                    if (old != node.markdown) {
+                        checkManifest(previous.bytes)
+                        saf.writeAtomic(relative, node.markdown.toByteArray(), old?.toByteArray(), relative !in disk)
+                    }
                     intended[relative] = node.markdown
                 }
             }
