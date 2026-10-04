@@ -49,7 +49,7 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - Preserve existing saved workspaces and Markdown/database round trips. If a data format changes, provide compatible loading or a deliberate migration.
 - Keep edits, selection, undo/redo, tab switching, and autosave working together. Avoid resetting editor DOM unnecessarily during ordinary typing.
 - Do not add dependencies unless they serve a concrete requirement. Update the manifest and lockfile together when dependencies change.
-- Never commit `node_modules/`, `dist/`, secrets, or environment files. Preserve unrelated user changes.
+- Never commit `node_modules/`, `dist/`, secrets, or environment files. Preserve unrelated user changes. Exception: the user deliberately committed the Android release key (`android/noter-release.jks`, `android/keystore.properties`); keep using it for release builds and do not rotate or remove it without their direction.
 
 ## Validation and ongoing work
 

@@ -19,7 +19,8 @@ android {
         testInstrumentationRunner = "app.noter.StorageContractCheck"
     }
 
-    // Release signing reads the local, git-ignored keystore.properties; keep that key to publish updates.
+    // Release signing reads keystore.properties. The owner chose to commit this key (android/noter-release.jks)
+    // to the repository; every update must keep using it.
     val keystore = rootProject.file("keystore.properties").takeIf { it.exists() }?.let { file ->
         Properties().apply { file.inputStream().use { load(it) } }
     }

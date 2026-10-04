@@ -28,7 +28,7 @@ npm run build
 
 `npm run dev` also launches the desktop app. Vite builds the desktop interface; opening its URL in a browser shows a retired-app notice and does not load or save a workspace. The localStorage/IndexedDB persistence paths have been removed. Existing browser data is left untouched.
 
-For Android, open `android/` in Android Studio and run the app on your device or emulator. With a configured JDK 17 and Android SDK, `android/gradlew.bat -p android :app:assembleDebug` builds `android/app/build/outputs/apk/debug/app-debug.apk` on Windows. Choose the local folder synchronized by Syncthing using Android's folder picker.
+For Android, open `android/` in Android Studio and run the app on your device or emulator. With a configured JDK 17 and Android SDK, `android/gradlew.bat -p android :app:assembleDebug` builds `android/app/build/outputs/apk/debug/app-debug.apk` on Windows. `:app:assembleRelease` builds the minified `android/app/build/outputs/apk/release/app-release.apk`, signed with the repository's release key (`android/noter-release.jks`). Install updates signed with that same key. If Gradle reports `Unable to establish loopback connection` on Windows, set `JAVA_TOOL_OPTIONS=-Djdk.net.unixdomain.tmpdir=<a short folder path>`. Choose the local folder synchronized by Syncthing using Android's folder picker.
 
 Tap the search icon in Android's Notes screen to find notes by name, content, or folder path. All, Names, Contents, and Folders filters match desktop search. Results include previews and open the note when tapped. Search includes current edits, keeps editor selection and undo when closed, and does not add index files to the synced workspace.
 
