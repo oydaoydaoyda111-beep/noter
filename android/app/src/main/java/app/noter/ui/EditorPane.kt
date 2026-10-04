@@ -64,6 +64,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -87,6 +88,7 @@ import androidx.compose.ui.window.PopupProperties
 import app.noter.model.Note
 import app.noter.model.Settings
 import app.noter.model.DatabaseBlock
+import app.noter.model.DatabaseException
 import app.noter.model.databaseBlocks
 import app.noter.model.replaceDatabase
 import app.noter.ui.database.DatabaseDialog
@@ -155,6 +157,8 @@ private class EditorState(initial: TextFieldValue) {
 fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (String) -> Unit, modifier: Modifier = Modifier) {
     // Reset only on note switch or reload from disk; resetting on every model change would move the cursor during fast typing.
     val state = remember(note.id, loadGeneration) { EditorState(TextFieldValue(note.markdown)) }
+    val latestEditor by rememberUpdatedState(state)
+    val latestChange by rememberUpdatedState(onChange)
     val transformation = remember { MarkdownTransformation() }
     val focusManager = LocalFocusManager.current
     var focused by remember { mutableStateOf(false) }
@@ -169,9 +173,10 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
     val scrollState = remember(note.id, loadGeneration) { ScrollState(0) }
 
     fun apply(next: TextFieldValue, step: Boolean = true) {
-        val changed = next.text != state.value.text
-        state.update(next, step)
-        if (changed) onChange(next.text)
+        val editor = latestEditor
+        val changed = next.text != editor.value.text
+        editor.update(next, step)
+        if (changed) latestChange(next.text)
     }
 
     val slash = slashQuery(state.value)?.takeIf { focused && state.value.text != dismissedSlash }
@@ -277,10 +282,13 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
     }
     openedDatabase?.let { original ->
         DatabaseDialog(original.database, onChange = { database ->
-            val markdown = replaceDatabase(state.value.text, original, database)
-            val selection = state.value.selection
-            apply(state.value.copy(text = markdown, selection = TextRange(selection.start.coerceAtMost(markdown.length), selection.end.coerceAtMost(markdown.length)), composition = null))
-            openedDatabase = databaseBlocks(markdown).first { it.index == original.index }
+            // Own saves refresh this token before the dialog's callbacks finish recomposing.
+            val current = openedDatabase ?: throw DatabaseException("This database was closed. Reopen it before saving.")
+            val editor = latestEditor
+            val markdown = replaceDatabase(editor.value.text, current, database)
+            val selection = editor.value.selection
+            apply(editor.value.copy(text = markdown, selection = TextRange(selection.start.coerceAtMost(markdown.length), selection.end.coerceAtMost(markdown.length)), composition = null))
+            openedDatabase = databaseBlocks(markdown).first { it.index == current.index }
         }, onClose = { openedDatabase = null })
     }
 }

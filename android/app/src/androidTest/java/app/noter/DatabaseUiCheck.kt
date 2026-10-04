@@ -93,6 +93,20 @@ internal fun Instrumentation.checkDatabaseUi() {
             runOnMainSync { value = databaseBlocks(note.markdown).single().database }
             return checkNotNull(value)
         }
+        fun awaitDatabase(label: String, matches: (NoteDatabase) -> Boolean): NoteDatabase {
+            val deadline = SystemClock.uptimeMillis() + 8000
+            while (SystemClock.uptimeMillis() < deadline) {
+                database().let { if (matches(it)) return it }
+                SystemClock.sleep(50)
+            }
+            val labels = ArrayList<String>()
+            fun describe(node: AccessibilityNodeInfo) {
+                node.text?.toString()?.let(labels::add)
+                for (i in 0 until node.childCount) node.getChild(i)?.let(::describe)
+            }
+            uiAutomation.rootInActiveWindow?.let(::describe)
+            error("Database state '$label' did not appear: view=${database().viewId}, filter=${database().filter}, visible=${labels.take(30)}")
+        }
         fun screenshot(name: String) {
             uiAutomation.waitForIdle(100, 2000)
             val addButton = awaitNode("Visible New record button") { labelMatches(it, "New record", true) && it.isVisibleToUser }
@@ -199,6 +213,66 @@ internal fun Instrumentation.checkDatabaseUi() {
         click("Database filters and sorting")
         click("Clear property filter")
         text("5 of 5 records")
+        click("Database filters and sorting")
+        val settingsScroll = awaitNode("Database view settings") { it.contentDescription?.toString() == "Database view settings" }
+        if (settingsScroll.isScrollable) check(settingsScroll.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD))
+        click("Show Score column")
+        click("Close database filters")
+        check(database().visibleColumns().none { it.id == "score" })
+        setText("Search database records", "alpha")
+        click("Database actions")
+        click("Saved views", exact = true)
+        text("Close saved database views")
+        click("New view")
+        text("New saved view")
+        fun setViewName(value: String) {
+            val field = awaitNode("View name") { it.isEditable }
+            check(field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }))
+            awaitNode(value) { it.isEditable && it.text?.toString() == value }
+        }
+        setViewName("Mobile focus")
+        click("Save view")
+        text("Use Mobile focus view")
+        val mobileViewId = database().viewId
+        check(database().views.size == 4 && database().filter == "alpha")
+        check(database().visibleColumns().none { it.id == "score" })
+        click("Rename Mobile focus view")
+        text("Rename saved view")
+        setViewName("Focused tasks")
+        click("Save view")
+        text("Use Focused tasks view")
+        check(database().viewId == mobileViewId && database().views.last().name == "Focused tasks")
+        uiAutomation.takeScreenshot()?.let { bitmap ->
+            File(targetContext.getExternalFilesDir(null), "database-views-preview.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+        }
+        click("Use Completed view")
+        awaitDatabase("Completed view") { it.viewId == "board" }
+        check(database().viewId == "board" && database().visibleColumns().any { it.id == "score" })
+        click("Use Focused tasks view")
+        awaitDatabase("Focused tasks view") { it.viewId == mobileViewId }
+        check(database().viewId == mobileViewId && database().filter == "alpha") { "Saved view switch lost its filter: id=${database().viewId}, expected=$mobileViewId, filter=${database().filter}" }
+        click("Delete Focused tasks view")
+        text("Delete Focused tasks view?")
+        click("Cancel", exact = true)
+        check(database().views.size == 4)
+        click("Delete Focused tasks view")
+        click("Delete", exact = true)
+        awaitDatabase("Deleted view") { it.views.none { view -> view.id == mobileViewId } }
+        check(database().views.size == 3 && database().viewId == "table" && database().rows.size == 5)
+        click("Close saved database views")
+        click("Close Shared tasks")
+        click("Undo")
+        check(database().views.size == 4 && database().viewId == mobileViewId)
+        click("Redo")
+        check(database().views.size == 3)
+        click("Open database Shared tasks")
+        click("Choose saved database view")
+        text("Close sheet")
+        click("Schedule", exact = true)
+        text("1 of 5 records")
+        click("Clear record search")
+        text("5 of 5 records")
         click("Database actions")
         click("Properties")
         click("Add property", exact = true)
@@ -230,6 +304,23 @@ internal fun Instrumentation.checkDatabaseUi() {
         click("Edit Incoming synced task")
         text("Close Edit record")
         click("Close Edit record")
+        click("Database actions")
+        click("Saved views", exact = true)
+        click("Rename Schedule view")
+        text("Rename saved view")
+        setViewName("Unsaved view name")
+        runOnMainSync {
+            val incoming = databaseBlocks(note.markdown).single().database.withRow("beta", mapOf("name" to "Incoming view sync"))
+            note = note.copy(markdown = "Synced introduction.\n\n${databaseMarkdown(incoming)}\nKeep this ending.")
+            generation++
+        }
+        click("Save view")
+        text("This database changed outside this view.")
+        text("Unsaved view name")
+        check(database().views.first { it.id == "calendar" }.name == "Schedule")
+        check(database().rows.first { it.id == "beta" }.cells.getString("name") == "Incoming view sync")
+        click("Cancel", exact = true)
+        click("Close saved database views")
         click("Close Shared tasks")
         click("Edit Markdown")
         text("noter-database")

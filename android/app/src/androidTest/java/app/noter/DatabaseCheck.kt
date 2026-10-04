@@ -28,6 +28,40 @@ internal fun Instrumentation.checkDatabaseFormat() {
     check(board.layout == "kanban" && board.visibleRows().single().id == "gamma")
     check(board.withSetting("filter", "Gamma").withView("table").filter.isEmpty())
     check(board.withView("calendar").visibleRows().size == 4)
+    val focused = original.withSetting("filter", "alpha").withCondition("status", "Ready").withColumnVisible("score", false)
+        .withSavedView(null, " Mobile focus ")
+    val focusId = focused.viewId
+    check(focusId !in original.views.map { it.id } && focused.views.last().name == "Mobile focus")
+    check(focused.filter == "alpha" && focused.layout == "table" && focused.visibleRows().single().id == "alpha")
+    check(focused.visibleColumns().map { it.id } == listOf("name", "status", "due"))
+    val focusJson = JSONObject(focused.encode()).getJSONArray("views").getJSONObject(3)
+    check(focusJson.getString("futureLabel") == "preserve" && focusJson.getJSONObject("columnWidths").getInt("name") == 280)
+    val renamed = focused.withSavedView(focusId, "Renamed focus")
+    check(renamed.viewId == focusId && renamed.views.last().id == focusId && renamed.views.last().name == "Renamed focus")
+    check(original.withSavedView(null, "all TASKS").views.last().name == "all TASKS 2")
+    check(original.withSavedView("table", "All tasks").views.first().name == "All tasks")
+    val longName = "x".repeat(80)
+    val longViews = original.withSavedView(null, longName).withSavedView(null, longName)
+    check(longViews.views.last().name == "x".repeat(78) + " 2")
+    check(renamed.withView("board").withCondition("status", "Blocked").withView(focusId).visibleRows().single().id == "alpha")
+    check(renamed.withColumnVisible("score", true).visibleColumns().map { it.id } == listOf("name", "status", "due", "score"))
+    check(renamed.removeView("board").viewId == focusId)
+    val removed = renamed.removeView(focusId)
+    check(removed.viewId == "table" && removed.filter == "alpha" && removed.rows.map { it.id } == original.rows.map { it.id })
+    check(original.views.size == 3 && original.filter.isEmpty() && original.visibleColumns().size == 4)
+    val oneView = original.removeView("board").removeView("calendar")
+    rejects { oneView.removeView("table") }
+    rejects { original.withSavedView(null, " ") }
+    rejects { original.withSavedView("removed", "Lost view") }
+    rejects { original.withView("removed") }
+    rejects { original.removeView("removed") }
+    rejects { original.withColumnVisible("removed", false) }
+    var oneColumn = original
+    for (column in original.visibleColumns().drop(1)) oneColumn = oneColumn.withColumnVisible(column.id, false)
+    rejects { oneColumn.withColumnVisible("name", false) }
+    check(oneColumn.withColumnVisible("status", true).visibleColumns().map { it.id } == listOf("name", "status"))
+    check(checkNotNull(NoteDatabase.read(renamed.encode())).viewId == focusId)
+    File(targetContext.getExternalFilesDir(null), "database-views-roundtrip.json").writeText(renamed.encode())
     check(original.withSetting("sort", JSONObject().put("columnId", "score").put("direction", "asc")).visibleRows().map { it.id } == listOf("delta", "alpha", "beta", "gamma"))
     val natural = original.withRow("alpha", mapOf("name" to "Task 10")).withRow("beta", mapOf("name" to "Task 2"))
         .withSetting("sort", JSONObject().put("columnId", "name").put("direction", "asc"))
@@ -108,9 +142,15 @@ internal fun Instrumentation.checkDatabaseFormat() {
         val loadedMarkdown = (reopened.workspace.nodes[databaseId] as Note).markdown
         val loadedBlock = databaseBlocks(loadedMarkdown).single()
         check(loadedBlock.database.cell(loadedBlock.database.rows.first(), loadedBlock.database.columns.first()) == "Alpha mobile")
-        val changedMarkdown = replaceDatabase(loadedMarkdown, loadedBlock, loadedBlock.database.withRow("alpha", mapOf("name" to "Reopened on Android")))
+        val changedDatabase = loadedBlock.database.withRow("alpha", mapOf("name" to "Reopened on Android"))
+            .withColumnVisible("score", false).withSavedView(null, "Mobile tasks")
+        val changedMarkdown = replaceDatabase(loadedMarkdown, loadedBlock, changedDatabase)
         val changedWorkspace = WorkspaceOps.edit(reopened.workspace, databaseId, changedMarkdown)
         vault.save(changedWorkspace, reopened.revision)
-        check(Vault(saf).load().workspace == changedWorkspace) { "Reopened database edits did not persist" }
+        val changedReload = Vault(saf).load()
+        check(changedReload.workspace == changedWorkspace) { "Reopened database edits did not persist" }
+        val reopenedDatabase = databaseBlocks((changedReload.workspace.nodes[databaseId] as Note).markdown).single().database
+        check(reopenedDatabase.viewId == changedDatabase.viewId && reopenedDatabase.views.last().name == "Mobile tasks")
+        check(reopenedDatabase.visibleColumns().none { it.id == "score" })
     }
 }

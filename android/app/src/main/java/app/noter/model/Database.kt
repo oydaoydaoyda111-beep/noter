@@ -18,6 +18,7 @@ class DatabaseException(message: String) : Exception(message)
 private fun JSONArray.objects() = List(length()) { getJSONObject(it) }
 private fun JSONArray.strings() = List(length()) { getString(it) }
 private fun newDatabaseId() = UUID.randomUUID().toString()
+private val viewSettings = listOf("filter", "sort", "calendarColumnId", "boardColumnId", "calendarMonth")
 
 /** Keep the original object so mobile edits retain desktop view settings and unknown fields. */
 class NoteDatabase private constructor(private val json: JSONObject) {
@@ -80,9 +81,50 @@ class NoteDatabase private constructor(private val json: JSONObject) {
         root.put(key, value ?: JSONObject.NULL)
     }
     fun withView(id: String): NoteDatabase = change { root ->
-        val view = root.getJSONArray("views").objects().find { it.getString("id") == id } ?: return@change
-        root.put("activeViewId", id).put("view", view.getString("layout"))
-        for (key in listOf("filter", "sort", "calendarColumnId", "boardColumnId", "calendarMonth")) root.put(key, view.opt(key) ?: JSONObject.NULL)
+        val view = root.getJSONArray("views").objects().find { it.getString("id") == id }
+            ?: throw DatabaseException("This view no longer exists. Close and reopen the database.")
+        activate(root, view)
+    }
+    private fun activate(root: JSONObject, view: JSONObject) {
+        root.put("activeViewId", view.getString("id")).put("view", view.getString("layout"))
+        for (key in viewSettings) root.put(key, view.opt(key) ?: JSONObject.NULL)
+    }
+    fun withSavedView(id: String?, name: String): NoteDatabase = change { root ->
+        val base = name.trim().take(80)
+        if (base.isEmpty()) throw DatabaseException("Enter a view name.")
+        val views = root.getJSONArray("views")
+        var title = base; var suffix = 2
+        val names = views.objects().filter { it.getString("id") != id }.map { it.getString("name").lowercase(Locale.ROOT) }.toSet()
+        while (title.lowercase(Locale.ROOT) in names) {
+            val ending = " ${suffix++}"
+            title = base.take(80 - ending.length) + ending
+        }
+        if (id == null) {
+            val view = JSONObject(active(root).toString()).put("id", newDatabaseId()).put("name", title)
+            for (key in viewSettings + "condition") if (!view.has(key)) view.put(key, root.opt(key) ?: JSONObject.NULL)
+            views.put(view)
+            activate(root, view)
+        } else {
+            val view = views.objects().find { it.getString("id") == id }
+                ?: throw DatabaseException("This view no longer exists. Close and reopen the database.")
+            view.put("name", title)
+        }
+    }
+    fun removeView(id: String): NoteDatabase = change { root ->
+        val views = root.getJSONArray("views").objects()
+        if (views.none { it.getString("id") == id }) throw DatabaseException("This view no longer exists. Close and reopen the database.")
+        if (views.size == 1) throw DatabaseException("Keep at least one saved view.")
+        val selected = active(root).getString("id") == id
+        val remaining = views.filter { it.getString("id") != id }
+        root.put("views", JSONArray(remaining))
+        if (selected) activate(root, remaining.first())
+    }
+    fun withColumnVisible(id: String, visible: Boolean): NoteDatabase = change { root ->
+        if (columns.none { it.id == id }) throw DatabaseException("This property no longer exists. Close and reopen the database.")
+        if (!visible && visibleColumns().none { it.id != id }) throw DatabaseException("Keep at least one column visible.")
+        val view = active(root)
+        val hidden = view.optJSONArray("hiddenColumnIds")?.strings().orEmpty().filter { it != id }
+        view.put("hiddenColumnIds", JSONArray(if (visible) hidden else hidden + id))
     }
     fun withCondition(columnId: String?, value: String = ""): NoteDatabase = change { root ->
         active(root).put("condition", columnId?.let { JSONObject().put("columnId", it).put("value", value) } ?: JSONObject.NULL)

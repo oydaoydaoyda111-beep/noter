@@ -7,6 +7,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -23,6 +24,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -49,6 +51,7 @@ fun DatabaseDialog(data: NoteDatabase, onChange: (NoteDatabase) -> Unit, onClose
     var record by remember { mutableStateOf<RecordRequest?>(null) }
     var properties by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
+    var savedViews by remember { mutableStateOf(false) }
     var rename by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var choice by remember { mutableStateOf<Choice?>(null) }
@@ -56,13 +59,16 @@ fun DatabaseDialog(data: NoteDatabase, onChange: (NoteDatabase) -> Unit, onClose
     var problem by remember { mutableStateOf<String?>(null) }
     var query by remember(data.viewId) { mutableStateOf(data.filter) }
     val latestData by rememberUpdatedState(data)
+    val latestQuery by rememberUpdatedState(query)
     val latestChange by rememberUpdatedState(onChange)
     var day by remember(data.month) { mutableStateOf<LocalDate?>(LocalDate.now().takeIf { YearMonth.from(it) == data.month } ?: data.month.atDay(1)) }
     fun update(next: NoteDatabase): String? = try { latestChange(next); problem = null; null }
         catch (error: Exception) { (error.message ?: "Could not update the database.").also { problem = it } }
-    LaunchedEffect(query, data.viewId) {
+    fun searchedData() = latestData.let { if (latestQuery == it.filter) it else it.withSetting("filter", latestQuery) }
+    val queryViewId = data.viewId
+    LaunchedEffect(query, queryViewId) {
         kotlinx.coroutines.delay(250)
-        if (query != latestData.filter) update(latestData.withSetting("filter", query))
+        if (latestData.viewId == queryViewId && query != latestData.filter) update(latestData.withSetting("filter", query))
     }
     val rows = remember(data, query) { data.visibleRows(query) }
     DialogFrame(data.title.ifBlank { "Untitled database" }, onClose, actions = {
@@ -71,7 +77,12 @@ fun DatabaseDialog(data: NoteDatabase, onChange: (NoteDatabase) -> Unit, onClose
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, contentDescription = "Database actions") }
             DropdownMenu(menu, onDismissRequest = { menu = false }) {
                 DropdownMenuItem(text = { Text("Properties") }, onClick = { menu = false; properties = true })
-                DropdownMenuItem(text = { Text("Rename database") }, onClick = { menu = false; rename = true })
+                DropdownMenuItem(text = { Text("Saved views") }, onClick = {
+                    menu = false
+                    val current = searchedData()
+                    if (current === latestData || update(current) == null) savedViews = true
+                })
+                DropdownMenuItem(text = { Text("Rename database") }, onClick = { menu = false; problem = null; rename = true })
             }
         }
     }) {
@@ -80,7 +91,8 @@ fun DatabaseDialog(data: NoteDatabase, onChange: (NoteDatabase) -> Unit, onClose
             trailingIcon = if (query.isNotEmpty()) ({ IconButton(onClick = { query = "" }) { Icon(Icons.Default.Close, "Clear record search") } }) else null,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).semantics { contentDescription = "Search database records" })
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { choice = Choice("Saved view", data.views.map { it.id to it.name }, data.viewId) { update(latestData.withView(it)) } }) {
+            TextButton(onClick = { choice = Choice("Saved view", data.views.map { it.id to it.name }, data.viewId) { update(searchedData().withView(it)) } },
+                modifier = Modifier.semantics { contentDescription = "Choose saved database view" }) {
                 Text(data.views.first { it.id == data.viewId }.name, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 200.dp))
                 Icon(Icons.Default.KeyboardArrowDown, null)
             }
@@ -112,8 +124,9 @@ fun DatabaseDialog(data: NoteDatabase, onChange: (NoteDatabase) -> Unit, onClose
     }
     deleteRow?.let { row -> MessageDialog("Delete ${data.rowTitle(row)}?", "This removes the record. You can undo the change in the note editor.", "Delete", "Cancel",
         onConfirm = { update(data.removeRow(row.id)); deleteRow = null }, onDismiss = { deleteRow = null }) }
-    if (rename) NameDialog("Rename database", data.title, "Save", { update(data.withTitle(it)); rename = false }, { rename = false })
+    if (rename) NameDialog("Rename database", data.title, "Save", { if (update(data.withTitle(it)) == null) rename = false }, { rename = false }, error = problem)
     if (settings) ViewSettings(data, onUpdate = ::update, onClose = { settings = false })
+    if (savedViews) SavedViewsDialog(data, onUpdate = ::update, onClose = { savedViews = false })
     if (properties) PropertiesDialog(data, onUpdate = ::update, onClose = { properties = false })
     choice?.let { value -> OptionSheet(value.title, value.values.map { Triple(it.first, it.second, "") }, value.selected, { value.select(it); choice = null }, { choice = null }) }
 }
@@ -323,7 +336,7 @@ private fun ViewSettings(data: NoteDatabase, onUpdate: (NoteDatabase) -> String?
     val latestData by rememberUpdatedState(data)
     val latestUpdate by rememberUpdatedState(onUpdate)
     AlertDialog(onDismissRequest = onClose, title = { Text("Filters and sorting") }, confirmButton = { TextButton(onClick = onClose, modifier = Modifier.semantics { contentDescription = "Close database filters" }) { Text("Done") } },
-        text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        text = { Column(Modifier.verticalScroll(rememberScrollState()).semantics { contentDescription = "Database view settings" }, verticalArrangement = Arrangement.spacedBy(16.dp)) {
             val condition = data.condition
             PickerRow(Icons.Default.FilterAlt, "Filter property", data.columns.find { it.id == condition?.optString("columnId") }?.name.orEmpty(), "All records", onClick = {
                 choice = Choice("Filter property", listOf("" to "All records") + data.columns.map { it.id to it.name }, condition?.optString("columnId").orEmpty()) { id ->
@@ -333,7 +346,7 @@ private fun ViewSettings(data: NoteDatabase, onUpdate: (NoteDatabase) -> String?
             })
             data.columns.find { it.id == condition?.optString("columnId") }?.let { column ->
                 Text("Matches exactly", style = MaterialTheme.typography.labelSmall)
-                DatabaseField(column.copy(name = "Filter value"), condition?.optString("value").orEmpty()) { onUpdate(data.withCondition(column.id, it)) }
+                DatabaseField(column.copy(name = "Filter value"), condition?.optString("value").orEmpty()) { latestUpdate(latestData.withCondition(column.id, it)) }
             }
             PickerRow(Icons.AutoMirrored.Filled.Sort, "Sort property", data.columns.find { it.id == data.sort?.optString("columnId") }?.name.orEmpty(), "No sorting", onClick = {
                 choice = Choice("Sort property", listOf("" to "No sorting") + data.columns.map { it.id to it.name }, data.sort?.optString("columnId").orEmpty()) { id ->
@@ -351,8 +364,58 @@ private fun ViewSettings(data: NoteDatabase, onUpdate: (NoteDatabase) -> String?
                 })
             }
             TextButton(onClick = { onUpdate(data.withCondition(null)); onClose() }) { Text("Clear property filter") }
+            if (data.layout == "table") {
+                Text("Visible table columns", style = MaterialTheme.typography.titleSmall)
+                val shown = data.visibleColumns().map { it.id }.toSet()
+                data.columns.forEach { column ->
+                    val visible = column.id in shown
+                    val enabled = !visible || shown.size > 1
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(visible, enabled = enabled, role = Role.Checkbox,
+                        onValueChange = { latestUpdate(latestData.withColumnVisible(column.id, it)) })
+                        .semantics { contentDescription = "Show ${column.name} column" }, verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(visible, onCheckedChange = null, enabled = enabled)
+                        Text(column.name, modifier = Modifier.padding(start = 12.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
         } })
     choice?.let { item -> OptionSheet(item.title, item.values.map { Triple(it.first, it.second, "") }, item.selected, { item.select(it); choice = null }, { choice = null }) }
+}
+
+@Composable
+private fun SavedViewsDialog(data: NoteDatabase, onUpdate: (NoteDatabase) -> String?, onClose: () -> Unit) {
+    var edit by remember { mutableStateOf<DatabaseView?>(null) }
+    var adding by remember { mutableStateOf(false) }
+    var remove by remember { mutableStateOf<DatabaseView?>(null) }
+    var problem by remember { mutableStateOf<String?>(null) }
+    val latestData by rememberUpdatedState(data)
+    val latestUpdate by rememberUpdatedState(onUpdate)
+    fun apply(change: () -> NoteDatabase): Boolean {
+        problem = try { latestUpdate(change()) } catch (error: Exception) { error.message ?: "Could not update the view." }
+        return problem == null
+    }
+    AlertDialog(onDismissRequest = onClose, title = { Text("Saved views") },
+        confirmButton = { TextButton(onClick = onClose, modifier = Modifier.semantics { contentDescription = "Close saved database views" }) { Text("Done") } },
+        dismissButton = { TextButton(onClick = { problem = null; adding = true }) { Text("New view") } },
+        text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("New views copy the current layout, filters and columns.", style = MaterialTheme.typography.bodySmall)
+            data.views.forEach { view -> Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { apply { latestData.withView(view.id) } }, modifier = Modifier.weight(1f).semantics {
+                    contentDescription = "Use ${view.name} view"; selected = view.id == data.viewId
+                }) {
+                    if (view.id == data.viewId) Icon(Icons.Default.Check, null, modifier = Modifier.size(18.dp).padding(end = 4.dp))
+                    Text(view.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                IconButton(onClick = { problem = null; edit = view }) { Icon(Icons.Default.Edit, "Rename ${view.name} view") }
+                IconButton(onClick = { problem = null; remove = view }, enabled = data.views.size > 1) { Icon(Icons.Default.DeleteOutline, "Delete ${view.name} view") }
+            } }
+            if (!adding && edit == null) problem?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        } })
+    if (adding || edit != null) NameDialog(if (adding) "New saved view" else "Rename saved view", edit?.name.orEmpty(), "Save view",
+        { name -> if (apply { latestData.withSavedView(edit?.id, name) }) { adding = false; edit = null } },
+        { adding = false; edit = null; problem = null }, error = problem)
+    remove?.let { view -> MessageDialog("Delete ${view.name} view?", "Your records are kept. You can undo this change in the note editor.", "Delete", "Cancel",
+        { apply { latestData.removeView(view.id) }; remove = null }, { remove = null }) }
 }
 
 @Composable

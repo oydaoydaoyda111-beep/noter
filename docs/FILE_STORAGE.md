@@ -17,7 +17,7 @@ The selected workspace folder is the source of truth on both platforms. There is
 
 The shared fixture in `tests/fixtures/file-storage/workspace.json` and its Markdown siblings checks IDs, ordering, settings and database content through Rust and Android load/save/reopen paths.
 
-`tests/fixtures/file-storage/database.json` checks all five property types, saved views, filters, sorting and view settings on desktop and Android. Android database edits share the note editor's undo/autosave path. Before applying an edit, Android compares the opened block's payload with the current note buffer; a changed or removed block rejects the save and keeps the open form's draft. Database records use ordinary note synchronization and conflict handling, rather than Finance's per-record log merge.
+`tests/fixtures/file-storage/database.json` checks all five property types, saved views, filters, sorting and view settings on desktop and Android. Both apps create, rename and delete saved views, with independent filters, sorting and column visibility. New views copy the active view; deleting a view preserves all records and properties. Android database edits share the note editor's undo/autosave path. Before applying an edit, Android compares the opened block's payload with the current note buffer; a changed or removed block rejects the save and keeps the open form's draft. Database records use ordinary note synchronization and conflict handling, rather than Finance's per-record log merge.
 
 ## Finance log v1
 
