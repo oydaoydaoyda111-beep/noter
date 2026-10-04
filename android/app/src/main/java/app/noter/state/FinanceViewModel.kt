@@ -20,8 +20,10 @@ import app.noter.finance.replayFinance
 import app.noter.finance.sha256
 import app.noter.finance.validateFinance
 import app.noter.storage.Saf
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -42,6 +44,7 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     private var clock = 0L
     private var seq = 0L
     private var needsNewline = false
+    private var pollJob: Job? = null
 
     /** The data as last loaded or saved; saves append only the difference from it. */
     private var base: FinanceState? = null
@@ -56,13 +59,16 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     /** Set by the UI while a Finance dialog is open, so polling never replaces data under an edit. */
     var dialogOpen = false
 
-    init {
-        viewModelScope.launch {
+    /** Finance uses the same foreground-only sync schedule as notes. */
+    fun setForeground(active: Boolean) {
+        if (active && pollJob?.isActive == true) return
+        pollJob?.cancel()
+        pollJob = if (active) viewModelScope.launch {
             while (true) {
-                delay(5000)
                 checkExternalChanges()
+                delay(5000)
             }
-        }
+        } else null
     }
 
     private fun message(text: String, error: Boolean = false) {
@@ -73,7 +79,8 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     fun bind(uri: Uri) {
         if (uri == boundUri) return
         boundUri = uri
-        files = FinanceFiles(Saf(getApplication<Application>().contentResolver, uri))
+        val application = getApplication<Application>()
+        files = FinanceFiles(Saf(application.contentResolver, uri, application.filesDir))
         reload()
     }
 
@@ -137,6 +144,8 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         if (busy || dialogOpen || lock.isLocked || !loaded) return
         val changed = try {
             withContext(Dispatchers.IO) { target.revision() != revision }
+        } catch (problem: CancellationException) {
+            throw problem
         } catch (_: Exception) {
             loadError
         }
@@ -163,7 +172,9 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
                     message("Saved in your workspace folder")
                     true
                 } catch (problem: Exception) {
-                    message(problem.message ?: "Could not save Finance.", true)
+                    // The provider may have committed the batch before reporting failure; reload its actual sequence.
+                    loadError = true
+                    message("${problem.message ?: "Could not save Finance."} Reload Finance before saving again.", true)
                     false
                 } finally {
                     busy = false

@@ -8,7 +8,7 @@ import java.util.UUID
 import kotlin.math.abs
 
 const val TRANSFER_CATEGORY = "Transfer to other account"
-private const val MAX_SAFE = 9_007_199_254_740_991L
+internal const val MAX_SAFE = 9_007_199_254_740_991L
 
 class FinanceException(message: String) : Exception(message)
 
@@ -62,7 +62,7 @@ fun money(value: String): Long {
     } catch (_: ArithmeticException) {
         throw FinanceException("Amount is too large.")
     }
-    if (abs(cents) > MAX_SAFE) throw FinanceException("Amount is too large.")
+    if (cents !in -MAX_SAFE..MAX_SAFE) throw FinanceException("Amount is too large.")
     return cents
 }
 
@@ -78,7 +78,7 @@ fun validDate(date: String): Boolean = Regex("^\\d{4}-\\d{2}-\\d{2}$").matches(d
 
 fun validateTransaction(finance: Finance, row: Transaction) {
     if (!validDate(row.date)) throw FinanceException("Choose a valid date.")
-    if (row.cents == 0L || abs(row.cents) > MAX_SAFE) throw FinanceException("Amount must be greater than zero.")
+    if (row.cents == 0L || row.cents !in -MAX_SAFE..MAX_SAFE) throw FinanceException("Amount must be greater than zero.")
     if (finance.accounts.none { it.name == row.account }) throw FinanceException("Choose an account.")
 }
 

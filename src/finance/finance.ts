@@ -1,4 +1,4 @@
-import { desktop, readDocument, writeDocument } from '../desktop/platform';
+import { readDocument, writeDocument } from '../desktop/platform';
 import { el, button } from '../ui/dom';
 import { askDialog } from '../ui/dialog';
 import { balances, money, saveTransaction, removeTransaction, type Finance, type Transaction } from './model';
@@ -62,7 +62,7 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     if (!finance || busy) return;
     busy = true; render();
     try {
-      if (await writeDocument(`bank-backup-${today()}.xlsx`, await exportWorkbook(finance), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) message('Excel backup exported.');
+      if (await writeDocument(`bank-backup-${today()}.xlsx`, await exportWorkbook(finance))) message('Excel backup exported.');
     } catch (error) { message(error instanceof Error ? error.message : String(error), true); }
     finally { busy = false; render(); }
   }
@@ -164,7 +164,7 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
       const wrapper = el('label', 'finance-date-label', label); const input = el('input', 'field-input'); input.type = 'date'; input.value = value; input.onchange = () => { update(input.value); redraw(); }; wrapper.append(input); filters.append(wrapper);
     }
     filters.append(action('Clear filters', () => { query = accountFilter = categoryFilter = from = until = ''; page = 0; render(); }));
-    body.append(filters, history, el('p', 'finance-local', `Source: ${finance.sourceName} · ${desktop ? 'Saved in your workspace folder' : 'Saved on this browser'} · Amounts use two decimal places · Excel backups preserve the other sheets`)); renderHistory(history);
+    body.append(filters, history, el('p', 'finance-local', `Source: ${finance.sourceName} · Saved in your workspace folder · Amounts use two decimal places · Excel backups preserve the other sheets`)); renderHistory(history);
   }
   function renderHistory(root: HTMLElement) {
     if (!finance) return;

@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -23,6 +24,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CalendarToday
@@ -67,6 +69,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
@@ -170,9 +175,9 @@ fun FinanceScreen(
 private fun Welcome(vm: FinanceViewModel) {
     var name by remember { mutableStateOf("") }
     var saving by remember { mutableStateOf(false) }
-    Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
+    Box(Modifier.fillMaxSize().imePadding().padding(20.dp), contentAlignment = Alignment.Center) {
         Column(
-            Modifier.widthIn(max = 460.dp).background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(18.dp)).padding(24.dp),
+            Modifier.widthIn(max = 460.dp).verticalScroll(rememberScrollState()).background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(24.dp)).padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -233,19 +238,23 @@ private fun Overview(
     val activeFilters = listOf(accountFilter, categoryFilter, from, until).count { it.isNotEmpty() }
     val busy = vm.busy
 
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp)) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp)) {
         item {
             Column(
-                Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(18.dp)).padding(vertical = 18.dp),
+                Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(24.dp)).padding(vertical = 20.dp),
             ) {
-                Text("Total balance", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 18.dp))
+                Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Total balance", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                    Icon(Icons.Default.AccountBalanceWallet, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                }
                 val total = totals.values.sum()
                 Text(
-                    format(total), fontSize = 34.sp, fontWeight = FontWeight.Medium,
+                    format(total), fontSize = 34.sp, fontWeight = FontWeight.SemiBold,
                     color = if (total < 0) NoterColors.danger else MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp),
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
                 )
-                LazyRow(contentPadding = PaddingValues(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 12.dp)) {
+                Text("Tap an account to filter its activity", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 20.dp))
+                LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 16.dp)) {
                     items(finance.accounts, key = { it.name }) { account ->
                         val selected = accountFilter == account.name
                         val cents = totals[account.name] ?: 0
@@ -254,6 +263,7 @@ private fun Overview(
                             shape = RoundedCornerShape(12.dp),
                             color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest,
                             border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+                            modifier = Modifier.semantics { this.selected = selected },
                         ) {
                             Column(Modifier.widthIn(min = 112.dp, max = 190.dp).padding(horizontal = 12.dp, vertical = 10.dp)) {
                                 Text(
@@ -261,7 +271,7 @@ private fun Overview(
                                     style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
-                                Text(format(cents), style = MaterialTheme.typography.titleSmall, color = if (cents < 0) NoterColors.danger else MaterialTheme.colorScheme.onSurface)
+                                Text(format(cents), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = if (cents < 0) NoterColors.danger else MaterialTheme.colorScheme.onSurface)
                                 if (settings.financeShowAccountNotes && account.note.isNotEmpty()) {
                                     Text(account.note, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
@@ -274,17 +284,28 @@ private fun Overview(
         item {
             Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val shape = RoundedCornerShape(12.dp)
-                Button(onClick = { onEntry(EditRequest("expense")) }, enabled = !busy, shape = shape, modifier = Modifier.weight(1f).height(48.dp), contentPadding = PaddingValues(horizontal = 8.dp)) {
-                    Icon(Icons.Default.Remove, contentDescription = null, modifier = Modifier.size(18.dp)); Text(" Expense")
+                Button(onClick = { onEntry(EditRequest("expense")) }, enabled = !busy, shape = shape, modifier = Modifier.weight(1f).heightIn(min = 64.dp), contentPadding = PaddingValues(horizontal = 6.dp, vertical = 10.dp)) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Icon(Icons.Default.Remove, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("Expense", style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center)
+                    }
                 }
-                FilledTonalButton(onClick = { onEntry(EditRequest("income")) }, enabled = !busy, shape = shape, modifier = Modifier.weight(1f).height(48.dp), contentPadding = PaddingValues(horizontal = 8.dp)) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp)); Text(" Income")
+                FilledTonalButton(onClick = { onEntry(EditRequest("income")) }, enabled = !busy, shape = shape, modifier = Modifier.weight(1f).heightIn(min = 64.dp), contentPadding = PaddingValues(horizontal = 6.dp, vertical = 10.dp)) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("Income", style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center)
+                    }
                 }
                 FilledTonalButton(
                     onClick = { onEntry(EditRequest("transfer")) },
                     enabled = !busy && finance.accounts.count { it.archived != true } >= 2,
-                    shape = shape, modifier = Modifier.weight(1f).height(48.dp), contentPadding = PaddingValues(horizontal = 8.dp),
-                ) { Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp)); Text(" Transfer") }
+                    shape = shape, modifier = Modifier.weight(1f).heightIn(min = 64.dp), contentPadding = PaddingValues(horizontal = 6.dp, vertical = 10.dp),
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("Transfer", style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center)
+                    }
+                }
             }
             if (vm.status.isNotEmpty() && vm.statusIsError) {
                 Text(vm.status, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
@@ -299,12 +320,12 @@ private fun Overview(
                     trailingIcon = if (query.isNotEmpty()) {
                         { IconButton(onClick = { query = ""; refilter() }) { Icon(Icons.Default.Close, contentDescription = "Clear search") } }
                     } else null,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.weight(1f),
                 )
                 BadgedBox(badge = { if (activeFilters > 0) Badge { Text("$activeFilters") } }, modifier = Modifier.padding(start = 8.dp)) {
                     FilledTonalIconButton(onClick = { filtersOpen = true }, modifier = Modifier.size(52.dp), shape = RoundedCornerShape(12.dp)) {
-                        Icon(Icons.Default.FilterList, contentDescription = "Filters")
+                        Icon(Icons.Default.FilterList, contentDescription = if (activeFilters > 0) "Filters, $activeFilters active" else "Filters")
                     }
                 }
             }
@@ -324,16 +345,29 @@ private fun Overview(
             }
         }
         item {
-            Row(Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 4.dp), verticalAlignment = Alignment.Bottom) {
-                Text("Transactions", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                Text("${rows.size} · Net ${format(rows.sumOf { it.cents })}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(Modifier.fillMaxWidth().padding(top = 24.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Transactions", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("Net ${format(rows.sumOf { it.cents })}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceContainerHighest) {
+                    Text("${rows.size}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
+                }
             }
             if (rows.isEmpty()) {
-                Text(
-                    if (finance.transactions.isEmpty()) "No transactions yet. Add your first expense or income above." else "No transactions match these filters.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 32.dp),
-                )
+                FieldGroup {
+                    Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(if (finance.transactions.isEmpty()) Icons.Default.AccountBalanceWallet else Icons.Default.Search, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(28.dp))
+                        Text(if (finance.transactions.isEmpty()) "Your first entry starts here" else "No matching transactions", style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
+                        Text(
+                            if (finance.transactions.isEmpty()) "Add an expense or income to see your activity." else "Try another search or clear your filters.",
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center,
+                        )
+                        if (query.isNotEmpty() || activeFilters > 0) TextButton(onClick = {
+                            query = ""; accountFilter = ""; categoryFilter = ""; from = ""; until = ""; refilter()
+                        }) { Text("Clear search and filters") }
+                    }
+                }
             }
         }
         groups.forEach { (date, dayRows) ->
@@ -361,8 +395,8 @@ private fun Overview(
         }
         item {
             Text(
-                "Source: ${finance.sourceName} · Saved in your workspace folder",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline,
+                "Saved in your workspace",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
             )
         }
@@ -380,7 +414,8 @@ private fun Overview(
 @Composable
 private fun TransactionRow(row: Transaction, format: (Long) -> String, compact: Boolean, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = if (compact) 9.dp else 14.dp),
+        Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Transaction actions", onClick = onClick)
+            .heightIn(min = if (compact) 64.dp else 76.dp).padding(horizontal = 14.dp, vertical = if (compact) 10.dp else 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (row.transferId != null) {
@@ -388,16 +423,20 @@ private fun TransactionRow(row: Transaction, format: (Long) -> String, compact: 
                 Icon(Icons.Default.SwapHoriz, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
             }
         } else Monogram(row.category.ifEmpty { row.payee })
-        Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
-            Text(row.payee.ifEmpty { row.note.ifEmpty { row.category.ifEmpty { "Transaction" } } }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Column(Modifier.weight(1f).padding(start = 12.dp, end = 10.dp)) {
+            Text(row.payee.ifEmpty { row.note.ifEmpty { row.category.ifEmpty { "Transaction" } } }, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val detail = listOf(listOf(row.category, row.subcategory).filter { it.isNotEmpty() }.joinToString(" / "), row.account)
                 .filter { it.isNotEmpty() }.joinToString(" · ")
             Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (row.payee.isNotEmpty() && row.note.isNotEmpty()) {
-                Text(row.note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(row.note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
-        Text(format(row.cents), color = amountColor(row.cents), fontWeight = FontWeight.Medium)
+        Text(
+            format(row.cents), style = MaterialTheme.typography.bodyMedium,
+            color = if (row.transferId != null) MaterialTheme.colorScheme.primary else amountColor(row.cents),
+            fontWeight = FontWeight.SemiBold, textAlign = TextAlign.End, modifier = Modifier.widthIn(max = 148.dp),
+        )
     }
 }
 
@@ -405,7 +444,7 @@ private fun TransactionRow(row: Transaction, format: (Long) -> String, compact: 
 @Composable
 private fun RowActions(row: Transaction, settings: Settings, format: (Long) -> String, onDismiss: () -> Unit, onAction: (String) -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = MaterialTheme.colorScheme.surfaceContainerHigh) {
-        Column(Modifier.navigationBarsPadding().padding(bottom = 8.dp)) {
+        Column(Modifier.heightIn(max = 620.dp).navigationBarsPadding().verticalScroll(rememberScrollState()).padding(bottom = 8.dp)) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(format(row.cents), fontSize = 30.sp, fontWeight = FontWeight.Medium, color = amountColor(row.cents))
                 Text(row.payee.ifEmpty { row.note.ifEmpty { "Transaction" } }, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
@@ -421,7 +460,7 @@ private fun RowActions(row: Transaction, settings: Settings, format: (Long) -> S
             @Composable
             fun action(icon: ImageVector, label: String, key: String, color: Color = MaterialTheme.colorScheme.onSurface) {
                 Row(
-                    Modifier.fillMaxWidth().clickable { onAction(key) }.heightIn(min = 54.dp).padding(horizontal = 24.dp),
+                    Modifier.fillMaxWidth().clickable(role = Role.Button) { onAction(key) }.heightIn(min = 56.dp).padding(horizontal = 24.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(icon, contentDescription = null, tint = color)
@@ -449,7 +488,7 @@ private fun FilterSheet(
 ) {
     var picker by remember { mutableStateOf<String?>(null) }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = MaterialTheme.colorScheme.surfaceContainerHigh) {
-        Column(Modifier.navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.heightIn(max = 620.dp).navigationBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Filters", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                 TextButton(onClick = { onChange("", "", "", "") }) { Text("Clear all") }

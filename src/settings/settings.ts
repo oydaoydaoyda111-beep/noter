@@ -1,4 +1,4 @@
-import { desktop, workspacePath } from '../desktop/platform';
+import { workspacePath } from '../desktop/platform';
 import type { Store } from '../state/workspace';
 import { demoWorkspace, emptyWorkspace } from '../state/demo';
 import { el, button } from '../ui/dom';
@@ -106,7 +106,7 @@ export function openSettings(store: Store, accounts: string[] = [], dataActions?
   toggleSetting('showNoteStats', 'Word and character counts', 'Show note statistics in the status bar.');
   selectSetting('autosaveDelay', 'Autosave', 'How soon edits are stored on this device.', [['250', '250 ms'], ['650', '650 ms'], ['1200', '1.2 seconds'], ['2000', '2 seconds']]);
   const data = el('div', 'settings-data');
-  data.append(el('h3', '', 'Workspace'), el('p', 'setting-description', desktop ? 'Notes are Markdown files in your workspace folder.' : 'Your notes live in this browser, on this device.'));
+  data.append(el('h3', '', 'Workspace'), el('p', 'setting-description', 'Notes are Markdown files in your workspace folder.'));
   const restore = button('Restore demo notes', 'button-secondary'); restore.textContent = 'Restore demo notes';
   restore.onclick = async () => {
     const confirmed = await askDialog({ title: 'Restore the demo workspace?', description: 'This replaces your current notes and folders with the original examples. Your appearance settings will stay.', submit: 'Restore demo', danger: true });
@@ -119,16 +119,14 @@ export function openSettings(store: Store, accounts: string[] = [], dataActions?
   };
   const actions = el('div', 'settings-data-actions');
   if (dataActions) {
-    if (desktop) { data.append(el('p', 'setting-description settings-vault-path', workspacePath)); }
+    data.append(el('p', 'setting-description settings-vault-path', workspacePath));
     const result = el('p', 'setting-description'); result.setAttribute('role', 'status');
     function dataButton(label: string, callback: () => Promise<void>) {
       const control = button(label, 'button-secondary'); control.textContent = label;
       control.onclick = async () => { control.disabled = true; try { await callback(); } catch (error) { result.textContent = String(error); } finally { control.disabled = false; } }; actions.append(control);
     }
-    if (desktop) {
-      dataButton('Change workspace folder', dataActions.chooseFolder);
-      dataButton('Reload synced files', async () => { dialog.close(); await dataActions.reload(); });
-    }
+    dataButton('Change workspace folder', dataActions.chooseFolder);
+    dataButton('Reload synced files', async () => { dialog.close(); await dataActions.reload(); });
     dataButton('Export notes backup', dataActions.exportNotes);
     dataButton('Restore notes backup', dataActions.importNotes);
     data.append(result);
@@ -145,7 +143,7 @@ export function openSettings(store: Store, accounts: string[] = [], dataActions?
   selectSetting('financeDefaultAccount', 'Default account', 'Use this account for new entries. Automatic uses the last account when remembering entries is on.', accountOptions);
   toggleSetting('financeRememberEntries', 'Remember entry choices', 'Reuse your last account and category for the next entry.');
   toggleSetting('financeShowAccountNotes', 'Account notes', 'Show account notes underneath each balance.');
-  section.append(el('p', 'setting-description', desktop ? 'Finance data is stored in .noter inside your synced folder. Use Export Excel backup for a workbook copy.' : 'Finance data stays on this browser. Use Export Excel backup in Finance to keep a copy.'));
+  section.append(el('p', 'setting-description', 'Finance data is stored in .noter inside your synced folder. Use Export Excel backup for a workbook copy.'));
   const reset = button('Reset preferences', 'button-secondary'); reset.textContent = 'Reset preferences';
   reset.onclick = async () => {
     const answer = await askDialog({ title: 'Reset preferences?', description: 'Restore default appearance, workspace, and Finance preferences. Your notes, transactions, and accounts are kept.', submit: 'Reset preferences' });

@@ -32,6 +32,7 @@ private const val MANIFEST = ".noter/workspace.json"
  */
 class Vault(private val saf: Saf) {
     class Loaded(val workspace: Workspace, val revision: String)
+    data class PreservedEdits(val snapshot: String, val folder: String?, val notes: Int)
 
     private class Manifest(val workspace: JSONObject, val paths: Map<String, String>, val bytes: ByteArray)
 
@@ -233,6 +234,41 @@ class Vault(private val saf: Saf) {
             paths[id] = candidate
             if (node is Folder) plan(workspace, node.children, "$candidate/", paths, used, previous)
         }
+    }
+
+    /** Writes only new destinations, leaving incoming notes and the shared manifest intact. */
+    fun preserveEdits(workspace: Workspace, base: Workspace): PreservedEdits {
+        fun plannedPaths(value: Workspace): Map<String, String> {
+            val result = LinkedHashMap<String, String>()
+            plan(value, value.rootIds, "", result, HashSet(), Manifest(JSONObject(), emptyMap(), ByteArray(0)))
+            if (result.size != value.nodes.size) throw VaultException("Invalid workspace hierarchy.")
+            return result
+        }
+        val paths = plannedPaths(workspace)
+        val basePaths = plannedPaths(base)
+        val changed = workspace.nodes.values.filterIsInstance<Note>().filter { note ->
+            paths[note.id] != basePaths[note.id] || note.markdown != (base.nodes[note.id] as? Note)?.markdown
+        }
+        if (workspace.nodes.values.filterIsInstance<Note>().any { it.markdown.toByteArray().size > MAX_NOTE }) {
+            throw VaultException("Keep each note below 10 MB.")
+        }
+        val snapshotJson = JSONObject(String(metadataBytes(workspace, paths), Charsets.UTF_8)).getJSONObject("workspace")
+        for (note in workspace.nodes.values.filterIsInstance<Note>()) snapshotJson.getJSONObject("nodes").getJSONObject(note.id).put("markdown", note.markdown)
+        val bytes = snapshotJson.toString(2).toByteArray()
+        if (bytes.size > MAX_TOTAL) throw VaultException("The recovery backup is larger than 100 MB. Your edits are still in memory.")
+        val token = "${System.currentTimeMillis()}-${UUID.randomUUID()}"
+        val snapshot = ".noter/recovery/$token/workspace.json"
+        fun writeVerified(path: String, content: ByteArray) {
+            if (saf.resolve(path) != null) throw VaultException("A recovery destination already exists. Your edits are still in memory.")
+            saf.writeAtomic(path, content)
+            if (!saf.read(saf.resolve(path)?.doc ?: throw VaultException("A recovery file is missing.")).contentEquals(content)) {
+                throw VaultException("A recovery file could not be verified. Your edits are still in memory.")
+            }
+        }
+        writeVerified(snapshot, bytes)
+        val folder = if (changed.isEmpty()) null else "Recovered edits $token"
+        if (folder != null) for (note in changed) writeVerified("$folder/${paths.getValue(note.id)}", note.markdown.toByteArray())
+        return PreservedEdits(snapshot, folder, changed.size)
     }
 
     fun save(workspace: Workspace, expected: String): String {

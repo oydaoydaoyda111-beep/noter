@@ -1,7 +1,13 @@
 import { desktop, selectedFolder, chooseFolder } from './platform';
 import { el, button } from '../ui/dom';
 export async function prepareWorkspace(mount: HTMLElement) {
-  if (!desktop || await selectedFolder()) return true;
+  if (!desktop) {
+    const shell = el('main', 'desktop-setup'), card = el('section', 'desktop-setup-card');
+    card.append(el('h1', '', 'Open Noter on desktop or Android.'), el('p', '', 'Your workspace lives in local files that you can sync with Syncthing. The browser app has been retired.'));
+    shell.append(card); mount.replaceChildren(shell);
+    return false;
+  }
+  if (await selectedFolder()) return true;
   showWorkspaceSetup(mount); return false;
 }
 export function showWorkspaceSetup(mount: HTMLElement, problem?: unknown) {

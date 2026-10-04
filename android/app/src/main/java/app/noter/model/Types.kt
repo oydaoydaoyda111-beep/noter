@@ -27,12 +27,12 @@ data class Folder(
 ) : Node
 
 data class Settings(
-    val fontSize: Int = 18,
+    val fontSize: Double = 18.0,
     val fontStyle: String = "sans",
     val documentWidth: Int = 790,
     val density: String = "comfortable",
     val motion: String = "full",
-    val autosaveDelay: Int = 650,
+    val autosaveDelay: Double = 650.0,
     val accentColor: String = "blue",
     val startupSection: String = "last",
     val spellcheck: Boolean = true,

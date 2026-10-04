@@ -11,9 +11,12 @@ import androidx.lifecycle.viewModelScope
 import app.noter.model.Settings
 import app.noter.model.Workspace
 import app.noter.model.WorkspaceOps
+import app.noter.model.NoteDatabase
+import app.noter.model.databaseMarkdown
 import app.noter.storage.Saf
 import app.noter.storage.SyncConflictException
 import app.noter.storage.Vault
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -32,7 +35,9 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     private var revision = ""
     private var version = 0
     private var savedVersion = 0
+    private var savedWorkspace = Workspace()
     private var saveJob: Job? = null
+    private var pollJob: Job? = null
 
     var screen by mutableStateOf(Screen.Loading); private set
     var workspace by mutableStateOf(Workspace()); private set
@@ -41,6 +46,8 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     var folderName by mutableStateOf(""); private set
     var treeUri by mutableStateOf<Uri?>(null); private set
     var section by mutableStateOf("notes"); private set
+    var recovering by mutableStateOf(false); private set
+    var recoveryNotice by mutableStateOf<String?>(null); private set
 
     /** Set when disk changed under unsaved edits; the user chooses between reloading and keeping the edits. */
     var conflict by mutableStateOf<String?>(null); private set
@@ -50,64 +57,99 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         val saved = preferences.getString(TREE_KEY, null)
         if (saved == null) screen = Screen.NeedFolder else openFolder(Uri.parse(saved))
-        viewModelScope.launch {
+    }
+
+    /** Pause folder scans in the background; check incoming files as soon as the app returns. */
+    fun setForeground(active: Boolean) {
+        if (active && pollJob?.isActive == true) return
+        pollJob?.cancel()
+        pollJob = if (active) viewModelScope.launch {
             while (true) {
-                delay(POLL_MS)
                 checkExternalChanges()
+                delay(POLL_MS)
             }
-        }
+        } else null
     }
 
     fun chooseFolder(uri: Uri) {
         val resolver = getApplication<Application>().contentResolver
         resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        preferences.edit().putString(TREE_KEY, uri.toString()).apply()
         viewModelScope.launch {
             flush()
+            if (dirty) {
+                failure = "Keep your unsaved edits before switching folders. Review synced changes or finish saving first."
+                return@launch
+            }
             openFolder(uri)
         }
     }
 
-    private fun openFolder(uri: Uri, showLoading: Boolean = true) {
+    private fun openFolder(uri: Uri, showLoading: Boolean = true, keepEdits: Boolean = false) {
+        if (recovering) return
+        if (keepEdits) recovering = true
         if (showLoading) screen = Screen.Loading
         viewModelScope.launch {
             lock.withLock {
+                var preserved: Vault.PreservedEdits? = null
                 try {
+                    val snapshot = workspace
+                    val snapshotVersion = version
+                    val base = savedWorkspace
                     val opened = withContext(Dispatchers.IO) {
-                        val vault = Vault(Saf(getApplication<Application>().contentResolver, uri))
+                        if (keepEdits) preserved = (vault ?: throw IllegalStateException("Open your workspace first.")).preserveEdits(snapshot, base)
+                        val application = getApplication<Application>()
+                        val vault = Vault(Saf(application.contentResolver, uri, application.filesDir))
                         vault to vault.load()
+                    }
+                    if (version != snapshotVersion) {
+                        failure = "More edits arrived during reload. They are still here; review synced changes again when you finish editing."
+                        screen = Screen.Ready
+                        return@withLock
                     }
                     vault = opened.first
                     revision = opened.second.revision
                     workspace = opened.second.workspace
+                    savedWorkspace = workspace
                     loadGeneration++
                     folderName = Uri.decode(uri.lastPathSegment.orEmpty()).substringAfterLast(':').substringAfterLast('/')
                     version = 0
                     savedVersion = 0
                     conflict = null
                     if (showLoading) {
+                        recoveryNotice = null
                         val startup = workspace.settings.startupSection
                         section = if (startup == "last") preferences.getString(SECTION_KEY, "notes") ?: "notes" else startup
                     }
                     treeUri = uri
+                    preferences.edit().putString(TREE_KEY, uri.toString()).apply()
                     screen = Screen.Ready
                 } catch (problem: Exception) {
                     failure = problem.message ?: "Could not open the workspace folder."
-                    screen = Screen.Failed
+                    if (showLoading) screen = Screen.Failed
+                } finally {
+                    preserved?.let { recoveryNotice = "Your edits were saved ${it.folder?.let { folder -> "in $folder and " }.orEmpty()}in ${it.snapshot}." }
+                    if (keepEdits) recovering = false
                 }
             }
         }
     }
 
     fun reload() {
+        if (recovering) return
+        if (dirty && screen == Screen.Ready) {
+            conflict = "Keep your unsaved edits before loading synced files."
+            return
+        }
         val saved = preferences.getString(TREE_KEY, null) ?: return
         openFolder(Uri.parse(saved), showLoading = false)
     }
 
-    fun discardEditsAndReload() {
-        conflict = null
-        reload()
+    fun keepEditsAndReload() {
+        val uri = treeUri ?: return
+        openFolder(uri, showLoading = false, keepEdits = true)
     }
+
+    fun dismissRecoveryNotice() { recoveryNotice = null }
 
     private fun change(transform: (Workspace) -> Workspace) {
         val next = transform(workspace)
@@ -126,12 +168,13 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         withContext(NonCancellable) {
             lock.withLock {
                 val target = vault ?: return@withLock
-                if (!dirty || conflict != null) return@withLock
+                if (!dirty || conflict != null || recovering) return@withLock
                 val snapshot = workspace
                 val snapshotVersion = version
                 try {
                     revision = withContext(Dispatchers.IO) { target.save(snapshot, revision) }
                     savedVersion = snapshotVersion
+                    savedWorkspace = snapshot
                 } catch (problem: SyncConflictException) {
                     conflict = problem.message
                 } catch (problem: Exception) {
@@ -147,9 +190,11 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     private suspend fun checkExternalChanges() {
         val target = vault ?: return
-        if (screen != Screen.Ready || dirty || conflict != null || lock.isLocked) return
+        if (screen != Screen.Ready || dirty || conflict != null || recovering || lock.isLocked) return
         val changed = try {
             withContext(Dispatchers.IO) { target.revision() != revision }
+        } catch (problem: CancellationException) {
+            throw problem
         } catch (_: Exception) {
             false
         }
@@ -165,6 +210,10 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun edit(id: String, markdown: String) = change { WorkspaceOps.edit(it, id, markdown) }
     fun createNote(name: String, parentId: String?) = change { WorkspaceOps.addNote(it, name, parentId).first }
+    fun createDatabase(name: String, parentId: String?) = change {
+        val (workspace, id) = WorkspaceOps.addNote(it, name, parentId)
+        WorkspaceOps.edit(workspace, id, databaseMarkdown(NoteDatabase.create(name)))
+    }
     fun createFolder(name: String, parentId: String?) = change { WorkspaceOps.addFolder(it, name, parentId) }
     fun rename(id: String, name: String) = change { WorkspaceOps.rename(it, id, name) }
     fun delete(id: String) = change { WorkspaceOps.delete(it, id) }

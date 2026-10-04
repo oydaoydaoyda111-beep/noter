@@ -1,6 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { newDatabase, newRow, readDatabase, activeView, createSavedView, saveActiveView, switchView, visibleColumns, visibleRows, columnWidth, optionColor, duplicateRows, updateRows, removeRows } from '../src/database/model.ts';
+
+test('desktop reads the shared Android database fixture with the same typed cells and saved views', () => {
+  const data = readDatabase(readFileSync(new URL('./fixtures/file-storage/database.json', import.meta.url), 'utf8'));
+  assert.ok(data);
+  assert.deepEqual(visibleRows(data).map(row => row.id), ['beta', 'alpha', 'delta', 'gamma']);
+  assert.deepEqual(visibleColumns(data).map(column => column.id), ['name', 'status', 'due', 'score']);
+  assert.equal(data.rows[0].cells.score, 3);
+  assert.equal(data.rows[1].cells.done, true);
+  assert.equal(data.rows[2].cells.score, null);
+  assert.equal(columnWidth(data, 'name'), 280);
+  assert.equal(optionColor(data.columns[1], 'Done'), 'green');
+  activeView(data).condition = { columnId: 'score', value: '3' };
+  assert.deepEqual(visibleRows(data).map(row => row.id), ['alpha']);
+  switchView(data, 'board');
+  assert.equal(data.view, 'kanban');
+  assert.deepEqual(visibleRows(data).map(row => row.id), ['gamma']);
+  switchView(data, 'calendar');
+  assert.equal(data.view, 'calendar');
+  assert.equal(data.calendarMonth, '2026-10');
+  assert.equal(visibleRows(data).filter(row => row.cells.due === '2026-10-04').length, 2);
+});
 
 test('legacy databases migrate without losing rows or current settings', () => {
   const original = newDatabase();

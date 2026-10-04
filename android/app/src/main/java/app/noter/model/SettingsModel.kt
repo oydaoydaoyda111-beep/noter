@@ -1,18 +1,17 @@
 package app.noter.model
 
 import org.json.JSONObject
-import kotlin.math.roundToInt
 
 fun normalizeSettings(input: JSONObject?): Settings {
     val defaults = Settings()
     fun text(key: String, options: List<String>, fallback: String): String =
         (input?.opt(key) as? String)?.takeIf { it in options } ?: fallback
     fun number(key: String, options: List<Int>, fallback: Int): Int =
-        (input?.opt(key) as? Number)?.toInt()?.takeIf { it in options } ?: fallback
+        (input?.opt(key) as? Number)?.toDouble()?.takeIf { it in options.map(Int::toDouble) }?.toInt() ?: fallback
     fun flag(key: String, fallback: Boolean): Boolean = input?.opt(key) as? Boolean ?: fallback
-    fun clamped(key: String, min: Int, max: Int, fallback: Int): Int =
+    fun clamped(key: String, min: Int, max: Int, fallback: Double): Double =
         (input?.opt(key) as? Number)?.toDouble()?.takeIf { it.isFinite() && it > 0 }
-            ?.coerceIn(min.toDouble(), max.toDouble())?.roundToInt() ?: fallback
+            ?.coerceIn(min.toDouble(), max.toDouble()) ?: fallback
     return Settings(
         fontSize = clamped("fontSize", 14, 24, defaults.fontSize),
         fontStyle = text("fontStyle", listOf("sans", "serif", "mono"), defaults.fontStyle),

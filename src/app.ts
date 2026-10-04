@@ -1,4 +1,4 @@
-import { desktop, readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument } from './desktop/platform';
+import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits } from './desktop/platform';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createStore } from './state/workspace';
@@ -94,7 +94,7 @@ export async function startApp(mount: HTMLElement) {
     if (isFinance) finance.show(); else finance.hide();
     renderNote();
     if (isFinance) document.title = 'Finance — Noter';
-    try { localStorage.setItem('noter.section', isFinance ? 'finance' : 'notes'); } catch { /* Navigation still works without storage. */ }
+    void saveLastSection(isFinance ? 'finance' : 'notes').catch(() => { /* Navigation still works if device preferences cannot be saved. */ });
   }
   get('notes-section').onclick = () => section(false);
   get('finance-section').onclick = () => section(true);
@@ -111,7 +111,7 @@ export async function startApp(mount: HTMLElement) {
     clearTimeout(toastTimer); toastTimer = setTimeout(() => { notification.hidden = true; }, 2400);
   }
 
-  let editVersion = 0, unsaved = false, applyingDisk = false, polling = false;
+  let editVersion = 0, unsaved = false, applyingDisk = false, polling = false, checkingFiles = false;
   async function saveNow() {
     clearTimeout(saveTimer);
     if (loaded.warning && !changedSinceLoad) return false;
@@ -121,7 +121,7 @@ export async function startApp(mount: HTMLElement) {
       if (version === editVersion) {
         unsaved = !success;
         saveStatus.dataset.state = success ? 'saved' : 'error';
-        get('save-label').textContent = success ? (desktop ? 'Saved to folder' : 'Saved locally') : 'Couldn’t save';
+        get('save-label').textContent = success ? 'Saved to folder' : 'Couldn’t save';
         if (!success) { warning.textContent = 'Your changes are still in memory. Storage is unavailable or full; keep Noter open until you can save.'; warning.hidden = false; }
         else { loaded.warning = undefined; warning.hidden = true; }
       }
@@ -129,7 +129,7 @@ export async function startApp(mount: HTMLElement) {
     } catch (error) {
       unsaved = true; saveStatus.dataset.state = 'error'; get('save-label').textContent = 'Couldn’t save';
       warning.replaceChildren(el('span', '', String(error)));
-      if (desktop) { const reload = el('button', 'button-secondary', 'Review synced changes'); reload.onclick = () => void reloadFiles(); warning.append(reload); }
+      const reload = el('button', 'button-secondary', 'Review synced changes'); reload.onclick = () => void reloadFiles(); warning.append(reload);
       warning.hidden = false; return false;
     }
   }
@@ -183,7 +183,7 @@ export async function startApp(mount: HTMLElement) {
   async function remove(node: WorkspaceNode) {
     const confirmed = await askDialog({
       title: `Delete “${node.name}”?`,
-      description: node.type === 'folder' ? desktop ? 'This folder will be removed from the workspace. Its notes are kept in .noter/trash.' : 'This folder and every note inside it will be permanently removed.' : desktop ? 'This note will move to .noter/trash in your workspace folder.' : 'This note will be permanently removed from your workspace.',
+      description: node.type === 'folder' ? 'This folder will be removed from the workspace. Its notes are kept in .noter/trash.' : 'This note will move to .noter/trash in your workspace folder.',
       submit: `Delete ${node.type}`, danger: true,
     });
     if (confirmed) { store.remove(node.id); saveNow(); }
@@ -286,18 +286,20 @@ export async function startApp(mount: HTMLElement) {
     if (document.querySelector('dialog[open]')) return;
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
     switch (event.key.toLowerCase()) {
-      case 's': event.preventDefault(); commitTitle(); void saveNow().then(success => { if (success) notify(desktop ? 'Saved to workspace folder' : 'Saved on this device'); }); break;
+      case 's': event.preventDefault(); commitTitle(); void saveNow().then(success => { if (success) notify('Saved to workspace folder'); }); break;
       case 'f': event.preventDefault(); if (showingFinance) finance.focusSearch(); else search.focus(); break;
       case 'n': event.preventDefault(); createNote(tree.destination); break;
       case 'w': if (store.activeNote) { event.preventDefault(); commitTitle(); void tabs.close(store.activeNote.id); } break;
     }
   });
-  if (!desktop) window.addEventListener('beforeunload', () => { commitTitle(); saveNow(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { commitTitle(); saveNow(); } });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { commitTitle(); void saveNow(); }
+    else void checkSyncedFiles(true);
+  });
 
   async function exportNotes() {
     commitTitle();
-    await writeDocument('noter-notes-backup.json', new TextEncoder().encode(JSON.stringify(store.workspace, null, 2)), 'application/json');
+    await writeDocument('noter-notes-backup.json', new TextEncoder().encode(JSON.stringify(store.workspace, null, 2)));
   }
   async function importNotes() {
     const file = await readDocument('json'); if (!file) return;
@@ -310,53 +312,57 @@ export async function startApp(mount: HTMLElement) {
     try { await flushFiles(); if (await chooseFolder()) location.reload(); } catch (error) { notify(String(error)); }
   }
   async function reloadFiles() {
-    if (!desktop || polling || finance.isBusy()) return;
+    if (polling || finance.isBusy()) return;
     commitTitle(); clearTimeout(saveTimer);
-    if (unsaved) {
-      const exported = await askDialog({ title: 'Review synced changes', description: 'Your unsaved notes will be exported to a backup before reloading the folder. Finance records on disk will also be reloaded. Cancel to keep editing.', submit: 'Back up edits and reload' });
-      if (!exported || !await writeDocument('noter-unsaved-notes.json', new TextEncoder().encode(JSON.stringify(store.workspace, null, 2)), 'application/json')) return;
-    }
     polling = true;
     try {
+      if (unsaved) {
+        const answer = await askDialog({ title: 'Keep both versions', description: 'Keep your changed notes as Markdown copies in a Recovered edits folder, and back up your full workspace before loading synced files. Cancel to keep editing.', submit: 'Keep edits and reload' });
+        if (!answer) { scheduleSave(); return; }
+      }
       await flushFiles().catch(() => {});
       const version = editVersion;
+      const recovery = unsaved ? await preserveWorkspaceEdits(structuredClone(store.workspace)) : null;
+      if (recovery) { warning.textContent = `Your edits were backed up to ${recovery.snapshot}${recovery.folder ? ` and copied into ${recovery.folder}` : ''}.`; warning.hidden = false; }
       const snapshot = await readWorkspaceSnapshot();
       if (version !== editVersion) { notify('Finish editing before reloading synced files.'); return; }
       const next = validateWorkspace(snapshot.workspace); adoptWorkspaceSnapshot(snapshot); applyingDisk = true; store.replace(next); applyingDisk = false; unsaved = false; loaded.warning = undefined;
-      await finance.reload(); warning.hidden = true; saveStatus.dataset.state = 'saved'; get('save-label').textContent = 'Synced files loaded'; notify('Workspace reloaded from files');
+      await finance.reload(); warning.hidden = recovery === null; saveStatus.dataset.state = 'saved'; get('save-label').textContent = recovery ? 'Both versions kept' : 'Synced files loaded'; notify(recovery ? 'Your edits were preserved; synced files loaded' : 'Workspace reloaded from files');
     } catch (error) { warning.textContent = String(error); warning.hidden = false; }
     finally { applyingDisk = false; polling = false; }
   }
-  if (desktop) {
-    document.documentElement.dataset.desktop = 'true';
-    const currentWindow = getCurrentWindow();
-    await currentWindow.onCloseRequested(async event => {
-      event.preventDefault(); commitTitle();
-      if (finance.isBusy()) { notify('Wait for Finance to finish saving before closing.'); return; }
-      if (!await saveNow()) return;
-      try { await flushFiles(); await currentWindow.destroy(); } catch (error) { notify(String(error)); }
-    });
-    await listen<string>('desktop-command', event => {
-      if (event.payload === 'quit') { void currentWindow.close(); return; }
-      if (document.querySelector('dialog[open]')) return;
-      if (event.payload === 'new-note') void createNote(tree.destination);
-      if (event.payload === 'settings') applicationSettings();
-      if (event.payload === 'save') { commitTitle(); void saveNow(); }
-      if (event.payload === 'folder') void switchFolder();
-      if (event.payload === 'reload') void reloadFiles();
-    });
-    setInterval(() => {
-      if (polling || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
-      void Promise.allSettled([workspaceChanged(), financeChanged()]).then(results => {
-        if (results.some(result => result.status === 'fulfilled' && result.value)) { void reloadFiles(); return; }
-        const failed = results.find(result => result.status === 'rejected');
-        if (failed?.status === 'rejected') { warning.textContent = `Could not check synced files: ${String(failed.reason)}`; warning.hidden = false; }
-      });
-    }, 5000);
+  document.documentElement.dataset.desktop = 'true';
+  const currentWindow = getCurrentWindow();
+  await currentWindow.onCloseRequested(async event => {
+    event.preventDefault(); commitTitle();
+    if (finance.isBusy()) { notify('Wait for Finance to finish saving before closing.'); return; }
+    if (!await saveNow()) return;
+    try { await flushFiles(); await currentWindow.destroy(); } catch (error) { notify(String(error)); }
+  });
+  await listen<string>('desktop-command', event => {
+    if (event.payload === 'quit') { void currentWindow.close(); return; }
+    if (document.querySelector('dialog[open]')) return;
+    if (event.payload === 'new-note') void createNote(tree.destination);
+    if (event.payload === 'settings') applicationSettings();
+    if (event.payload === 'save') { commitTitle(); void saveNow(); }
+    if (event.payload === 'folder') void switchFolder();
+    if (event.payload === 'reload') void reloadFiles();
+  });
+  async function checkSyncedFiles(force = false) {
+    if (document.hidden || checkingFiles || polling || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
+    checkingFiles = true;
+    try {
+      const results = await Promise.allSettled([workspaceChanged(force), financeChanged()]);
+      if (document.hidden || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
+      if (results.some(result => result.status === 'fulfilled' && result.value)) { await reloadFiles(); return; }
+      const failed = results.find(result => result.status === 'rejected');
+      if (failed?.status === 'rejected') { warning.textContent = `Could not check synced files: ${String(failed.reason)}`; warning.hidden = false; }
+    } finally { checkingFiles = false; }
   }
+  setInterval(() => void checkSyncedFiles(), 5000);
 
   applySettings(store.workspace.settings); tree.render(); tabs.render(); renderNote(); renderCount();
-  try { const startup = store.workspace.settings.startupSection; if ((startup === 'last' ? localStorage.getItem('noter.section') : startup) === 'finance') section(true); } catch { if (store.workspace.settings.startupSection === 'finance') section(true); }
+  try { const startup = store.workspace.settings.startupSection; if ((startup === 'last' ? await readLastSection() : startup) === 'finance') section(true); } catch { if (store.workspace.settings.startupSection === 'finance') section(true); }
   if (loaded.warning) { warning.textContent = loaded.warning; warning.hidden = false; }
   else saveNow();
 }

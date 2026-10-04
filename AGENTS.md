@@ -4,7 +4,7 @@
 
 Read `MEMORY.md` for established product decisions, completed work, and known limitations. Keep that file concise and current when decisions change; do not store secrets or private financial records.
 
-Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript, Vite, and native DOM APIs. It includes a Markdown editor, folders, tabs, search, settings, and embedded databases with table, kanban, and calendar views. Desktop notes are Markdown files in a user-selected folder. Shared metadata and Finance JSON/Excel files live in `.noter` for Syncthing. There is no backend. The browser preview retains legacy localStorage/IndexedDB for development and migration.
+Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript, Vite, and native DOM APIs, plus a Kotlin/Compose Android app. Both apps use the same versioned file storage in a user-selected folder: Markdown notes, `.noter/workspace.json`, per-device Finance JSONL logs and the original Excel template. See `docs/FILE_STORAGE.md`. Syncthing synchronizes the files; there is no backend or supported browser app. Vite builds the desktop UI, and browser persistence has been removed.
 
 ## Setup and commands
 
@@ -14,10 +14,9 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - `npm run desktop:build` builds native bundles; platform prerequisites are required.
 - `npm run desktop:package` builds the app and creates a DMG on macOS without Finder automation.
 - `npm run desktop:test` runs Rust vault regression tests.
-- `npm run dev` starts the development server on localhost.
+- `npm run dev` also launches the desktop app.
 - `npm run check` checks TypeScript without generating files.
 - `npm run build` checks TypeScript and builds the production app into `dist/`.
-- `npm run preview` serves the production build locally.
 - `npm test` runs database regression tests with the built-in Node.js test runner (Node.js 24).
 - There is currently no lint script. Do not report lint checks as passing.
 
@@ -28,11 +27,13 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - `src/types.ts`: workspace and settings types.
 - `src/state/`: workspace store and initial/demo data.
 - `src/storage/storage.ts`: workspace validation and asynchronous platform persistence.
-- `src/desktop/`: native platform adapters, file dialogs, startup folder selection, and browser migration support.
+- `src/desktop/`: native platform adapters, file dialogs, startup folder selection, and device preferences.
 - `src-tauri/src/vault.rs`: Markdown/metadata persistence, file revision checks, safe paths, and recoverable snapshots.
 - `src-tauri/src/archive.rs`: bounded native Excel ZIP processing on worker threads.
 - `src-tauri/src/lib.rs`: scoped native commands, platform plugins, and desktop menus.
-- `src/finance/`: precise transaction model, IndexedDB persistence, template-preserving Excel import/export, and the Finance view. Finance is saved separately from notes, as native JSON plus an Excel template or legacy IndexedDB.
+- `src/finance/`: precise transaction model, shared JSONL log format, native file persistence, template-preserving Excel import/export, and the Finance view.
+- `android/`: Kotlin/Compose app using Android SAF to access the shared workspace file formats.
+- `tests/fixtures/file-storage/`: shared synthetic Markdown/manifest/Finance fixtures; keep desktop and Android round trips compatible.
 - `src/editor/`: editing, Markdown conversion, selection, history, slash commands, and syntax highlighting.
 - `src/database/`: database models, serialization, and views.
 - `src/tree/`, `src/tabs/`, `src/search/`, `src/settings/`: feature-specific UI.

@@ -1,9 +1,6 @@
-import { desktop, loadWorkspaceFile, saveWorkspaceFile } from '../desktop/platform';
-import { demoWorkspace, emptyWorkspace } from '../state/demo';
-import { normalizeSettings } from '../settings/model';
+import { loadWorkspaceFile, saveWorkspaceFile } from '../desktop/platform.ts';
+import { normalizeSettings } from '../settings/model.ts';
 import type { Workspace, WorkspaceNode } from '../types';
-
-const STORAGE_KEY = 'noter.workspace.v1';
 
 export function validateWorkspace(data: unknown): Workspace {
   const value = data as Workspace;
@@ -35,22 +32,10 @@ export function validateWorkspace(data: unknown): Workspace {
 
 export const storage = {
   async load(): Promise<{ workspace: Workspace; warning?: string }> {
-    if (desktop) return { workspace: validateWorkspace(await loadWorkspaceFile()) };
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw === null) return { workspace: demoWorkspace() };
-      return { workspace: validateWorkspace(JSON.parse(raw)) };
-    } catch {
-      return { workspace: emptyWorkspace(), warning: 'Your saved workspace could not be opened. Local storage may be unavailable. You can start fresh in Settings.' };
-    }
+    return { workspace: validateWorkspace(await loadWorkspaceFile()) };
   },
   async save(workspace: Workspace): Promise<boolean> {
-    if (desktop) { await saveWorkspaceFile(workspace); return true; }
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
-      return true;
-    } catch {
-      return false;
-    }
+    await saveWorkspaceFile(workspace);
+    return true;
   },
 };

@@ -1,0 +1,34 @@
+{
+  "workspace": {
+    "version": 1,
+    "nodes": {
+      "personal": { "id": "personal", "name": "Personal", "type": "folder", "parentId": null, "createdAt": 1, "updatedAt": 2, "children": ["overview"] },
+      "overview": { "id": "overview", "name": "Overview", "type": "note", "parentId": "personal", "createdAt": 3, "updatedAt": 4 },
+      "inbox": { "id": "inbox", "name": "Inbox", "type": "note", "parentId": null, "createdAt": 5, "updatedAt": 6 }
+    },
+    "rootIds": ["personal", "inbox"],
+    "openTabs": ["overview", "inbox"],
+    "activeNoteId": "overview",
+    "collapsedFolders": ["personal"],
+    "settings": {
+      "fontSize": 18.5,
+      "fontStyle": "serif",
+      "documentWidth": 850,
+      "density": "compact",
+      "motion": "none",
+      "autosaveDelay": 650.5,
+      "accentColor": "purple",
+      "startupSection": "finance",
+      "spellcheck": false,
+      "showNoteStats": false,
+      "financeCurrency": "AZN",
+      "financeDateFormat": "dmy",
+      "financeTableDensity": "comfortable",
+      "financePageSize": 100,
+      "financeDefaultAccount": "Cash",
+      "financeRememberEntries": false,
+      "financeShowAccountNotes": false
+    }
+  },
+  "paths": { "personal": "Personal", "overview": "Personal/Overview.md", "inbox": "Inbox.md" }
+}

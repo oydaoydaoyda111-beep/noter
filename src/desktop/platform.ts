@@ -1,23 +1,33 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Finance } from '../finance/model';
-import { batchLine, diffFinance, parseLogs, replayFinance, type FinanceData, type FinanceOp, type LogFile } from '../finance/log';
+import { batchLine, diffFinance, parseLogs, replayFinance, type FinanceData, type FinanceOp, type LogFile } from '../finance/log.ts';
 export const desktop = isTauri();
 export let workspacePath = '';
 let revision = '', financeRevision = '';
+let workspaceBase: unknown;
 let workspaceQueue: Promise<unknown> = Promise.resolve(), financeQueue: Promise<unknown> = Promise.resolve();
 export async function selectedFolder() { const path = await invoke<string | null>('workspace_folder'); workspacePath = path ?? ''; return path; }
 export async function chooseFolder() { const path = await invoke<string | null>('choose_workspace_folder'); if (path) workspacePath = path; return path; }
+export function readLastSection() { return invoke<'notes' | 'finance'>('read_last_section'); }
+export function saveLastSection(section: 'notes' | 'finance') { return invoke<void>('save_last_section', { section }); }
 export interface WorkspaceSnapshot { workspace: unknown; revision: string; path: string }
 export async function readWorkspaceSnapshot() { return invoke<WorkspaceSnapshot>('load_workspace'); }
-export function adoptWorkspaceSnapshot(loaded: WorkspaceSnapshot) { revision = loaded.revision; workspacePath = loaded.path; }
+export function adoptWorkspaceSnapshot(loaded: WorkspaceSnapshot) { revision = loaded.revision; workspacePath = loaded.path; workspaceBase = JSON.parse(JSON.stringify(loaded.workspace)); }
 export async function loadWorkspaceFile() { const loaded = await readWorkspaceSnapshot(); adoptWorkspaceSnapshot(loaded); return loaded.workspace; }
-export async function workspaceChanged() { return revision !== await invoke<string>('workspace_revision'); }
+export async function workspaceChanged(force = false) { return revision !== await invoke<string>('workspace_revision', { force }); }
+export interface PreservedEdits { snapshot: string; folder: string | null; notes: number }
+export async function preserveWorkspaceEdits(workspace: unknown) {
+  await workspaceQueue.catch(() => {});
+  if (workspaceBase === undefined) throw new Error('Open your workspace before preserving edits.');
+  return invoke<PreservedEdits>('preserve_workspace_edits', { workspace, base: workspaceBase });
+}
 export function saveWorkspaceFile(workspace: unknown) {
   const snapshot: unknown = JSON.parse(JSON.stringify(workspace));
-  const operation = workspaceQueue.catch(() => {}).then(async () => { revision = await invoke<string>('save_workspace', { workspace: snapshot, expected: revision }); });
+  const operation = workspaceQueue.catch(() => {}).then(async () => { revision = await invoke<string>('save_workspace', { workspace: snapshot, expected: revision }); workspaceBase = snapshot; });
   workspaceQueue = operation; return operation;
 }
 let financeDevice = '', financeClock = 0, financeSeq = 0, financeNewline = false;
+let financeNeedsReload = false;
 let financeBase: { data: FinanceData; templateSha256: string; template: Uint8Array } | undefined;
 async function sha256(bytes: Uint8Array) {
   const digest = await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
@@ -25,11 +35,17 @@ async function sha256(bytes: Uint8Array) {
 }
 async function appendFinance(ops: FinanceOp[], template: Uint8Array | undefined, retireLegacy = false) {
   const { line, ts } = batchLine(financeDevice, financeClock, financeSeq + 1, ops);
-  financeRevision = await invoke<string>('append_finance', { line: (financeNewline ? '\n' : '') + line, template: template ? Array.from(template) : null, retireLegacy });
+  try {
+    financeRevision = await invoke<string>('append_finance', { line: (financeNewline ? '\n' : '') + line, template: template ? Array.from(template) : null, retireLegacy });
+  } catch (error) {
+    financeNeedsReload = true;
+    throw new Error(`${String(error)} Reload Finance before saving again so completed changes are preserved.`);
+  }
   financeClock = ts; financeSeq++; financeNewline = false;
 }
 export async function loadFinanceFile() {
   await financeQueue.catch(() => {}); financeQueue = Promise.resolve();
+  financeNeedsReload = true;
   const loaded = await invoke<{ logs: LogFile[]; legacy: Record<string, unknown> | null; template: number[] | null; revision: string; device: string }>('load_finance');
   financeRevision = loaded.revision; financeDevice = loaded.device;
   const parsed = parseLogs(loaded.logs, loaded.device);
@@ -45,9 +61,10 @@ export async function loadFinanceFile() {
     await appendFinance(diffFinance(undefined, state.data, templateSha256), undefined, true);
   }
   financeBase = undefined;
-  if (!state) return undefined;
+  if (!state) { financeNeedsReload = false; return undefined; }
   if (state.templateSha256 !== templateSha256) throw new Error('Finance workbook is still syncing or was changed independently. Wait for Syncthing to finish and reload.');
   financeBase = { ...state, template };
+  financeNeedsReload = false;
   return { ...state.data, template };
 }
 export async function financeChanged() { return financeRevision !== await invoke<string>('finance_revision'); }
@@ -55,6 +72,7 @@ export function saveFinanceFile(data: Finance) {
   const snapshot: FinanceData = JSON.parse(JSON.stringify({ ...data, template: undefined }));
   const template = data.template;
   const operation = financeQueue.catch(() => {}).then(async () => {
+    if (financeNeedsReload) throw new Error('Reload Finance before saving again so completed changes are preserved.');
     const base = financeBase;
     const templateSha256 = base && base.template === template ? base.templateSha256 : await sha256(template);
     const ops = diffFinance(base, snapshot, templateSha256);
@@ -65,27 +83,16 @@ export function saveFinanceFile(data: Finance) {
 }
 export async function flushFiles() { await Promise.all([workspaceQueue, financeQueue]); }
 export async function readDocument(extension: 'xlsx' | 'json'): Promise<{ name: string; bytes: Uint8Array } | null> {
-  if (desktop) {
-    const file = await invoke<{ name: string; bytes: number[] } | null>('open_document', { extension });
-    return file ? { name: file.name, bytes: new Uint8Array(file.bytes) } : null;
-  }
-  return new Promise(resolve => {
-    const input = document.createElement('input'); input.type = 'file'; input.accept = `.${extension}`;
-    input.oncancel = () => resolve(null);
-    input.onchange = async () => { const file = input.files?.[0]; if (!file) { resolve(null); return; } if (file.size > (extension === 'json' ? 100_000_000 : 10_000_000)) { resolve(null); return; } resolve({ name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) }); }; input.click();
-  });
+  const file = await invoke<{ name: string; bytes: number[] } | null>('open_document', { extension });
+  return file ? { name: file.name, bytes: new Uint8Array(file.bytes) } : null;
 }
-export async function writeDocument(name: string, bytes: Uint8Array, type: string) {
-  if (desktop) return invoke<boolean>('save_document', { name, bytes: Array.from(bytes) });
-  const url = URL.createObjectURL(new Blob([bytes as Uint8Array<ArrayBuffer>], { type }));
-  const link = document.createElement('a'); link.href = url; link.download = name; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000); return true;
+export async function writeDocument(name: string, bytes: Uint8Array) {
+  return invoke<boolean>('save_document', { name, bytes: Array.from(bytes) });
 }
 export async function copyText(text: string) {
-  if (desktop) { const { writeText } = await import('@tauri-apps/plugin-clipboard-manager'); await writeText(text); }
-  else await navigator.clipboard.writeText(text);
+  const { writeText } = await import('@tauri-apps/plugin-clipboard-manager'); await writeText(text);
 }
 export async function openExternal(href: string) {
   if (!['http:', 'https:', 'mailto:'].includes(new URL(href).protocol)) return;
-  if (desktop) { const { openUrl } = await import('@tauri-apps/plugin-opener'); await openUrl(href); }
-  else window.open(href, '_blank', 'noopener,noreferrer');
+  const { openUrl } = await import('@tauri-apps/plugin-opener'); await openUrl(href);
 }

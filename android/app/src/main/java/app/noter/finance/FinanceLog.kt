@@ -24,15 +24,11 @@ class FinanceState(val finance: Finance, val templateSha256: String)
 private fun logInvalid(): Nothing =
     throw FinanceException("Finance log contains invalid data. Keep the files and restore a valid backup before editing.")
 
-private fun JSONObject.long(key: String): Long = when (val value = opt(key)) {
-    is Int -> value.toLong()
-    is Long -> value
-    else -> logInvalid()
-}
+private fun JSONObject.long(key: String): Long = safeInteger(opt(key)) ?: logInvalid()
 
 private fun parseBatch(line: String): Batch {
     val json = try { JSONObject(line) } catch (_: JSONException) { logInvalid() }
-    if (json.opt("v") != 1) logInvalid()
+    if (safeInteger(json.opt("v")) != 1L) logInvalid()
     val dev = json.opt("dev") as? String ?: logInvalid()
     val opsJson = json.optJSONArray("ops") ?: logInvalid()
     if (dev.isEmpty()) logInvalid()
@@ -154,7 +150,9 @@ fun diffFinance(base: FinanceState?, next: Finance, templateSha256: String): Lis
 }
 
 fun batchLine(device: String, clock: Long, seq: Long, ops: List<JSONObject>): Pair<String, Long> {
+    if (clock !in -MAX_SAFE..MAX_SAFE || seq !in -MAX_SAFE..MAX_SAFE) logInvalid()
     val ts = maxOf(System.currentTimeMillis(), clock + 1)
+    if (ts !in -MAX_SAFE..MAX_SAFE) logInvalid()
     val line = JSONObject().put("v", 1).put("ts", ts).put("dev", device).put("seq", seq).put("ops", JSONArray(ops)).toString()
     return "$line\n" to ts
 }

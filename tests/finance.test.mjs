@@ -3,11 +3,26 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
+import { mockIPC } from '@tauri-apps/api/mocks';
 import { money, balances, saveTransaction, removeTransaction } from '../src/finance/model.ts';
 import { importWorkbook, exportWorkbook } from '../src/finance/excel.ts';
 import { categoryCatalog, addCategory, renameCategory, mergeCategories, deleteCategory, registerCategory } from '../src/finance/categories.ts';
 globalThis.DOMParser = DOMParser;
 globalThis.XMLSerializer = XMLSerializer;
+globalThis.window = { crypto: globalThis.crypto };
+mockIPC((command, args) => {
+  if (command === 'unpack_workbook') {
+    let total = 0;
+    const files = unzipSync(new Uint8Array(args.bytes), { filter: file => {
+      total += file.originalSize;
+      if (total > 40_000_000) throw new Error('Workbook expands beyond the supported 40 MB limit.');
+      return true;
+    } });
+    return Object.fromEntries(Object.entries(files).map(([name, bytes]) => [name, Array.from(bytes)]));
+  }
+  if (command === 'pack_workbook') return Array.from(zipSync(Object.fromEntries(Object.entries(args.files).map(([name, bytes]) => [name, new Uint8Array(bytes)]))));
+  throw new Error(`Unexpected native command: ${command}`);
+});
 const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 export function fixture() {
   const cell = (ref, value) => typeof value === 'number' ? `<c r="${ref}"><v>${value}</v></c>` : `<c r="${ref}" t="inlineStr"><is><t>${value}</t></is></c>`;

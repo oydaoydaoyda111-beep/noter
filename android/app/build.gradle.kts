@@ -16,6 +16,7 @@ android {
         targetSdk = 35
         versionCode = 2
         versionName = "0.2.0"
+        testInstrumentationRunner = "app.noter.StorageContractCheck"
     }
 
     // Release signing reads the local, git-ignored keystore.properties; keep that key to publish updates.
@@ -49,6 +50,7 @@ android {
     buildFeatures {
         compose = true
     }
+    sourceSets.getByName("androidTest").assets.srcDir("../../tests/fixtures/file-storage")
 }
 
 dependencies {

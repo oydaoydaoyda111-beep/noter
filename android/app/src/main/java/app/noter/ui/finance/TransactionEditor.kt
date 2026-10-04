@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -37,7 +38,6 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -51,11 +51,16 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -81,17 +86,17 @@ import kotlin.math.abs
 data class EditRequest(val kind: String, val existing: Transaction? = null, val duplicate: Boolean = false)
 
 @Composable
-private fun TextRow(icon: ImageVector, placeholder: String, value: String, onChange: (String) -> Unit, singleLine: Boolean = true) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+private fun TextRow(icon: ImageVector, placeholder: String, value: String, onChange: (String) -> Unit, singleLine: Boolean = true, enabled: Boolean = true) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
         Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
         Box(Modifier.weight(1f).padding(start = 16.dp, top = 14.dp, bottom = 14.dp)) {
-            if (value.isEmpty()) Text(placeholder, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (value.isEmpty()) Text("$placeholder (optional)", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             BasicTextField(
-                value = value, onValueChange = { onChange(it.take(2000)) }, singleLine = singleLine,
-                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 16.sp),
+                value = value, onValueChange = { onChange(it.take(2000)) }, singleLine = singleLine, enabled = enabled,
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
                 cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = placeholder },
             )
         }
     }
@@ -136,6 +141,7 @@ fun TransactionEditor(
     val payees = remember(source) { source.transactions.map { it.payee }.filter { it.isNotEmpty() }.distinct() }
     val catalog = remember(source) { categoryCatalog(source) }
     val amountFocus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
     LaunchedEffect(Unit) { amountFocus.requestFocus() }
 
     fun changeKind(next: String) {
@@ -181,12 +187,12 @@ fun TransactionEditor(
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onClose, enabled = !saving) { Icon(Icons.Default.Close, contentDescription = "Close") }
+                    IconButton(onClick = onClose, enabled = !saving) { Icon(Icons.Default.Close, contentDescription = "Close transaction editor") }
                     Text(
                         if (editing) "Edit ${kind}" else if (request.duplicate) "Repeat ${kind}" else "New ${kind}",
-                        style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f).padding(end = 16.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
-                    TextButton(onClick = ::submit, enabled = !saving) { Text("Save", fontWeight = FontWeight.SemiBold) }
                 }
                 Column(
                     Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
@@ -197,15 +203,15 @@ fun TransactionEditor(
                         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                             kinds.forEachIndexed { index, value ->
                                 SegmentedButton(
-                                    selected = kind == value, onClick = { changeKind(value) },
+                                    selected = kind == value, onClick = { changeKind(value) }, enabled = !saving && (value != "transfer" || available.size >= 2),
                                     shape = SegmentedButtonDefaults.itemShape(index, kinds.size),
-                                    label = { Text(value.replaceFirstChar { it.uppercase() }) },
+                                    icon = {}, label = { Text(value.replaceFirstChar { it.uppercase() }, style = MaterialTheme.typography.labelMedium) },
                                 )
                             }
                         }
                     }
                     Column(
-                        Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(14.dp)).padding(vertical = 18.dp),
+                        Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(20.dp)).padding(horizontal = 16.dp, vertical = 24.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         Text(
@@ -214,39 +220,42 @@ fun TransactionEditor(
                             style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Box(Modifier.padding(top = 6.dp), contentAlignment = Alignment.Center) {
-                            if (amount.isEmpty()) Text("0.00", fontSize = 40.sp, color = MaterialTheme.colorScheme.outline, fontWeight = FontWeight.Medium)
+                            if (amount.isEmpty()) Text("0.00", fontSize = 40.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), fontWeight = FontWeight.Medium)
                             BasicTextField(
                                 value = amount, onValueChange = { amount = it.replace(',', '.').filter { c -> c.isDigit() || c == '.' }.take(18) },
-                                singleLine = true,
+                                singleLine = true, enabled = !saving,
                                 textStyle = TextStyle(color = accent, fontSize = 40.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center),
                                 cursorBrush = SolidColor(accent),
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                                modifier = Modifier.fillMaxWidth().focusRequester(amountFocus),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                                keyboardActions = KeyboardActions(onDone = { keyboard?.hide() }),
+                                modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).semantics {
+                                    contentDescription = if (settings.financeCurrency.isEmpty()) "Amount" else "Amount in ${settings.financeCurrency}"
+                                },
                             )
                         }
                     }
                     FieldGroup {
-                        PickerRow(Icons.Default.CalendarToday, "Date", formatDate(date, settings.financeDateFormat)) { dateOpen = true }
+                        PickerRow(Icons.Default.CalendarToday, "Date", formatDate(date, settings.financeDateFormat), enabled = !saving) { dateOpen = true }
                         GroupDivider()
-                        PickerRow(Icons.Default.AccountBalanceWallet, if (kind == "transfer") "From" else "Account", account) { sheet = "account" }
+                        PickerRow(Icons.Default.AccountBalanceWallet, if (kind == "transfer") "From" else "Account", account, enabled = !saving) { keyboard?.hide(); sheet = "account" }
                         if (kind == "transfer") {
                             GroupDivider()
-                            PickerRow(Icons.Default.SwapHoriz, "To", to) { sheet = "to" }
+                            PickerRow(Icons.Default.SwapHoriz, "To", to, enabled = !saving) { keyboard?.hide(); sheet = "to" }
                         }
                     }
                     FieldGroup {
-                        CategoryRows(catalog, selection, locked = kind == "transfer") { selection = it }
+                        CategoryRows(catalog, selection, locked = kind == "transfer" || saving) { selection = it }
                     }
                     Column {
                         FieldGroup {
-                            TextRow(Icons.Default.Person, if (kind == "income") "Payer" else "Payee", payee, { payee = it })
+                            TextRow(Icons.Default.Person, if (kind == "income") "Payer" else "Payee", payee, { payee = it }, enabled = !saving)
                             GroupDivider()
-                            TextRow(Icons.AutoMirrored.Filled.Notes, "Note", note, { note = it }, singleLine = false)
+                            TextRow(Icons.AutoMirrored.Filled.Notes, "Note", note, { note = it }, singleLine = false, enabled = !saving)
                         }
                         val matches = payees.filter { payee.isNotBlank() && it.contains(payee.trim(), ignoreCase = true) && it != payee }.take(8)
                         if (matches.isNotEmpty()) {
                             Row(Modifier.horizontalScroll(rememberScrollState()).padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                matches.forEach { SuggestionChip(onClick = { payee = it }, label = { Text(it) }) }
+                                matches.forEach { SuggestionChip(onClick = { payee = it }, enabled = !saving, label = { Text(it) }) }
                             }
                         }
                     }
@@ -256,11 +265,13 @@ fun TransactionEditor(
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
-                    Button(onClick = ::submit, enabled = !saving, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                    Box(Modifier.height(8.dp))
+                }
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    Button(onClick = ::submit, enabled = !saving, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
                         Text(if (saving) "Saving…" else "Save transaction", fontWeight = FontWeight.SemiBold)
                     }
-                    Box(Modifier.height(8.dp))
                 }
             }
         }

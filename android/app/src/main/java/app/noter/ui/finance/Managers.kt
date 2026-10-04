@@ -9,12 +9,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -46,6 +51,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -101,25 +111,25 @@ private fun ManagerFrame(
 ) {
     Dialog(onDismissRequest = { if (!applier.saving) onClose() }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Box(Modifier.fillMaxSize().systemBarsPadding()) {
+            Box(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
                 Column(Modifier.fillMaxSize()) {
-                    Row(Modifier.fillMaxWidth().padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onClose, enabled = !applier.saving) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
-                        Text(title, style = MaterialTheme.typography.titleLarge)
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = onClose, enabled = !applier.saving) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close $title") }
+                        Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
+                    OutlinedTextField(
+                        value = search, onValueChange = onSearch, singleLine = true,
+                        placeholder = { Text(searchHint) },
+                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                        trailingIcon = if (search.isNotEmpty()) {
+                            { IconButton(onClick = { onSearch("") }) { Icon(Icons.Default.Close, contentDescription = "Clear search") } }
+                        } else null,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 12.dp).semantics { contentDescription = searchHint },
+                    )
                     LazyColumn(contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 96.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         item {
-                            Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            OutlinedTextField(
-                                value = search, onValueChange = onSearch, singleLine = true,
-                                placeholder = { Text(searchHint) },
-                                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                                trailingIcon = if (search.isNotEmpty()) {
-                                    { IconButton(onClick = { onSearch("") }) { Icon(Icons.Default.Close, contentDescription = "Clear search") } }
-                                } else null,
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
-                            )
+                            Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 8.dp))
                             if (applier.status.isNotEmpty()) {
                                 Text(applier.status, color = if (applier.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                             }
@@ -140,10 +150,10 @@ private fun ManagerFrame(
 
 /** Row menu with the given actions; each action is (label, enabled, color, run). */
 @Composable
-private fun RowMenu(actions: List<MenuAction>, enabled: Boolean) {
+private fun RowMenu(actions: List<MenuAction>, enabled: Boolean, label: String = "Actions") {
     var open by remember { mutableStateOf(false) }
     Box {
-        IconButton(onClick = { open = true }, enabled = enabled) { Icon(Icons.Default.MoreVert, contentDescription = "Actions") }
+        IconButton(onClick = { open = true }, enabled = enabled) { Icon(Icons.Default.MoreVert, contentDescription = label) }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             actions.forEach { action ->
                 DropdownMenuItem(
@@ -162,21 +172,33 @@ private class MenuAction(val label: String, val enabled: Boolean = true, val dan
 private fun TextInputDialog(title: String, description: String?, fields: List<Pair<String, String>>, submit: String, onSubmit: suspend (List<String>) -> String?, onDismiss: () -> Unit) {
     var values by remember { mutableStateOf(fields.map { it.second }) }
     var error by remember { mutableStateOf("") }
+    var saving by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!saving) onDismiss() },
         title = { Text(title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 description?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 fields.forEachIndexed { index, (label, _) ->
-                    OutlinedTextField(value = values[index], onValueChange = { v -> values = values.toMutableList().also { it[index] = v } }, label = { Text(label) }, singleLine = index == 0)
+                    OutlinedTextField(
+                        value = values[index], onValueChange = { v -> values = values.toMutableList().also { it[index] = v.take(2000) } },
+                        label = { Text(label) }, singleLine = index == 0, enabled = !saving,
+                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                        shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth(),
+                    )
                 }
                 if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
             }
         },
-        confirmButton = { TextButton(onClick = { scope.launch { onSubmit(values)?.let { error = it } ?: onDismiss() } }) { Text(submit) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = { TextButton(onClick = {
+            saving = true
+            scope.launch {
+                onSubmit(values)?.let { error = it } ?: onDismiss()
+                saving = false
+            }
+        }, enabled = !saving) { Text(if (saving) "Saving…" else submit) } },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !saving) { Text("Cancel") } },
     )
 }
 
@@ -210,7 +232,7 @@ fun AccountManager(
                 Row(Modifier.fillMaxWidth().padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(account.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            Text(account.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
                                 color = if (account.archived == true) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface)
                             if (defaultAccount == account.name) Icon(Icons.Default.Star, contentDescription = "Default account", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(start = 6.dp).heightIn(max = 16.dp))
                         }
@@ -218,9 +240,11 @@ fun AccountManager(
                             "$count ${if (count == 1) "transaction" else "transactions"}" + if (account.archived == true) " · Archived" else "",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        if (account.note.isNotEmpty()) Text(account.note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        if (account.note.isNotEmpty()) Text(account.note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     }
-                    Text(format(cents), style = MaterialTheme.typography.titleSmall, color = if (cents < 0) NoterColors.danger else MaterialTheme.colorScheme.onSurface)
+                    Text(format(cents), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold,
+                        color = if (cents < 0) NoterColors.danger else MaterialTheme.colorScheme.onSurface,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.End, modifier = Modifier.widthIn(max = 140.dp).padding(start = 8.dp))
                     RowMenu(
                         listOf(
                             MenuAction("Edit") { editing = account.name },
@@ -233,6 +257,7 @@ fun AccountManager(
                             },
                         ),
                         enabled = !applier.saving,
+                        label = "Actions for ${account.name}",
                     )
                 }
             }
@@ -289,7 +314,7 @@ fun CategoryManager(finance: Finance, commit: suspend (Finance) -> Boolean, onCl
             val reserved = isTransferCategory(category.name)
             FieldGroup {
                 Row(
-                    Modifier.fillMaxWidth().clickable { expanded = if (open) expanded - category.name else expanded + category.name }
+                    Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = if (open) "Collapse subcategories" else "Show subcategories") { expanded = if (open) expanded - category.name else expanded + category.name }
                         .padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -311,6 +336,7 @@ fun CategoryManager(finance: Finance, commit: suspend (Finance) -> Boolean, onCl
                             MenuAction("Delete", danger = true) { action = CategoryAction.Delete(category.name, null) },
                         ),
                         enabled = !applier.saving,
+                        label = "Actions for ${category.name}",
                     ) else Box(Modifier.padding(end = 12.dp))
                 }
                 if (open) {
@@ -324,6 +350,7 @@ fun CategoryManager(finance: Finance, commit: suspend (Finance) -> Boolean, onCl
                                     MenuAction("Delete", danger = true) { action = CategoryAction.Delete(category.name, sub) },
                                 ),
                                 enabled = !applier.saving,
+                                label = "Actions for $sub",
                             )
                         }
                     }

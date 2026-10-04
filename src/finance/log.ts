@@ -1,7 +1,7 @@
 import type { Finance, Transaction } from './model.ts';
 
 // Finance is stored as one append-only log per device in .noter/finance/log-<device>.jsonl.
-// Each device appends only to its own file, so Syncthing never produces conflicting copies.
+// Each device appends only to its own file, avoiding competing writes during normal sync.
 // Every line is one batch of changes; replaying all batches ordered by (ts, dev, seq) gives
 // the current data, with the latest change winning for each transaction or setting.
 // The Android client implements the same format in FinanceLog.kt; keep both in step.
@@ -119,5 +119,6 @@ export function replayFinance(batches: FinanceBatch[]): { data: FinanceData; tem
 
 export function batchLine(device: string, clock: number, seq: number, ops: FinanceOp[]): { line: string; ts: number } {
   const ts = Math.max(Date.now(), clock + 1);
+  if (!Number.isSafeInteger(ts) || !Number.isSafeInteger(seq)) throw new Error('Finance log timestamp or sequence is outside the supported range.');
   return { line: `${JSON.stringify({ v: 1, ts, dev: device, seq, ops })}\n`, ts };
 }

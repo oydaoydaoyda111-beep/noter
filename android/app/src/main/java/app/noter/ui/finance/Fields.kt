@@ -2,12 +2,14 @@ package app.noter.ui.finance
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -18,21 +20,32 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -43,7 +56,7 @@ import java.time.ZoneOffset
 /** A grouped surface for rows, like a settings list. */
 @Composable
 fun FieldGroup(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
-    Column(modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(14.dp))) { content() }
+    Column(modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerLow)) { content() }
 }
 
 @Composable
@@ -55,22 +68,22 @@ fun GroupDivider() {
 @Composable
 fun PickerRow(icon: ImageVector, label: String, value: String, placeholder: String = "Choose", enabled: Boolean = true, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onClick).heightIn(min = 54.dp).padding(horizontal = 16.dp),
+        Modifier.fillMaxWidth().clickable(enabled = enabled, role = Role.Button, onClick = onClick).heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
-        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp).weight(0.9f))
-        Text(
-            value.ifEmpty { placeholder },
-            color = when {
-                !enabled -> MaterialTheme.colorScheme.onSurfaceVariant
-                value.isEmpty() -> MaterialTheme.colorScheme.primary
-                else -> MaterialTheme.colorScheme.onSurface
-            },
-            maxLines = 1, overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1.4f).padding(start = 8.dp),
-            textAlign = androidx.compose.ui.text.style.TextAlign.End,
-        )
+        Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
+            Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                value.ifEmpty { placeholder }, style = MaterialTheme.typography.bodyMedium,
+                color = when {
+                    !enabled -> MaterialTheme.colorScheme.onSurfaceVariant
+                    value.isEmpty() -> MaterialTheme.colorScheme.primary
+                    else -> MaterialTheme.colorScheme.onSurface
+                },
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
+        }
         if (enabled) Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 4.dp).size(20.dp))
     }
 }
@@ -79,17 +92,33 @@ fun PickerRow(icon: ImageVector, label: String, value: String, placeholder: Stri
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OptionSheet(title: String, options: List<Triple<String, String, String>>, selected: String, onSelect: (String) -> Unit, onDismiss: () -> Unit) {
+    var query by remember { mutableStateOf("") }
+    val filtered = options.filter { (_, label, detail) -> listOf(label, detail).any { it.contains(query.trim(), ignoreCase = true) } }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = MaterialTheme.colorScheme.surfaceContainerHigh) {
-        Column(Modifier.navigationBarsPadding()) {
-            Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-            LazyColumn(Modifier.heightIn(max = 480.dp)) {
-                items(options, key = { it.first }) { (value, label, detail) ->
+        Column(Modifier.heightIn(max = 620.dp).navigationBarsPadding().imePadding()) {
+            Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
+            if (options.size > 8) OutlinedTextField(
+                value = query, onValueChange = { query = it.take(120) }, singleLine = true,
+                label = { Text("Search ${title.lowercase()}") },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                trailingIcon = if (query.isNotEmpty()) {
+                    { IconButton(onClick = { query = "" }) { Icon(Icons.Default.Close, contentDescription = "Clear search") } }
+                } else null,
+                shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+            LazyColumn(Modifier.weight(1f, fill = false).heightIn(max = 480.dp)) {
+                if (filtered.isEmpty()) item {
+                    Text("No matches. Try another name.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(20.dp))
+                }
+                items(filtered, key = { it.first }) { (value, label, detail) ->
                     Row(
-                        Modifier.fillMaxWidth().clickable { onSelect(value); onDismiss() }.heightIn(min = 52.dp).padding(horizontal = 20.dp, vertical = 8.dp),
+                        Modifier.fillMaxWidth().background(if (value == selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                            .selectable(selected = value == selected, role = Role.RadioButton, onClick = { onSelect(value); onDismiss() })
+                            .heightIn(min = 60.dp).padding(horizontal = 20.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(label, fontWeight = if (value == selected) FontWeight.SemiBold else FontWeight.Normal)
+                            Text(label, fontWeight = if (value == selected) FontWeight.SemiBold else FontWeight.Normal, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             if (detail.isNotEmpty()) Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (value == selected) Icon(Icons.Default.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)

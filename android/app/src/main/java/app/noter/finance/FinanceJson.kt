@@ -9,12 +9,13 @@ internal fun invalid(): Nothing =
 
 private fun JSONObject.string(key: String): String = opt(key) as? String ?: invalid()
 
-private fun JSONObject.integer(key: String): Long = when (val value = opt(key)) {
-    is Int -> value.toLong()
-    is Long -> value
-    is Double -> if (value % 1.0 == 0.0) value.toLong() else invalid()
-    else -> invalid()
+/** JSON numbers must remain exact when the desktop client reads them as JavaScript numbers. */
+internal fun safeInteger(value: Any?): Long? {
+    val number = (value as? Number)?.toDouble() ?: return null
+    return number.takeIf { it.isFinite() && it % 1.0 == 0.0 && it >= -MAX_SAFE && it <= MAX_SAFE }?.toLong()
 }
+
+private fun JSONObject.integer(key: String): Long = safeInteger(opt(key)) ?: invalid()
 
 private fun Any?.objects(): List<JSONObject> = (this as? JSONArray ?: invalid()).let { array -> List(array.length()) { array.optJSONObject(it) ?: invalid() } }
 internal fun Any?.strings(): List<String> = (this as? JSONArray ?: invalid()).let { array -> List(array.length()) { array.opt(it) as? String ?: invalid() } }
@@ -70,7 +71,7 @@ fun validateFinance(finance: Finance): Finance {
     for (account in finance.accounts) if (account.name.isEmpty() || !names.add(account.name)) invalid()
     val ids = HashSet<String>()
     for (row in finance.transactions) {
-        if (row.id.isEmpty() || !ids.add(row.id) || row.account !in names || !validDate(row.date) || row.cents == 0L) invalid()
+        if (row.id.isEmpty() || !ids.add(row.id) || row.account !in names || !validDate(row.date) || row.cents == 0L || row.cents !in -MAX_SAFE..MAX_SAFE) invalid()
     }
     for (pair in finance.transactions.filter { it.transferId != null }.groupBy { it.transferId }.values) {
         if (pair.size != 2 || pair[0].cents != -pair[1].cents || pair[0].account == pair[1].account || pair[0].date != pair[1].date) invalid()
@@ -81,7 +82,7 @@ fun validateFinance(finance: Finance): Finance {
 /** Reads the former single-file `.noter/finance.json`, used only for the one-time migration to logs. */
 fun parseLegacyFinance(text: String, template: ByteArray): Finance {
     val data = try { JSONObject(text) } catch (_: JSONException) { invalid() }
-    if (data.opt("version") != 1) invalid()
+    if (safeInteger(data.opt("version")) != 1L) invalid()
     val finance = Finance(
         accounts = accountsFromJson(data.opt("accounts")),
         transactions = data.opt("transactions").objects().map(::transactionFromJson),

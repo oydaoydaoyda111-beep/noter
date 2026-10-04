@@ -1,0 +1,20 @@
+{
+  "data": {
+    "version": 1,
+    "accounts": [
+      { "name": "Cash", "note": "Shared account", "archived": false },
+      { "name": "Savings", "note": "Keep account notes", "archived": true },
+      { "name": "Wallet", "note": "" }
+    ],
+    "transactions": [
+      { "id": "meal", "date": "2026-10-04", "cents": -1250, "account": "Cash", "category": "Food", "subcategory": "Café", "payee": "Test café", "note": "Updated in Bakı 😀" },
+      { "id": "transfer-out", "date": "2026-10-04", "cents": -500, "account": "Cash", "category": "Transfer to other account", "subcategory": "", "payee": "", "note": "" },
+      { "id": "income", "date": "2026-10-04", "cents": 10000, "account": "Wallet", "category": "Income", "subcategory": "", "payee": "Synthetic", "note": "Restore referenced account" }
+    ],
+    "categories": ["Food", "Transfer to other account"],
+    "sourceName": "synthetic.xlsx",
+    "defaults": { "account": "Cash", "category": "Food" },
+    "categoryDefinitions": [{ "name": "Food", "subcategories": ["Café"] }]
+  },
+  "templateSha256": ""
+}

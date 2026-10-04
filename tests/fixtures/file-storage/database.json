@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "title": "Shared tasks",
+  "columns": [
+    { "id": "name", "name": "Name", "type": "text", "options": [], "futureLabel": "preserve" },
+    { "id": "status", "name": "Status", "type": "select", "options": ["Ready", "Done", "Blocked"], "optionColors": { "Ready": "blue", "Done": "green", "Blocked": "orange" } },
+    { "id": "due", "name": "Due", "type": "date", "options": [] },
+    { "id": "score", "name": "Score", "type": "number", "options": [] },
+    { "id": "done", "name": "Complete", "type": "checkbox", "options": [] }
+  ],
+  "rows": [
+    { "id": "alpha", "cells": { "name": "Alpha", "status": "Ready", "due": "2026-10-04", "score": 3, "done": false, "unknown": { "preserve": true } }, "futureLabel": "preserve" },
+    { "id": "beta", "cells": { "name": "Beta", "status": "Ready", "due": "2026-10-05", "score": 12.5, "done": true } },
+    { "id": "gamma", "cells": { "name": "Gamma", "status": "Done", "due": "", "score": null, "done": true } },
+    { "id": "delta", "cells": { "name": "Ångström", "status": "Blocked", "due": "2026-10-04", "score": -2, "done": false } }
+  ],
+  "view": "table",
+  "filter": "",
+  "sort": { "columnId": "score", "direction": "desc" },
+  "boardColumnId": "status",
+  "calendarColumnId": "due",
+  "calendarMonth": "2026-10",
+  "activeViewId": "table",
+  "views": [
+    { "id": "table", "name": "All tasks", "layout": "table", "filter": "", "sort": { "columnId": "score", "direction": "desc" }, "hiddenColumnIds": ["done"], "columnWidths": { "name": 280 }, "boardColumnId": "status", "calendarColumnId": "due", "calendarMonth": "2026-10", "condition": null, "futureLabel": "preserve" },
+    { "id": "board", "name": "Completed", "layout": "kanban", "filter": "", "sort": null, "hiddenColumnIds": [], "columnWidths": {}, "boardColumnId": "status", "calendarColumnId": "due", "calendarMonth": "2026-10", "condition": { "columnId": "status", "value": "Done" } },
+    { "id": "calendar", "name": "Schedule", "layout": "calendar", "filter": "", "sort": null, "hiddenColumnIds": [], "columnWidths": {}, "boardColumnId": "status", "calendarColumnId": "due", "calendarMonth": "2026-10", "condition": null }
+  ],
+  "futureMetadata": { "preserve": true }
+}

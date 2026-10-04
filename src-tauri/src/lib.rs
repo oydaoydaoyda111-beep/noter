@@ -1,10 +1,15 @@
 mod archive;
 mod vault;
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 struct VaultState(Mutex<Option<PathBuf>>);
+struct RevisionState(Arc<Mutex<vault::RevisionProbe>>);
 fn root(state: &State<'_, VaultState>) -> Result<PathBuf, String> {
     state
         .0
@@ -21,6 +26,43 @@ fn workspace_folder(state: State<'_, VaultState>) -> Result<Option<String>, Stri
         .map_err(|_| "Workspace is busy.")?
         .as_ref()
         .map(|path| path.to_string_lossy().to_string()))
+}
+#[tauri::command]
+fn read_last_section(app: tauri::AppHandle) -> Result<String, String> {
+    let path = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "App settings are unavailable.")?
+        .join("ui.json");
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("notes".into()),
+        Err(e) => return Err(format!("Could not read app settings: {e}")),
+    };
+    Ok(serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|data| {
+            data["lastSection"]
+                .as_str()
+                .filter(|section| matches!(*section, "notes" | "finance"))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "notes".into()))
+}
+#[tauri::command]
+fn save_last_section(app: tauri::AppHandle, section: String) -> Result<(), String> {
+    if !matches!(section.as_str(), "notes" | "finance") {
+        return Err("Invalid app section.".into());
+    }
+    let path = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "App settings are unavailable.")?
+        .join("ui.json");
+    vault::atomic_write(
+        &path,
+        &serde_json::to_vec(&json!({"lastSection": section})).unwrap(),
+    )
 }
 #[tauri::command]
 async fn choose_workspace_folder(
@@ -59,8 +101,21 @@ async fn load_workspace(state: State<'_, VaultState>) -> Result<vault::LoadedWor
     vault::load(&root(&state)?)
 }
 #[tauri::command]
-async fn workspace_revision(state: State<'_, VaultState>) -> Result<String, String> {
-    vault::revision(&root(&state)?)
+async fn workspace_revision(
+    state: State<'_, VaultState>,
+    probe: State<'_, RevisionState>,
+    force: bool,
+) -> Result<String, String> {
+    let folder = root(&state)?;
+    let probe = Arc::clone(&probe.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        probe
+            .lock()
+            .map_err(|_| "Workspace is busy.".to_string())?
+            .check(&folder, force)
+    })
+    .await
+    .map_err(|_| "Could not check synced files.")?
 }
 #[tauri::command]
 async fn save_workspace(
@@ -69,6 +124,17 @@ async fn save_workspace(
     expected: String,
 ) -> Result<String, String> {
     vault::save(&root(&state)?, workspace, &expected)
+}
+#[tauri::command]
+async fn preserve_workspace_edits(
+    state: State<'_, VaultState>,
+    workspace: Value,
+    base: Value,
+) -> Result<vault::PreservedEdits, String> {
+    let folder = root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || vault::preserve_edits(&folder, &workspace, &base))
+        .await
+        .map_err(|_| "Could not preserve unsaved edits.")?
 }
 /// A random identifier for this installation; it names this device's Finance log file.
 fn device_id(app: &tauri::AppHandle) -> Result<String, String> {
@@ -89,7 +155,10 @@ fn device_id(app: &tauri::AppHandle) -> Result<String, String> {
     Ok(id)
 }
 #[tauri::command]
-async fn load_finance(app: tauri::AppHandle, state: State<'_, VaultState>) -> Result<Value, String> {
+async fn load_finance(
+    app: tauri::AppHandle,
+    state: State<'_, VaultState>,
+) -> Result<Value, String> {
     let folder = root(&state)?;
     let revision = vault::finance_revision(&folder)?;
     let mut finance = vault::read_finance(&folder)?;
@@ -112,7 +181,13 @@ async fn append_finance(
     template: Option<Vec<u8>>,
     retire_legacy: bool,
 ) -> Result<String, String> {
-    vault::append_finance(&root(&state)?, &device_id(&app)?, &line, template.as_deref(), retire_legacy)
+    vault::append_finance(
+        &root(&state)?,
+        &device_id(&app)?,
+        &line,
+        template.as_deref(),
+        retire_legacy,
+    )
 }
 #[tauri::command]
 async fn open_document(app: tauri::AppHandle, extension: String) -> Result<Option<Value>, String> {
@@ -203,13 +278,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(VaultState(Mutex::new(None)))
+        .manage(RevisionState(Arc::new(Mutex::new(
+            vault::RevisionProbe::default(),
+        ))))
         .invoke_handler(tauri::generate_handler![
             unpack_workbook,
             pack_workbook,
             workspace_folder,
+            read_last_section,
+            save_last_section,
             choose_workspace_folder,
             load_workspace,
             save_workspace,
+            preserve_workspace_edits,
             workspace_revision,
             load_finance,
             append_finance,
