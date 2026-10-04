@@ -19,6 +19,7 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - `npm run build` checks TypeScript and builds the production app into `dist/`.
 - `npm test` runs database regression tests with the built-in Node.js test runner (Node.js 24).
 - There is currently no lint script. Do not report lint checks as passing.
+- Android on the user's Windows machine: JDK 17 is in `%USERPROFILE%\.jdks\jdk-17*` and the SDK in `%LOCALAPPDATA%\Android\Sdk` (`android/local.properties`, git-ignored). Set `JAVA_HOME` to that JDK, `ANDROID_HOME` to the SDK and `JAVA_TOOL_OPTIONS=-Djdk.net.unixdomain.tmpdir=%USERPROFILE%\.gradle\uds`, then run `android\gradlew.bat -p android :app:assembleRelease :app:assembleDebugAndroidTest`. The release APK is `android/app/build/outputs/apk/release/app-release.apk`; bump `versionCode`/`versionName` in `android/app/build.gradle.kts` for each delivered build. No emulator or device is attached here, so instrumentation tests cannot run.
 
 ## Code map
 
