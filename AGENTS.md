@@ -4,7 +4,7 @@
 
 Read `MEMORY.md` for established product decisions, completed work, and known limitations. Keep that file concise and current when decisions change; do not store secrets or private financial records.
 
-Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript, Vite, and native DOM APIs, plus a Kotlin/Compose Android app. Both apps use the same versioned file storage in a user-selected folder: Markdown notes, `.noter/workspace.json`, per-device Finance JSONL logs and the original Excel template. See `docs/FILE_STORAGE.md`. Syncthing synchronizes the files; there is no backend or supported browser app. Vite builds the desktop UI, and browser persistence has been removed.
+Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript, Vite, and native DOM APIs, plus a Kotlin/Compose Android app. Both apps use the same versioned file storage in a user-selected folder: Markdown notes, `.noter/workspace.json`, per-device Finance and Planner JSONL logs and the original Excel template. See `docs/FILE_STORAGE.md`. Syncthing synchronizes the files; there is no backend or supported browser app. Vite builds the desktop UI, and browser persistence has been removed.
 
 ## Setup and commands
 
@@ -20,6 +20,7 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - `npm test` runs database regression tests with the built-in Node.js test runner (Node.js 24).
 - There is currently no lint script. Do not report lint checks as passing.
 - Android on the user's Windows machine: JDK 17 is in `%USERPROFILE%\.jdks\jdk-17*` and the SDK in `%LOCALAPPDATA%\Android\Sdk` (`android/local.properties`, git-ignored). Set `JAVA_HOME` to that JDK, `ANDROID_HOME` to the SDK and `JAVA_TOOL_OPTIONS=-Djdk.net.unixdomain.tmpdir=%USERPROFILE%\.gradle\uds`, then run `android\gradlew.bat -p android :app:assembleRelease :app:assembleDebugAndroidTest`. The release APK is `android/app/build/outputs/apk/release/app-release.apk`; bump `versionCode`/`versionName` in `android/app/build.gradle.kts` for each delivered build. No emulator or device is attached here, so instrumentation tests cannot run.
+- Android on the user's Mac: JDK 17 from Homebrew (`JAVA_HOME=$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home`; Android Studio's bundled JDK 25 is too new for Gradle 8.9) and the SDK in `~/Library/Android/sdk` (`android/local.properties`). `gradlew` is not executable in Git, so run `sh gradlew -p android :app:assembleRelease :app:testDebugUnitTest`. No emulator here either; `:app:testDebugUnitTest` runs the JVM Planner contract tests.
 
 ## Code map
 
@@ -32,6 +33,7 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 - `src-tauri/src/vault.rs`: Markdown/metadata persistence, file revision checks, safe paths, and recoverable snapshots.
 - `src-tauri/src/archive.rs`: bounded native Excel ZIP processing on worker threads.
 - `src-tauri/src/lib.rs`: scoped native commands, platform plugins, and desktop menus.
+- `src/planner/`: Planner dates, task log model with recurrence, and the month-calendar view; `android/.../planner` mirrors it.
 - `src/finance/`: precise transaction model, shared JSONL log format, native file persistence, template-preserving Excel import/export, and the Finance view.
 - `android/`: Kotlin/Compose app using Android SAF to access the shared workspace file formats.
 - `tests/fixtures/file-storage/`: shared synthetic Markdown/manifest/Finance fixtures; keep desktop and Android round trips compatible.
@@ -55,6 +57,7 @@ Noter is a Tauri 2 desktop personal workspace built with Rust, strict TypeScript
 ## Validation and ongoing work
 
 - Run `npm test` for database model or persistence changes.
+- Run `npm test` and Android `:app:testDebugUnitTest` for Planner model or log changes; both replay `tests/fixtures/file-storage/planner`.
 - Run `npm test` for finance changes; set `BANK_TEST_WORKBOOK` to a local bank workbook path for the optional real-workbook round-trip check. Never commit private financial files or print transaction details in test failures.
 - Run `npm run build` after code changes; it includes the TypeScript check. Run `npm run check` when a faster intermediate check helps.
 - For native storage changes, run `npm run desktop:test`. Preserve readable Markdown, metadata IDs, integer cents, and the original Excel template. Keep revision checks and symlink/path restrictions; never silently overwrite incoming synced changes.

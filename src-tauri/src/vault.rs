@@ -1043,18 +1043,22 @@ fn millis(metadata: &fs::Metadata) -> u128 {
 }
 /// Finance log files, sorted by name. Each device appends only to its own `log-<device>.jsonl`.
 fn finance_logs(root: &Path) -> Result<Vec<(String, PathBuf, fs::Metadata)>> {
-    let folder = safe_path(root, FINANCE_LOGS)?;
+    device_logs(root, FINANCE_LOGS, "Finance")
+}
+/// Per-device JSONL logs in `folder`, sorted by name; a missing folder has no logs.
+fn device_logs(root: &Path, folder: &str, label: &str) -> Result<Vec<(String, PathBuf, fs::Metadata)>> {
+    let folder = safe_path(root, folder)?;
     let entries = match fs::read_dir(&folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(error("Could not read Finance logs", e)),
+        Err(e) => return Err(error(&format!("Could not read {label} logs"), e)),
     };
     let mut result = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| error("Could not read Finance logs", e))?;
+        let entry = entry.map_err(|e| error(&format!("Could not read {label} logs"), e))?;
         let name = entry.file_name().to_string_lossy().to_string();
         let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|e| error("Could not inspect Finance logs", e))?;
+            .map_err(|e| error(&format!("Could not inspect {label} logs"), e))?;
         if name.starts_with('.') || !name.ends_with(".jsonl") || !metadata.is_file() {
             continue;
         }
@@ -1175,49 +1179,9 @@ pub fn append_finance(
         }
         atomic_write(&safe_path(root, FINANCE_TEMPLATE)?, bytes)?;
     }
-    fs::create_dir_all(path.parent().ok_or("Invalid Finance location.")?)
-        .map_err(|e| error("Could not create Finance folder", e))?;
-    let mut recovered = false;
-    let mut committed = original_bytes.to_vec();
-    committed.extend_from_slice(body.as_bytes());
-    // A leading newline signals an ignored interrupted tail, not a record separator.
-    // Keep the original recoverable and replace the tail and new batch in one durable write.
-    if line.starts_with('\n') {
-        let original = original_bytes;
-        if !original.is_empty() && original.last() != Some(&b'\n') {
-            let backup = safe_path(
-                root,
-                &format!(
-                    ".noter/trash/finance-interrupted-{device}-{}-{}.jsonl",
-                    now(),
-                    Uuid::new_v4()
-                ),
-            )?;
-            atomic_write(&backup, &original)?;
-            let current = safe_path(root, &format!("{FINANCE_LOGS}/log-{device}.jsonl"))?;
-            unchanged_finance(root, &relative, expected_own_log)?;
-            let end = original
-                .iter()
-                .rposition(|&byte| byte == b'\n')
-                .map_or(0, |index| index + 1);
-            let mut repaired = original[..end].to_vec();
-            repaired.extend_from_slice(body.as_bytes());
-            atomic_write(&current, &repaired)?;
-            committed = repaired;
-            recovered = true;
-        }
-    }
-    if !recovered {
-        unchanged_finance(root, &relative, expected_own_log)?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| error("Could not open Finance log", e))?;
-        file.write_all(body.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|e| error("Could not save Finance", e))?;
-    }
+    let committed = write_device_log(root, &relative, device, original_bytes, line, "finance", "Finance", || {
+        unchanged_finance(root, &relative, expected_own_log)
+    })?;
     let legacy = safe_path(root, FINANCE_LEGACY)?;
     if retire_legacy && legacy.is_file() {
         let target = safe_path(
@@ -1238,6 +1202,140 @@ pub fn append_finance(
     unchanged_finance(root, &relative, own_log_sha256.as_deref())?;
     unchanged_finance(root, FINANCE_TEMPLATE, template_sha256.as_deref())?;
     Ok(SavedFinance { revision: finance_revision(root)?, own_log_sha256, template_sha256 })
+}
+
+/// Appends one batch (`line` without its optional leading newline) to a device log and returns the
+/// log's complete new bytes. A leading newline signals an ignored interrupted tail, not a record
+/// separator: the original is kept in `.noter/trash` and the tail is replaced with the batch in one
+/// durable write. `unchanged` re-checks the log immediately before writing.
+fn write_device_log(
+    root: &Path,
+    relative: &str,
+    device: &str,
+    original: &[u8],
+    line: &str,
+    trash_prefix: &str,
+    label: &str,
+    unchanged: impl Fn() -> Result<()>,
+) -> Result<Vec<u8>> {
+    let body = line.strip_prefix('\n').unwrap_or(line);
+    let path = safe_path(root, relative)?;
+    fs::create_dir_all(path.parent().ok_or(format!("Invalid {label} location."))?)
+        .map_err(|e| error(&format!("Could not create {label} folder"), e))?;
+    if line.starts_with('\n') && !original.is_empty() && original.last() != Some(&b'\n') {
+        let backup = safe_path(
+            root,
+            &format!(
+                ".noter/trash/{trash_prefix}-interrupted-{device}-{}-{}.jsonl",
+                now(),
+                Uuid::new_v4()
+            ),
+        )?;
+        atomic_write(&backup, original)?;
+        unchanged()?;
+        let end = original
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let mut repaired = original[..end].to_vec();
+        repaired.extend_from_slice(body.as_bytes());
+        atomic_write(&path, &repaired)?;
+        return Ok(repaired);
+    }
+    unchanged()?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| error(&format!("Could not open {label} log"), e))?;
+    file.write_all(body.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| error(&format!("Could not save {label}"), e))?;
+    let mut committed = original.to_vec();
+    committed.extend_from_slice(body.as_bytes());
+    Ok(committed)
+}
+
+const PLANNER_LOGS: &str = ".noter/planner";
+const MAX_PLANNER_LOGS: u64 = 100_000_000;
+fn valid_device(device: &str) -> Result<()> {
+    if device.is_empty() || device.len() > 64 || !device.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("Invalid device identifier.".into());
+    }
+    Ok(())
+}
+fn unchanged_planner(root: &Path, relative: &str, expected: Option<&str>) -> Result<()> {
+    if file_fingerprint(root, relative)?.as_deref() == expected {
+        Ok(())
+    } else {
+        Err("SYNC_CONFLICT: Planner files changed outside Noter. Reload Planner before saving; the incoming files have been kept.".into())
+    }
+}
+pub fn planner_revision(root: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    for (name, _, metadata) in device_logs(root, PLANNER_LOGS, "Planner")? {
+        hash.update(format!("{name}\0{}\0{}\n", metadata.len(), millis(&metadata)));
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+/// Every device's Planner log, plus the fingerprint of this device's own log.
+pub fn read_planner(root: &Path, device: &str) -> Result<Value> {
+    valid_device(device)?;
+    let own_name = format!("log-{device}.jsonl");
+    let (mut logs, mut checked, mut own_log_sha256, mut total) = (Vec::new(), Vec::new(), None, 0);
+    for (name, path, metadata) in device_logs(root, PLANNER_LOGS, "Planner")? {
+        total += metadata.len();
+        if total > MAX_PLANNER_LOGS {
+            return Err("Planner logs are larger than 100 MB.".into());
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|_| "A Planner log could not be read as UTF-8. Your files have been kept.")?;
+        let sha256 = fingerprint(text.as_bytes());
+        if name == own_name {
+            own_log_sha256 = Some(sha256.clone());
+        }
+        checked.push((path, sha256));
+        logs.push(json!({"name": name, "text": text}));
+    }
+    for (path, expected) in checked {
+        if read_optional(&path)?.as_deref().map(fingerprint).as_deref() != Some(&expected) {
+            return Err("SYNC_CONFLICT: Planner changed while loading. Wait for synchronization and reload.".into());
+        }
+    }
+    Ok(json!({"logs": logs, "ownLogSha256": own_log_sha256}))
+}
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedPlanner {
+    pub revision: String,
+    pub own_log_sha256: Option<String>,
+}
+/// Appends one batch line to this device's Planner log, refusing if the log changed since it was read.
+pub fn append_planner(root: &Path, device: &str, line: &str, expected_own_log: Option<&str>) -> Result<SavedPlanner> {
+    valid_device(device)?;
+    let body = line.strip_prefix('\n').unwrap_or(line);
+    let record = body.strip_suffix('\n').ok_or("Invalid Planner change.")?;
+    if record.contains('\n')
+        || record.len() > 10_000_000
+        || serde_json::from_str::<Value>(record).map_or(true, |value| value["v"] != 1)
+    {
+        return Err("Invalid Planner change.".into());
+    }
+    let relative = format!("{PLANNER_LOGS}/log-{device}.jsonl");
+    let original = read_optional(&safe_path(root, &relative)?)?;
+    if original.as_deref().map(fingerprint).as_deref() != expected_own_log {
+        return Err("SYNC_CONFLICT: This device's Planner log changed outside Noter. Reload Planner before saving; the incoming log has been kept.".into());
+    }
+    let original = original.unwrap_or_default();
+    if !original.is_empty() && original.last() != Some(&b'\n') && !line.starts_with('\n') {
+        return Err("An interrupted Planner log must be reloaded before saving.".into());
+    }
+    let committed = write_device_log(root, &relative, device, &original, line, "planner", "Planner", || {
+        unchanged_planner(root, &relative, expected_own_log)
+    })?;
+    let own_log_sha256 = Some(fingerprint(&committed));
+    unchanged_planner(root, &relative, own_log_sha256.as_deref())?;
+    Ok(SavedPlanner { revision: planner_revision(root)?, own_log_sha256 })
 }
 
 #[cfg(test)]
@@ -1948,6 +2046,39 @@ mod tests {
         assert_eq!(display_path(Path::new(r"\\?\UNC\server\share\Notes")), r"\\server\share\Notes");
         assert_eq!(display_path(Path::new(r"\\?\C:\Notes.")), r"\\?\C:\Notes.");
         assert_eq!(display_path(Path::new(r"C:\Notes")), r"C:\Notes");
+    }
+    #[test]
+    fn planner_logs_append_per_device_repair_tails_and_reject_stale_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = planner_revision(root.path()).unwrap();
+        assert_eq!(read_planner(root.path(), "abc").unwrap()["logs"], json!([]));
+        let line = "{\"v\":1,\"ts\":1,\"dev\":\"abc\",\"seq\":1,\"ops\":[]}\n";
+        let saved = append_planner(root.path(), "abc", line, None).unwrap();
+        assert_ne!(saved.revision, empty);
+        assert_eq!(saved.revision, planner_revision(root.path()).unwrap());
+        // A stale fingerprint means another writer touched this device's log: keep it and refuse.
+        assert!(append_planner(root.path(), "abc", line, None).unwrap_err().starts_with("SYNC_CONFLICT"));
+        assert!(append_planner(root.path(), "../x", line, saved.own_log_sha256.as_deref()).is_err());
+        assert!(append_planner(root.path(), "abc", "not json\n", saved.own_log_sha256.as_deref()).is_err());
+        // Interrupted tails are backed up and replaced, never silently appended to.
+        let path = root.path().join(".noter/planner/log-abc.jsonl");
+        let mut interrupted = fs::read(&path).unwrap();
+        interrupted.extend_from_slice(b"{\"v\":1,\"ts\":2");
+        fs::write(&path, &interrupted).unwrap();
+        let own = Some(fingerprint(&interrupted));
+        assert!(append_planner(root.path(), "abc", line, own.as_deref()).is_err());
+        let next = "{\"v\":1,\"ts\":3,\"dev\":\"abc\",\"seq\":2,\"ops\":[]}\n";
+        let repaired = append_planner(root.path(), "abc", &format!("\n{next}"), own.as_deref()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{line}{next}"));
+        let trash: Vec<_> = fs::read_dir(root.path().join(".noter/trash")).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert!(trash.iter().any(|name| name.starts_with("planner-interrupted-abc-")));
+        fs::write(root.path().join(".noter/planner/log-other.jsonl"), line).unwrap();
+        assert_ne!(planner_revision(root.path()).unwrap(), repaired.revision);
+        let loaded = read_planner(root.path(), "abc").unwrap();
+        assert_eq!(loaded["logs"].as_array().unwrap().len(), 2);
+        assert_eq!(loaded["ownLogSha256"], json!(repaired.own_log_sha256));
+        // Finance and Planner logs live in separate folders.
+        assert_eq!(read_finance(root.path(), "abc").unwrap()["logs"], json!([]));
     }
     #[test]
     fn finance_logs_append_per_device_and_retire_legacy_data() {

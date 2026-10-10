@@ -1,6 +1,6 @@
 # Noter project memory
 
-Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Check current code and Git state before relying on historical verification.
+Last updated: 2026-10-10. This is a durable handoff, not a feature backlog. Check current code and Git state before relying on historical verification.
 
 ## Product decisions and preferences
 
@@ -8,6 +8,7 @@ Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Chec
 - The user synchronizes files with Syncthing. Choose the workspace folder on first launch; keep notes readable as Markdown and shared app data in `.noter`. No hosted backend is needed.
 - The user now runs the desktop app on Windows 11 (WebView2/Chromium, NTFS, Syncthing installed); Windows readiness was a selected priority. Verify editor behavior in Chromium, not only WebKit.
 - Current feature focus is desktop Finance; keep desktop ↔ phone sync reliable. Budgets, bulk editing, monthly reports, date grouping and filtered totals are done. Use Codex's built-in workflow; third-party coding skills were removed at the user's request.
+- Planner (third section, 2026-10-10) on both apps. User decisions: date-only tasks (no times, reminders or extra fields such as notes, lists, priority or subtasks); tasks may be unscheduled; standard repeats (every N days, weeks on chosen weekdays, months by day number or Nth/last weekday, years; ends never/on date/after N) with per-occurrence skip/move; each occurrence completed separately and missed ones become overdue; undone tasks stay on their day plus an Overdue list with Move to today; completed tasks stay visible, struck through; weeks start Monday; not readable in Obsidian is fine, sync reliability matters most. Desktop: month grid plus Unscheduled/Overdue side panel with drag and drop (Alt+arrows move a task by keyboard). Android: compact month with dots, Day/Overdue/Unscheduled tabs, FAB, swipe to change month; no drag (row menu and date picker instead).
 - Finance replaces routine Excel entry. Excel remains the backup/export format. Preserve imported workbook formatting, other sheets, formulas, transaction IDs, and transfers.
 - Prefer compact UI: small Finance row padding, compact account management, convenient category/subcategory selection and database property management.
 - Show an emoji title without an additional generic file icon. New notes ask for a name in a dialog; search offers scope filters.
@@ -43,6 +44,7 @@ Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Chec
 - Last-used section is device-local (`ui.json` on desktop, SharedPreferences on Android). Existing notes JSON backups exclude Finance; export Finance separately to Excel on desktop.
 - Embedded databases round-trip inside fenced `noter-database` Markdown blocks. Preserve metadata IDs and compatibility when changing formats.
 - Desktop vault on Windows: notes decode from UTF-8, UTF-8 BOM or BOM-marked UTF-16 through one decoder (also used by pre-write checks), keeping bytes until edited; read errors name the file. Manifest/disk matching ignores case (paths are unique ignoring case), and case-only renames move entries in place, parents first; never write-then-delete them on case-insensitive volumes. Replace/remove/rename retry ~2 s on Windows errors 5/32/33 (Syncthing opens files without delete sharing), read-only targets are cleared before replacing, and hidden+system entries plus `$RECYCLE.BIN`/`System Volume Information` are skipped.
+- Planner storage: per-device `.noter/planner/log-<device>.jsonl` (same device ID as Finance) with per-field task changes, per-occurrence `occ` changes and final deletions; unknown ops/fields are ignored for forward compatibility. Contract in `docs/FILE_STORAGE.md`; shared fixture `tests/fixtures/file-storage/planner`. Rust `append_planner` shares the Finance tail-repair writer; Android SAF `append` labels recovery files by log folder.
 - Optional Finance `budgets` metadata stores unique month/category limits in integer cents and is preserved in Excel backups. Android's source reads/validates/preserves limits and follows category changes but has no budget controls. Update older Android builds before syncing budget-enabled logs; they reject the new metadata key. Limits use whole-list last-write-wins, with no automatic monthly rollover. Expenses only count toward budgets; income and linked/reserved-category transfers are excluded.
 
 ## Known limitations
@@ -56,6 +58,8 @@ Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Chec
 - A deleted folder that another Windows program uses as its working directory remains on disk and reappears after reload.
 
 ## Validation and repository handoff
+
+- 2026-10-10 Planner: desktop 1.2.0 and Android 0.4.0 (versionCode 6) built on macOS; macOS DMG built, signed APK verified with the same release key (certificate 63d68751…7b31d2). `npm test`: 44 passed, 1 optional workbook check skipped, including 44 Planner Chromium checks (grid, keyboard, quick add, drag and drop, repeat editor, occurrence done/move/skip, overdue, failed-save draft and reload, synced phone changes, HTML-safe titles); `npm run desktop:test` 33 Rust tests; Android JVM `PlannerContractTest` 4 tests replay the shared fixture identically. Android Planner UI compiled (lintVital passed) but not run on an emulator or phone; PlannerFiles SAF paths have no instrumentation test yet.
 
 - 2026-10-05 desktop balances: Windows 1.1.2 MSI/NSIS built, not installed. `npm test`: 39 passed, 1 optional workbook check skipped; 103 Finance and 47 editor Chromium checks passed. Historical balances, account/transfer edits, repeat/add previews, invalid drafts and independent overflow recovery have regression coverage. TypeScript/Vite and native release packaging passed; synthetic ledger screenshot inspected. No storage format changes.
 - 2026-10-04 desktop Finance grouping: delivered Windows 1.1.1 MSI/NSIS. `npm test`: 34 passed, 1 optional private-workbook check skipped, including 90 Finance and 47 editor Chromium assertions plus exact-cent/grouping regression tests. TypeScript/Vite and native release packaging passed; inspected the synthetic grouped-ledger screenshot. Filters, pagination, selection/focus, date-range boundaries, save/reload, transfer sides, empty results and unchanged view-only logs are covered. Installer not run; no dependencies or storage format changes.

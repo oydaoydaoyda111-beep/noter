@@ -101,7 +101,7 @@ export function openSettings(store: Store, accounts: string[] = [], dataActions?
     const control = el('input', 'setting-checkbox'); control.type = 'checkbox'; control.checked = store.workspace.settings[key]; control.onchange = () => store.configure({ [key]: control.checked }); row(label, description, control);
   }
   section = panels[1].panel;
-  selectSetting('startupSection', 'Start in', 'The section shown when you next open Noter.', [['last', 'Last used section'], ['notes', 'Notes'], ['finance', 'Finance']]);
+  selectSetting('startupSection', 'Start in', 'The section shown when you next open Noter.', [['last', 'Last used section'], ['notes', 'Notes'], ['finance', 'Finance'], ['planner', 'Planner']]);
   toggleSetting('spellcheck', 'Spellcheck', 'Check spelling while writing notes.');
   toggleSetting('showNoteStats', 'Word and character counts', 'Show note statistics in the status bar.');
   selectSetting('autosaveDelay', 'Autosave', 'How soon edits are stored on this device.', [['250', '250 ms'], ['650', '650 ms'], ['1200', '1.2 seconds'], ['2000', '2 seconds']]);

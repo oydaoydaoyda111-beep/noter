@@ -172,18 +172,20 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
         if (expected != null && (existing == null || !baseline.contentEquals(expected))) {
             throw SyncConflictException("The file changed while preparing the save. Both versions have been kept.")
         }
-        // A leading newline is the Finance parser's incomplete-tail signal, not a valid new batch.
+        // A leading newline is the log parsers' incomplete-tail signal, not a valid new batch.
+        val log = if (path.startsWith(".noter/planner/")) "planner" else "finance"
+        val tooLarge = "${log.replaceFirstChar { it.uppercase() }} logs are larger than 100 MB."
         val leadingNewline = bytes.firstOrNull() == '\n'.code.toByte()
         if (leadingNewline || path in failedAppends) {
             val batch = if (leadingNewline) bytes.copyOfRange(1, bytes.size) else bytes
             if (existing != null) {
-                if (existing.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
+                if (existing.size > 100_000_000) throw IOException(tooLarge)
                 val previous = baseline
-                if (previous.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
+                if (previous.size > 100_000_000) throw IOException(tooLarge)
                 if (previous.isNotEmpty() && previous.last() != '\n'.code.toByte()) {
-                    writeAtomic(".noter/trash/finance-interrupted-${UUID.randomUUID()}.jsonl", previous)
+                    writeAtomic(".noter/trash/$log-interrupted-${UUID.randomUUID()}.jsonl", previous)
                     val complete = previous.indexOfLast { it == '\n'.code.toByte() } + 1
-                    if (complete.toLong() + batch.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
+                    if (complete.toLong() + batch.size > 100_000_000) throw IOException(tooLarge)
                     writeAtomic(path, previous.copyOf(complete) + batch, previous)
                     failedAppends.remove(path)
                     return@synchronized
@@ -193,7 +195,7 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
             append(path, batch, expected, mustBeAbsent)
             return@synchronized
         }
-        if (baseline.size.toLong() + bytes.size > 100_000_000) throw IOException("Finance logs are larger than 100 MB.")
+        if (baseline.size.toLong() + bytes.size > 100_000_000) throw IOException(tooLarge)
         val target = existing?.let { uri(it.doc) }
             ?: DocumentsContract.createDocument(resolver, uri(parent), "application/octet-stream", name)
             ?: throw IOException("Could not create \"$name\".")
@@ -213,7 +215,7 @@ class Saf(private val resolver: ContentResolver, private val tree: Uri, privateF
                 val after = runCatching { read(DocumentsContract.getDocumentId(target)) }.getOrNull()
                 if (after != null && (after.size < baseline.size || !after.copyOfRange(0, baseline.size).contentEquals(baseline))) {
                     try {
-                        writeAtomic(".noter/trash/finance-append-recovery-${UUID.randomUUID()}.jsonl", baseline, mustBeAbsent = true)
+                        writeAtomic(".noter/trash/$log-append-recovery-${UUID.randomUUID()}.jsonl", baseline, mustBeAbsent = true)
                     } catch (recovery: Exception) {
                         recovery.addSuppressed(problem)
                         throw recovery

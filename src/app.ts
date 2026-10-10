@@ -1,4 +1,4 @@
-import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits, saveViewState } from './desktop/platform';
+import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, plannerChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits, saveViewState } from './desktop/platform';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createStore } from './state/workspace';
@@ -16,6 +16,8 @@ import { nameEmoji } from './ui/emoji';
 import { el } from './ui/dom';
 import type { WorkspaceNode } from './types';
 import { createFinance } from './finance/finance';
+import { createPlanner } from './planner/planner';
+import type { Section } from './desktop/platform';
 
 export async function startApp(mount: HTMLElement) {
   const loaded = await storage.load();
@@ -27,7 +29,7 @@ export async function startApp(mount: HTMLElement) {
           <div class="brand-mark" aria-hidden="true"><span>n</span></div>
           <div class="brand-copy"><span class="brand-name">noter<span class="brand-period">.</span></span><span class="workspace-name">Personal workspace</span></div>
         </div>
-        <nav class="workspace-sections" aria-label="Workspace sections"><button id="notes-section" type="button" aria-pressed="true">Notes</button><button id="finance-section" type="button" aria-pressed="false">Finance</button></nav>
+        <nav class="workspace-sections" aria-label="Workspace sections"><button id="notes-section" type="button" aria-pressed="true">Notes</button><button id="finance-section" type="button" aria-pressed="false">Finance</button><button id="planner-section" type="button" aria-pressed="false">Planner</button></nav>
         <div class="create-actions">
           <button class="new-note-button" id="new-note" type="button"><span>New note</span><kbd class="new-note-key"></kbd></button>
           <button class="new-folder-button icon-button" id="new-folder" type="button" title="New folder" aria-label="New folder"></button>
@@ -48,6 +50,7 @@ export async function startApp(mount: HTMLElement) {
       <main class="workspace">
         <div class="tab-bar"><div id="tabs" class="tabs"></div><div class="tab-bar-end"><span class="workspace-label">YOUR SPACE, IN FOCUS</span></div></div>
         <section id="finance-panel" class="finance-panel" aria-label="Finance workspace" hidden></section>
+        <section id="planner-panel" class="finance-panel planner-panel" aria-label="Planner" hidden></section>
         <section id="note-panel" class="note-panel" role="tabpanel" aria-label="Active note">
           <div class="workspace-topline">
             <div id="breadcrumb" class="breadcrumb" aria-label="Note location"></div>
@@ -86,18 +89,20 @@ export async function startApp(mount: HTMLElement) {
   const warning = get('storage-warning');
   function applicationSettings() { openSettings(store, finance.accounts(), { reload: reloadFiles, chooseFolder: switchFolder, exportNotes, importNotes }); }
   const finance = createFinance(get('finance-panel'), () => store.workspace.settings, applicationSettings, name => store.configure({ financeDefaultAccount: name }));
-  let showingFinance = false;
-  function section(isFinance: boolean) {
-    commitTitle(); showingFinance = isFinance;
-    get('notes-section').setAttribute('aria-pressed', String(!isFinance));
-    get('finance-section').setAttribute('aria-pressed', String(isFinance));
-    if (isFinance) finance.show(); else finance.hide();
+  const planner = createPlanner(get('planner-panel'));
+  let current: Section = 'notes';
+  // Notes stay mounted behind Finance and Planner so the editor keeps its selection and history.
+  function section(name: Section) {
+    commitTitle(); current = name;
+    for (const item of ['notes', 'finance', 'planner'] as const) get(`${item}-section`).setAttribute('aria-pressed', String(item === name));
+    if (name === 'finance') finance.show(); else finance.hide();
+    if (name === 'planner') planner.show(); else planner.hide();
     renderNote();
-    if (isFinance) document.title = 'Finance — Noter';
-    void saveLastSection(isFinance ? 'finance' : 'notes').catch(() => { /* Navigation still works if device preferences cannot be saved. */ });
+    void saveLastSection(name).catch(() => { /* Navigation still works if device preferences cannot be saved. */ });
   }
-  get('notes-section').onclick = () => section(false);
-  get('finance-section').onclick = () => section(true);
+  get('notes-section').onclick = () => section('notes');
+  get('finance-section').onclick = () => section('finance');
+  get('planner-section').onclick = () => section('planner');
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let titleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -146,7 +151,7 @@ export async function startApp(mount: HTMLElement) {
     if (shownNoteId && store.workspace.nodes[shownNoteId] && title.value.trim() && title.value.trim() !== store.workspace.nodes[shownNoteId].name) store.rename(shownNoteId, title.value);
   }
 
-  function open(id: string) { section(false); store.open(id); }
+  function open(id: string) { section('notes'); store.open(id); }
 
   let creatingNote = false;
   async function createNote(parentId: string | null) {
@@ -162,7 +167,7 @@ export async function startApp(mount: HTMLElement) {
         submit: 'Create note', nameEmoji: true,
       });
       if (!answer) return;
-      section(false);
+      section('notes');
       store.create('note', answer.name, parentId);
       editor.focus();
     } finally {
@@ -219,7 +224,7 @@ export async function startApp(mount: HTMLElement) {
 
   function renderNote() {
     const note = store.activeNote;
-    panel.hidden = showingFinance || !note; get('workspace-empty').hidden = showingFinance || !!note;
+    panel.hidden = current !== 'notes' || !note; get('workspace-empty').hidden = current !== 'notes' || !!note;
     get('breadcrumb').replaceChildren();
     get('document').querySelector<HTMLElement>('.document-symbol')!.hidden = !!note && !!nameEmoji(note.name);
     if (note) {
@@ -239,7 +244,7 @@ export async function startApp(mount: HTMLElement) {
       if (note) animateDocument(documentPage);
     }
     updateStats();
-    if (showingFinance) document.title = 'Finance — Noter';
+    if (current !== 'notes') document.title = `${current === 'finance' ? 'Finance' : 'Planner'} — Noter`;
   }
 
   function renderCount() {
@@ -322,8 +327,8 @@ export async function startApp(mount: HTMLElement) {
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
     switch (event.key.toLowerCase()) {
       case 's': event.preventDefault(); commitTitle(); void saveNow().then(success => { if (success) notify('Saved to workspace folder'); }); break;
-      case 'f': event.preventDefault(); if (showingFinance) finance.focusSearch(); else search.focus(); break;
-      case 'n': event.preventDefault(); createNote(tree.destination); break;
+      case 'f': event.preventDefault(); if (current === 'finance') finance.focusSearch(); else if (current === 'notes') search.focus(); break;
+      case 'n': event.preventDefault(); if (current === 'planner') planner.focusNew(); else createNote(tree.destination); break;
       case 'w': if (store.activeNote) { event.preventDefault(); commitTitle(); void tabs.close(store.activeNote.id); } break;
     }
   });
@@ -343,11 +348,11 @@ export async function startApp(mount: HTMLElement) {
     if (answer) { store.replace(next); await saveNow(); }
   }
   async function switchFolder() {
-    commitTitle(); if (!await saveNow() || finance.isBusy()) { notify('Finish saving your changes before switching folders.'); return; }
+    commitTitle(); if (!await saveNow() || finance.isBusy() || planner.isBusy()) { notify('Finish saving your changes before switching folders.'); return; }
     try { await flushFiles(); if (await chooseFolder()) location.reload(); } catch (error) { notify(String(error)); }
   }
   async function reloadFiles(automatic = false) {
-    if (polling || finance.isBusy()) return;
+    if (polling || finance.isBusy() || planner.isBusy()) return;
     commitTitle(); clearTimeout(saveTimer);
     polling = true;
     try {
@@ -366,7 +371,7 @@ export async function startApp(mount: HTMLElement) {
       const incoming = active ? next.nodes[active.id] : null;
       keepEditorOnReload = !recovery && next.activeNoteId === active?.id && incoming?.type === 'note' && incoming.markdown === active.markdown;
       adoptWorkspaceSnapshot(snapshot); applyingDisk = true; store.replace(next); applyingDisk = false; keepEditorOnReload = false; unsaved = false; loaded.warning = undefined;
-      await finance.reload(); warning.hidden = recovery === null; saveStatus.dataset.state = 'saved'; get('save-label').textContent = recovery ? 'Both versions kept' : 'Synced files loaded'; if (recovery || !automatic) notify(recovery ? 'Your edits were preserved; synced files loaded' : 'Workspace reloaded from files');
+      await finance.reload(); await planner.reload(); warning.hidden = recovery === null; saveStatus.dataset.state = 'saved'; get('save-label').textContent = recovery ? 'Both versions kept' : 'Synced files loaded'; if (recovery || !automatic) notify(recovery ? 'Your edits were preserved; synced files loaded' : 'Workspace reloaded from files');
     } catch (error) { warning.textContent = String(error); warning.hidden = false; }
     finally { applyingDisk = false; keepEditorOnReload = false; polling = false; }
   }
@@ -374,25 +379,25 @@ export async function startApp(mount: HTMLElement) {
   const currentWindow = getCurrentWindow();
   await currentWindow.onCloseRequested(async event => {
     event.preventDefault(); commitTitle();
-    if (finance.isBusy()) { notify('Wait for Finance to finish saving before closing.'); return; }
+    if (finance.isBusy() || planner.isBusy()) { notify('Wait for Finance and Planner to finish saving before closing.'); return; }
     if (!await saveNow()) return;
     try { await flushFiles(); await currentWindow.destroy(); } catch (error) { notify(String(error)); }
   });
   await listen<string>('desktop-command', event => {
     if (event.payload === 'quit') { void currentWindow.close(); return; }
     if (document.querySelector('dialog[open]')) return;
-    if (event.payload === 'new-note') void createNote(tree.destination);
+    if (event.payload === 'new-note') { if (current === 'planner') planner.focusNew(); else void createNote(tree.destination); }
     if (event.payload === 'settings') applicationSettings();
     if (event.payload === 'save') { commitTitle(); void saveNow(); }
     if (event.payload === 'folder') void switchFolder();
     if (event.payload === 'reload') void reloadFiles();
   });
   async function checkSyncedFiles(force = false) {
-    if (document.hidden || checkingFiles || polling || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
+    if (document.hidden || checkingFiles || polling || unsaved || finance.isBusy() || planner.isBusy() || document.querySelector('dialog[open]')) return;
     checkingFiles = true;
     try {
-      const results = await Promise.allSettled([workspaceChanged(force), financeChanged()]);
-      if (document.hidden || unsaved || finance.isBusy() || document.querySelector('dialog[open]')) return;
+      const results = await Promise.allSettled([workspaceChanged(force), financeChanged(), plannerChanged()]);
+      if (document.hidden || unsaved || finance.isBusy() || planner.isBusy() || document.querySelector('dialog[open]')) return;
       if (results.some(result => result.status === 'fulfilled' && result.value)) { await reloadFiles(true); return; }
       const failed = results.find(result => result.status === 'rejected');
       if (failed?.status === 'rejected') { warning.textContent = `Could not check synced files: ${String(failed.reason)}`; warning.hidden = false; }
@@ -401,6 +406,9 @@ export async function startApp(mount: HTMLElement) {
   setInterval(() => void checkSyncedFiles(), 5000);
 
   applySettings(store.workspace.settings); tree.render(); tabs.render(); renderNote(); renderCount();
-  try { const startup = store.workspace.settings.startupSection; if ((startup === 'last' ? await readLastSection() : startup) === 'finance') section(true); } catch { if (store.workspace.settings.startupSection === 'finance') section(true); }
+  const startup = store.workspace.settings.startupSection;
+  let first: Section = startup === 'last' ? 'notes' : startup;
+  try { if (startup === 'last') first = await readLastSection(); } catch { /* Start in Notes when device preferences are unavailable. */ }
+  if (first !== 'notes') section(first);
   if (loaded.warning) { warning.textContent = loaded.warning; warning.hidden = false; }
 }

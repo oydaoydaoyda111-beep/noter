@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en" data-motion="none">
+<meta charset="utf-8">
+<title>Noter Planner regression check</title>
+<style>html,body{height:100%;margin:0;overflow:hidden}#planner{height:100%;overflow:auto;box-sizing:border-box}#result{position:fixed;bottom:0;right:0;font-size:10px}</style>
+<body data-planner-check="pending">
+<main id="planner" class="finance-panel planner-panel"></main>
+<pre id="result"></pre>
+<script type="module">
+import '../src/styles/tokens.css';
+import '../src/styles/app.css';
+import '../src/styles/finance.css';
+import '../src/styles/planner.css';
+import { mockIPC } from '@tauri-apps/api/mocks';
+import { createPlanner } from '../src/planner/planner.ts';
+import { batchLine, parsePlannerLogs, replayPlanner, occurrencesBetween } from '../src/planner/model.ts';
+import { addDays, localToday, weekday } from '../src/planner/dates.ts';
+
+const today = localToday(), yesterday = addDays(today, -1), tomorrow = addDays(today, 1);
+const monday = addDays(today, 1 - weekday(today));
+const seed = [
+  { k: 'task', id: 'late', set: { title: 'Renew passport', date: addDays(today, -3), repeat: null, done: false, created: 1 } },
+  { k: 'task', id: 'hostile', set: { title: '<img src=x onerror="document.body.dataset.injected=1">', date: tomorrow, repeat: null, done: false, created: 2 } },
+  { k: 'task', id: 'phone-edit', set: { title: 'Written on the phone', date: null, repeat: null, done: false, created: 3 } },
+];
+const disk = [{ name: 'log-phone.jsonl', text: batchLine('phone', 0, 1, seed).line }];
+let failure = false, checks = 0, revision = 1;
+mockIPC((command, args) => {
+  if (command === 'load_planner') return { logs: disk.map(file => ({ ...file })), revision: `r${revision}`, device: 'desktop', ownLogSha256: null };
+  if (command === 'planner_revision') return `r${revision}`;
+  if (command === 'append_planner') {
+    if (failure) throw new Error('Synthetic save failure');
+    const own = disk.find(file => file.name === 'log-desktop.jsonl');
+    if (own) own.text += args.line; else disk.push({ name: 'log-desktop.jsonl', text: args.line });
+    revision++; return { revision: `r${revision}`, ownLogSha256: null };
+  }
+  throw new Error(`Unexpected fixture command: ${command}`);
+});
+const root = document.getElementById('planner'), pause = (ms = 40) => new Promise(resolve => setTimeout(resolve, ms));
+const state = () => replayPlanner(parsePlannerLogs(disk, 'desktop').batches);
+const ops = () => disk.flatMap(file => file.text.split('\n').filter(Boolean).map(line => JSON.parse(line))).filter(batch => batch.dev === 'desktop').flatMap(batch => batch.ops);
+function equal(actual, expected, label) { if (actual !== expected) throw new Error(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`); checks++; }
+function control(label, target = document) { const item = target.querySelector(`[aria-label="${CSS.escape(label)}"]`) ?? [...target.querySelectorAll('button')].find(button => button.textContent === label); if (!item) throw new Error(`Missing control: ${label}`); return item; }
+const dialog = () => document.querySelector('dialog[open]');
+function chooseDays(days) {
+  for (const name of ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']) if (!days.includes(name)) continue; else if (control(name, dialog()).getAttribute('aria-pressed') !== 'true') control(name, dialog()).click();
+  for (const name of ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']) if (!days.includes(name) && control(name, dialog()).getAttribute('aria-pressed') === 'true') control(name, dialog()).click();
+}
+function input(item, value, event = 'input') { item.value = value; item.dispatchEvent(new Event(event, { bubbles: true })); }
+async function closeAfter(action) {
+  const open = dialog(); const finished = new Promise(resolve => open.addEventListener('close', resolve, { once: true }));
+  action(open); await finished; await pause();
+}
+const cell = date => root.querySelector(`.planner-day[data-date="${date}"]`);
+const row = (id, on) => root.querySelector(`.planner-task[data-task="${id}"]${on ? `[data-on="${on}"]` : ''}`);
+function key(target, key, options = {}) { target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options })); }
+function drag(source, target) {
+  const data = new DataTransfer();
+  source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: data }));
+  target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: data }));
+  target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: data }));
+  source.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: data }));
+}
+
+try {
+  const planner = createPlanner(root); planner.show(); await pause();
+  equal(root.querySelectorAll('.planner-day').length, 42, 'month grid shows six Monday-first weeks');
+  equal(root.querySelector('.planner-weekday-name').textContent, 'Mon', 'weeks start on Monday');
+  equal(cell(today).classList.contains('is-today'), true, 'today is highlighted');
+  equal(cell(today).tabIndex, 0, 'today is the grid tab stop');
+  equal(document.body.dataset.injected, undefined, 'task titles never become HTML');
+  equal(row('hostile').textContent.includes('<img'), true, 'hostile title is shown as text');
+  equal(root.querySelector('.planner-overdue .planner-count').textContent, '1', 'past open task is overdue');
+  equal(row('late').classList.contains('is-overdue'), true, 'overdue task is marked on its day');
+
+  // Quick add keeps a task unscheduled.
+  const quick = control('New unscheduled task', root); input(quick, 'Buy stamps'); quick.form.requestSubmit(); await pause();
+  const stamps = [...state().tasks.values()].find(task => task.title === 'Buy stamps');
+  equal(stamps?.date, null, 'quick add creates an unscheduled task');
+  equal(document.activeElement, control('New unscheduled task', root), 'quick add keeps focus for the next task');
+  equal(root.querySelector('.planner-inbox .planner-count').textContent, '2', 'unscheduled count includes open tasks');
+
+  // Dragging from Unscheduled schedules it; dragging back unschedules it.
+  drag(row(stamps.id), cell(tomorrow)); await pause();
+  equal(state().tasks.get(stamps.id).date, tomorrow, 'dropping on a day schedules the task');
+  drag(row(stamps.id), root.querySelector('.planner-inbox')); await pause();
+  equal(state().tasks.get(stamps.id).date, null, 'dropping on Unscheduled removes the date');
+
+  // Keyboard: arrows move between days, Enter opens a new task on that day.
+  cell(today).focus(); key(cell(today), 'ArrowRight');
+  equal(document.activeElement, cell(tomorrow), 'ArrowRight moves to the next day');
+  key(document.activeElement, 'ArrowLeft'); key(document.activeElement, 'Enter'); await pause();
+  equal(dialog().querySelector('input[type="date"]').value, today, 'Enter opens a new task on the focused day');
+  const [title, date] = dialog().querySelectorAll('input.field-input');
+  input(title, 'Water plants 🌱');
+  const frequency = dialog().querySelector('.planner-repeat select'); input(frequency, 'week', 'input');
+  equal(control(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][weekday(today) - 1], dialog()).getAttribute('aria-pressed'), 'true', 'the start weekday is selected by default');
+  chooseDays(['Monday', 'Wednesday']);
+  equal(dialog().querySelector('.planner-summary').textContent, 'Every week on Mon, Wed', 'weekly summary follows chosen days');
+  input(frequency, 'month'); equal(dialog().querySelector('[aria-label="Monthly on"]').hidden, false, 'monthly choice appears for monthly rules');
+  input(frequency, 'week');
+  const ends = control('Ends', dialog()); input(ends, 'count'); input(control('Number of times', dialog()), '6');
+  equal(dialog().querySelector('.planner-summary').textContent.endsWith('6 times'), true, 'end after a count is described');
+  input(date, ''); equal(frequency.disabled, true, 'repeat needs a date'); input(date, today); input(frequency, 'week');
+  equal(dialog().querySelector('.planner-summary').textContent.startsWith('Every week on Mon, Wed'), true, 'chosen weekdays survive changing the date');
+  await closeAfter(open => open.querySelector('form').requestSubmit());
+  const plants = [...state().tasks.values()].find(task => task.title === 'Water plants 🌱');
+  equal(JSON.stringify(plants.repeat), JSON.stringify({ every: 'week', interval: 1, weekdays: [1, 3], count: 6 }), 'weekly rule is saved canonically');
+  const series = occurrencesBetween(state(), today, addDays(today, 60)).filter(item => item.task.id === plants.id);
+  equal(series.length, 6, 'counted series stops after six occurrences');
+  equal(series.every(item => [1, 3].includes(weekday(item.date))), true, 'occurrences fall on Monday and Wednesday');
+  const first = series[0], second = series[1];
+  equal(!!row(plants.id, first.on), first.date.slice(0, 7) === today.slice(0, 7) || root.querySelector(`.planner-day[data-date="${first.date}"]`) !== null, 'first occurrence is on the calendar');
+
+  // Completing one occurrence leaves the others open.
+  const firstRow = row(plants.id, first.on); const check = firstRow.querySelector('.planner-check'); check.focus(); check.checked = true; check.dispatchEvent(new Event('change')); await pause();
+  equal(ops().at(-1).k, 'occ', 'completing a repeating occurrence records an occurrence change');
+  equal(row(plants.id, first.on).classList.contains('is-done'), true, 'completed occurrence is struck through');
+  equal(document.activeElement, row(plants.id, first.on).querySelector('.planner-check'), 'focus stays on the completed checkbox');
+  const reopened = occurrencesBetween(state(), today, addDays(today, 60)).filter(item => item.task.id === plants.id);
+  equal(reopened.filter(item => item.done).length, 1, 'other occurrences stay open');
+
+  // Moving one occurrence with the keyboard moves only that occurrence.
+  if (row(plants.id, second.on)) {
+    const titleButton = row(plants.id, second.on).querySelector('.planner-task-title'); titleButton.focus();
+    key(titleButton, 'ArrowRight', { altKey: true }); await pause();
+    const moved = occurrencesBetween(state(), today, addDays(today, 60)).find(item => item.task.id === plants.id && item.on === second.on);
+    equal(moved.date, addDays(second.on, 1), 'Alt+ArrowRight moves one occurrence a day later');
+    equal(state().tasks.get(plants.id).date, today, 'moving an occurrence keeps the series start');
+    equal(document.activeElement, row(plants.id, second.on)?.querySelector('.planner-task-title') ?? document.activeElement, 'focus follows the moved occurrence');
+  }
+
+  // Overdue: Move to today.
+  control('Move Renew passport to today', root).click(); await pause();
+  equal(state().tasks.get('late').date, today, 'Today moves an overdue task');
+  equal(root.querySelector('.planner-overdue'), null, 'overdue section disappears when nothing is late');
+
+  // Deleting one occurrence of a series skips it only.
+  row(plants.id, first.on).querySelector('.planner-task-title').click(); await pause();
+  control('Delete…', dialog()).click(); await pause(80);
+  await closeAfter(open => control('Only this occurrence', open).click());
+  equal(JSON.stringify(state().exceptions.get(plants.id).get(first.on)), JSON.stringify({ skip: true }), 'only this occurrence is skipped');
+  equal(state().tasks.has(plants.id), true, 'series remains after skipping one occurrence');
+
+  // Editing a task title records only the changed field.
+  row('hostile').querySelector('.planner-task-title').click(); await pause();
+  input(dialog().querySelector('input.field-input'), 'Plain title');
+  await closeAfter(open => open.querySelector('form').requestSubmit());
+  equal(JSON.stringify(ops().at(-1)), JSON.stringify({ k: 'task', id: 'hostile', set: { title: 'Plain title' } }), 'edits append only changed fields');
+
+  // A failed save keeps the dialog draft and requires a reload.
+  row('phone-edit').querySelector('.planner-task-title').click(); await pause();
+  input(dialog().querySelector('input.field-input'), 'Draft survives'); failure = true;
+  dialog().querySelector('form').requestSubmit(); await pause(80);
+  equal(dialog().querySelector('input.field-input').value, 'Draft survives', 'failed save keeps the draft');
+  equal(dialog().querySelector('.finance-error').textContent.length > 0, true, 'failed save explains the problem');
+  await closeAfter(open => control('Cancel', open).click());
+  equal(!!control('Reload Planner', root), true, 'failed save asks for a reload');
+  failure = false; await planner.reload(); await pause();
+  equal(state().tasks.get('phone-edit').title, 'Written on the phone', 'failed save did not change the logs');
+  equal(!!cell(today), true, 'reload restores the calendar');
+
+  // Incoming phone changes appear after reload without duplicating batches.
+  disk[0].text += batchLine('phone', 100, 2, [{ k: 'task', id: 'phone-edit', set: { done: true } }]).line; revision++;
+  await planner.reload(); await pause();
+  equal(row('phone-edit').classList.contains('is-done'), true, 'synced completion from the phone appears');
+  equal(root.querySelector('.planner-inbox .planner-task:last-child')?.dataset.task, 'phone-edit', 'completed unscheduled tasks sort last');
+
+  cell(today).focus();
+  document.body.dataset.plannerCheck = 'passed'; document.getElementById('result').textContent = `${checks} planner checks passed.`;
+} catch (error) { document.body.dataset.plannerCheck = 'failed'; document.getElementById('result').textContent = error.stack; }
+</script>
+</body>
+</html>

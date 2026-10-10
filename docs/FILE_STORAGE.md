@@ -45,6 +45,24 @@ Each installation has its own persistent device ID and writes `.noter/finance/lo
 
 The two synthetic device logs and `expected-finance.json` in the shared fixture directory verify replay, Unicode, transfers, account recovery, metadata and numeric compatibility on both clients.
 
+## Planner log v1
+
+Planner uses the same per-device approach as Finance: each installation appends to `.noter/planner/log-<device>.jsonl` (the same device ID that names its Finance log) and every device reads all logs. Each complete line is one batch:
+
+```json
+{"v":1,"ts":1000,"dev":"example","seq":1,"ops":[{"k":"task","id":"t1","set":{"title":"Gym","date":"2026-10-05","repeat":{"every":"week","interval":2,"weekdays":[1,4]},"done":false,"created":1000}}]}
+```
+
+- Operations: `task` sets some fields of one task (`set` holds only the changed fields), `del` deletes a task, and `occ` records how one occurrence of a repeating task differs from its rule.
+- Task fields: `title` (1–500 UTF-16 code units, not blank), `date` (`YYYY-MM-DD` or `null` for Unscheduled), `repeat` (rule or `null`), `done` (single tasks), `created` (milliseconds, used for ordering). There are no times; dates have no time zone.
+- `repeat`: `every` is `day`, `week`, `month` or `year`; `interval` 1–999; optional `weekdays` (ISO, Monday = 1; weekly only; defaults to the start date's weekday); optional `monthly: "weekday"` (the start date's weekday position, e.g. second Tuesday, or the last one when the start is on day 29 or later; otherwise monthly rules use the start's day number, clamped to short months); optional `until` (inclusive date) and `count` (1–10,000 generated dates, including skipped ones). Yearly rules on 29 February fall on 28 February in other years. A rule needs a `date`; without one the task is Unscheduled.
+- `occ` is keyed by task ID and the date the rule produced (`on`). Its `value` is `null` (no change) or an object with any of `done: true`, `skip: true` and `move: "YYYY-MM-DD"`. Each occurrence is completed separately; open past occurrences are overdue.
+- Replay order is (ts, dev, seq), as in Finance. The latest change wins per task field and per occurrence, so different fields edited on two devices both survive. A deletion is final: later changes to that task are ignored. "This and following" deletion sets `until` to the day before; deleting from the first occurrence deletes the task.
+- Readers ignore unknown operation kinds and unknown task fields so newer clients can extend the format. Known fields and operations are validated; any invalid completed line stops loading without discarding data. The same incomplete-tail repair, interrupted-write backups in `.noter/trash` and reload-after-failed-append rules as Finance apply.
+- Sorting uses code-unit string order on both clients: date, open before done, creation time, then ID.
+
+The two synthetic device logs and `expected-planner.json` in `tests/fixtures/file-storage/planner/` verify replay, recurrence, moves, skips, deletion, unknown fields and the overdue/unscheduled lists. Desktop checks them in `npm test`; Android checks them in the JVM test `:app:testDebugUnitTest`.
+
 ## Replacement and synchronization boundaries
 
 Both apps offer **Keep edits and reload** when notes have unsaved work. Changed or renamed/moved local notes are compared with the last acknowledged workspace and copied into a new `Recovered edits <timestamp>-<uuid>/` folder with their hierarchy and Markdown intact. Incoming originals are preserved. Each recovery also writes `.noter/recovery/<timestamp>-<uuid>/workspace.json`: a v1 notes backup containing note bodies, folders, settings and deletion intent, in the same shape as desktop notes exports. Finance stays in its own logs.
@@ -53,6 +71,6 @@ Recovery files are verified before reloading; a backup failure or further typing
 
 Desktop writes flush temporary files to disk before rename. Android SAF replacement uses a completed, verified `.noter-write-*.new` sibling, a preserved `.old` document, and a fsynced device-private journal. On interruption, that installation restores the old document only when the target is missing; an externally created target is preserved. Recovery never consumes another device's journal or incomplete temporary content. SAF replacement and a multi-file workspace are not single atomic transactions.
 
-Keep `.noter-*.tmp` and `.noter-write-*` out of synchronization using each device's Syncthing ignore list. Keep `.noter/workspace.json`, Finance logs, workbook and wanted recovery snapshots included. Noter does not change existing ignore rules automatically. [Syncthing ignore syntax](https://docs.syncthing.net/users/ignoring.html).
+Keep `.noter-*.tmp` and `.noter-write-*` out of synchronization using each device's Syncthing ignore list. Keep `.noter/workspace.json`, Finance and Planner logs, workbook and wanted recovery snapshots included. Noter does not change existing ignore rules automatically. [Syncthing ignore syntax](https://docs.syncthing.net/users/ignoring.html).
 
 Logs and recovery snapshots currently grow without compaction or automatic retention. Shared metadata can still produce Syncthing conflicts when two devices restructure notes at the same time, and same-record Finance changes use last-write-wins. The file contract does not imply conflict-free concurrent editing.

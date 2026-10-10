@@ -1,6 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Finance } from '../finance/model';
 import { batchLine, diffFinance, parseLogs, replayFinance, type FinanceData, type FinanceOp, type LogFile } from '../finance/log.ts';
+import { batchLine as plannerLine, parsePlannerLogs, replayPlanner, type Planner, type PlannerBatch, type PlannerOp } from '../planner/model.ts';
 export const desktop = isTauri();
 export let workspacePath = '';
 let revision = '', financeRevision = '';
@@ -8,8 +9,9 @@ let workspaceBase: unknown;
 let workspaceQueue: Promise<unknown> = Promise.resolve(), financeQueue: Promise<unknown> = Promise.resolve();
 export async function selectedFolder() { const path = await invoke<string | null>('workspace_folder'); workspacePath = path ?? ''; return path; }
 export async function chooseFolder() { const path = await invoke<string | null>('choose_workspace_folder'); if (path) workspacePath = path; return path; }
-export function readLastSection() { return invoke<'notes' | 'finance'>('read_last_section'); }
-export function saveLastSection(section: 'notes' | 'finance') { return invoke<void>('save_last_section', { section }); }
+export type Section = 'notes' | 'finance' | 'planner';
+export function readLastSection() { return invoke<Section>('read_last_section'); }
+export function saveLastSection(section: Section) { return invoke<void>('save_last_section', { section }); }
 export interface WorkspaceSnapshot { workspace: unknown; revision: string; path: string }
 export async function readWorkspaceSnapshot() { return invoke<WorkspaceSnapshot>('load_workspace'); }
 export function adoptWorkspaceSnapshot(loaded: WorkspaceSnapshot) { revision = loaded.revision; workspacePath = loaded.path; workspaceBase = JSON.parse(JSON.stringify(loaded.workspace)); }
@@ -112,7 +114,42 @@ export function saveFinanceFile(data: Finance) {
   });
   financeQueue = operation; return operation;
 }
-export async function flushFiles() { await Promise.all([workspaceQueue, financeQueue]); }
+let plannerDevice = '', plannerClock = 0, plannerSeq = 0, plannerNewline = false, plannerRevision = '';
+let plannerOwnLog: string | null = null, plannerNeedsReload = false, plannerBatches: PlannerBatch[] = [];
+let plannerQueue: Promise<unknown> = Promise.resolve();
+/** Reads every device's Planner log and replays it. */
+export async function loadPlannerFile(): Promise<Planner> {
+  await plannerQueue.catch(() => {}); plannerQueue = Promise.resolve();
+  plannerNeedsReload = true;
+  const loaded = await invoke<{ logs: LogFile[]; revision: string; device: string; ownLogSha256: string | null }>('load_planner');
+  const parsed = parsePlannerLogs(loaded.logs, loaded.device);
+  plannerRevision = loaded.revision; plannerDevice = loaded.device; plannerOwnLog = loaded.ownLogSha256;
+  plannerClock = parsed.clock; plannerSeq = parsed.seq; plannerNewline = parsed.ownNeedsNewline; plannerBatches = parsed.batches;
+  plannerNeedsReload = false;
+  return replayPlanner(plannerBatches);
+}
+/** Planner loads when first opened; until then there is nothing on screen to refresh. */
+export async function plannerChanged() { return plannerDevice !== '' && plannerRevision !== await invoke<string>('planner_revision'); }
+/** Appends one batch to this device's Planner log and returns the replayed result. */
+export function appendPlanner(ops: PlannerOp[]): Promise<Planner> {
+  const operation = plannerQueue.catch(() => {}).then(async () => {
+    if (plannerNeedsReload) throw new Error('Reload Planner before saving again so completed changes are preserved.');
+    const seq = plannerSeq + 1, { line, ts } = plannerLine(plannerDevice, plannerClock, seq, ops);
+    try {
+      const saved = await invoke<{ revision: string; ownLogSha256: string | null }>('append_planner', { line: (plannerNewline ? '\n' : '') + line, expectedOwnLog: plannerOwnLog });
+      plannerOwnLog = saved.ownLogSha256;
+      // Like Finance, only a reload acknowledges batches other devices wrote meanwhile.
+    } catch (error) {
+      plannerNeedsReload = true;
+      throw new Error(`${String(error)} Reload Planner before saving again so completed changes are preserved.`);
+    }
+    plannerClock = ts; plannerSeq = seq; plannerNewline = false;
+    plannerBatches.push({ v: 1, ts, dev: plannerDevice, seq, ops });
+    return replayPlanner(plannerBatches);
+  });
+  plannerQueue = operation; return operation;
+}
+export async function flushFiles() { await Promise.all([workspaceQueue, financeQueue, plannerQueue]); }
 export async function readDocument(extension: 'xlsx' | 'json'): Promise<{ name: string; bytes: Uint8Array } | null> {
   const file = await invoke<{ name: string; bytes: number[] } | null>('open_document', { extension });
   return file ? { name: file.name, bytes: new Uint8Array(file.bytes) } : null;

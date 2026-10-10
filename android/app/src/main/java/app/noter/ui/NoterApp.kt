@@ -82,6 +82,9 @@ import androidx.compose.ui.unit.dp
 import app.noter.model.Folder
 import app.noter.model.Note
 import app.noter.state.FinanceViewModel
+import app.noter.state.PlannerViewModel
+import app.noter.ui.planner.PlannerScreen
+import androidx.compose.material.icons.filled.CalendarMonth
 import app.noter.state.Screen
 import app.noter.ui.finance.FinanceScreen
 import app.noter.state.WorkspaceViewModel
@@ -96,7 +99,7 @@ private sealed interface Dialog {
 }
 
 @Composable
-fun NoterApp(vm: WorkspaceViewModel, financeVm: FinanceViewModel) {
+fun NoterApp(vm: WorkspaceViewModel, financeVm: FinanceViewModel, plannerVm: PlannerViewModel) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) vm.chooseFolder(uri)
     }
@@ -106,12 +109,12 @@ fun NoterApp(vm: WorkspaceViewModel, financeVm: FinanceViewModel) {
                 Screen.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 Screen.NeedFolder -> Message(
                     "Your space to think",
-                    "Notes and finances, in one quiet workspace. Choose a folder to get started. Your Markdown files stay yours and sync with Syncthing.",
+                    "Notes, finances and plans, in one quiet workspace. Choose a folder to get started. Your Markdown files stay yours and sync with Syncthing.",
                 ) { Button(onClick = { picker.launch(null) }, modifier = Modifier.fillMaxWidth()) { Text("Choose workspace folder") } }
                 Screen.Failed -> Message("Could not open the workspace", vm.failure.orEmpty()) {
                     RetryActions(onRetry = vm::reload, onChoose = { picker.launch(null) })
                 }
-                Screen.Ready -> WorkspaceScreen(vm, financeVm) { picker.launch(null) }
+                Screen.Ready -> WorkspaceScreen(vm, financeVm, plannerVm) { picker.launch(null) }
             }
         }
         val failure = vm.failure
@@ -147,7 +150,7 @@ private fun Message(title: String, body: String, actions: @Composable () -> Unit
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel, onChangeFolder: () -> Unit) {
+private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel, plannerVm: PlannerViewModel, onChangeFolder: () -> Unit) {
     val workspace = vm.workspace
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -156,8 +159,10 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
     var dialog by remember { mutableStateOf<Dialog?>(null) }
     var conflictDismissed by remember { mutableStateOf(false) }
     LaunchedEffect(vm.conflict) { if (vm.conflict == null) conflictDismissed = false }
-    LaunchedEffect(vm.treeUri) { vm.treeUri?.let(financeVm::bind) }
+    LaunchedEffect(vm.treeUri) { vm.treeUri?.let { financeVm.bind(it); plannerVm.bind(it) } }
     val showingFinance = vm.section == "finance"
+    val showingPlanner = vm.section == "planner"
+    var plannerMenu by remember { mutableStateOf(false) }
     var financeManager by remember { mutableStateOf<FinanceManager?>(null) }
     var financeMenu by remember { mutableStateOf(false) }
     val imeVisible = WindowInsets.isImeVisible
@@ -167,7 +172,7 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
         SettingsScreen(
             settings = workspace.settings, folderName = vm.folderName, onChange = vm::updateSettings,
             accounts = financeVm.finance?.accounts?.filter { it.archived != true }?.map { it.name }.orEmpty(),
-            onChangeFolder = onChangeFolder, onReload = { settingsOpen = false; vm.reload(); financeVm.reload() }, onClose = { settingsOpen = false },
+            onChangeFolder = onChangeFolder, onReload = { settingsOpen = false; vm.reload(); financeVm.reload(); plannerVm.reload() }, onClose = { settingsOpen = false },
         )
         return
     }
@@ -175,7 +180,7 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
     BackHandler(drawer.isOpen) { scope.launch { drawer.close() } }
     ModalNavigationDrawer(
         drawerState = drawer,
-        gesturesEnabled = drawer.isOpen || (!imeVisible && !showingFinance),
+        gesturesEnabled = drawer.isOpen || (!imeVisible && !showingFinance && !showingPlanner),
         drawerContent = {
             ModalDrawerSheet(drawerContainerColor = MaterialTheme.colorScheme.surfaceContainerLow) {
                 TreePanel(
@@ -196,7 +201,7 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
                 TopAppBar(
                     title = {
                         Column {
-                            Text(if (showingFinance) "Finance" else "Notes", style = MaterialTheme.typography.titleLarge)
+                            Text(if (showingFinance) "Finance" else if (showingPlanner) "Planner" else "Notes", style = MaterialTheme.typography.titleLarge)
                             Text(vm.folderName.ifEmpty { "Noter" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     },
@@ -210,6 +215,13 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
                                     DropdownMenuItem(text = { Text("Manage accounts") }, onClick = { financeMenu = false; financeManager = FinanceManager.Accounts })
                                     DropdownMenuItem(text = { Text("Manage categories") }, onClick = { financeMenu = false; financeManager = FinanceManager.Categories })
                                     DropdownMenuItem(text = { Text("Reload synced files") }, onClick = { financeMenu = false; financeVm.reload() })
+                                }
+                            }
+                        } else if (showingPlanner) {
+                            Box {
+                                IconButton(onClick = { plannerMenu = true }) { Icon(Icons.Default.MoreVert, contentDescription = "Planner actions") }
+                                DropdownMenu(expanded = plannerMenu, onDismissRequest = { plannerMenu = false }) {
+                                    DropdownMenuItem(text = { Text("Reload synced files") }, onClick = { plannerMenu = false; plannerVm.reload() })
                                 }
                             }
                         } else {
@@ -232,12 +244,16 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
                         windowInsets = WindowInsets(0, 0, 0, 0),
                     ) {
                         NavigationBarItem(
-                            selected = !showingFinance, onClick = { vm.showSection("notes") },
+                            selected = !showingFinance && !showingPlanner, onClick = { vm.showSection("notes") },
                             icon = { Icon(Icons.AutoMirrored.Filled.Notes, contentDescription = null) }, label = { Text("Notes") },
                         )
                         NavigationBarItem(
                             selected = showingFinance, onClick = { vm.showSection("finance") },
                             icon = { Icon(Icons.Default.AccountBalanceWallet, contentDescription = null) }, label = { Text("Finance") },
+                        )
+                        NavigationBarItem(
+                            selected = showingPlanner, onClick = { vm.showSection("planner") },
+                            icon = { Icon(Icons.Default.CalendarMonth, contentDescription = null) }, label = { Text("Planner") },
                         )
                     }
                 }
@@ -251,6 +267,8 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
                     onManager = { financeManager = it },
                     modifier = Modifier.padding(padding).consumeWindowInsets(padding).imePadding(),
                 )
+            } else if (showingPlanner) {
+                PlannerScreen(plannerVm, modifier = Modifier.padding(padding).consumeWindowInsets(padding).imePadding())
             } else Column(Modifier.padding(padding).consumeWindowInsets(padding).fillMaxSize().imePadding()) {
                 vm.recoveryNotice?.let { message ->
                     Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) {

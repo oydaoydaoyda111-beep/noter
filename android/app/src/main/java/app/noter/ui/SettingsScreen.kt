@@ -187,7 +187,7 @@ fun SettingsScreen(
                         modifier = Modifier.semantics { contentDescription = "Autosave delay" },
                     )
                 }
-                Choice("Open on startup", listOf("last" to "Last used", "notes" to "Notes", "finance" to "Finance"), settings.startupSection) { v -> onChange { it.copy(startupSection = v) } }
+                Choice("Open on startup", listOf("last" to "Last used", "notes" to "Notes", "finance" to "Finance", "planner" to "Planner"), settings.startupSection) { v -> onChange { it.copy(startupSection = v) } }
                 Toggle("Spellcheck and autocorrect", settings.spellcheck) { v -> onChange { it.copy(spellcheck = v) } }
                 Toggle("Show word and character count", settings.showNoteStats) { v -> onChange { it.copy(showNoteStats = v) } }
             }

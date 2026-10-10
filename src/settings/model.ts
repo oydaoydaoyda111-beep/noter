@@ -14,7 +14,7 @@ export function normalizeSettings(input: unknown): Settings {
   };
   pick('fontStyle', ['sans', 'serif', 'mono']); pick('documentWidth', [720, 790, 850]);
   pick('density', ['comfortable', 'compact']); pick('motion', ['full', 'subtle', 'none']);
-  pick('accentColor', ['blue', 'green', 'purple']); pick('startupSection', ['last', 'notes', 'finance']);
+  pick('accentColor', ['blue', 'green', 'purple']); pick('startupSection', ['last', 'notes', 'finance', 'planner']);
   pick('financeCurrency', ['', 'AZN', 'USD', 'EUR', 'GBP', 'TRY']); pick('financeDateFormat', ['iso', 'dmy', 'mdy']);
   pick('financeTableDensity', ['compact', 'comfortable']); pick('financePageSize', [25, 50, 100, 200]);
   for (const key of ['spellcheck', 'showNoteStats', 'financeRememberEntries', 'financeShowAccountNotes'] as const) if (typeof value[key] === 'boolean') result[key] = value[key];

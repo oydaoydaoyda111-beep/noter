@@ -53,7 +53,7 @@ async function browserConnection(browser, profile, url) {
   } catch (error) { socket?.close(); child.kill(); throw error; }
 }
 
-for (const fixture of ['editor', 'finance']) test(`Chromium ${fixture} interactions preserve data through editing and reload`, { timeout: 60000 }, async t => {
+for (const fixture of ['editor', 'finance', 'planner']) test(`Chromium ${fixture} interactions preserve data through editing and reload`, { timeout: 60000 }, async t => {
   const browser = [process.env.NOTER_TEST_BROWSER,
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -91,9 +91,10 @@ for (const fixture of ['editor', 'finance']) test(`Chromium ${fixture} interacti
     assert.equal(exceptionDetails, undefined, 'Fixture evaluation failed');
     assert.equal(result.value.state, 'passed', result.value.text || 'Interaction checks did not finish.');
     t.diagnostic(result.value.text);
-    if (fixture === 'finance' && process.env.NOTER_FINANCE_SCREENSHOT) {
+    const screenshotPath = process.env[`NOTER_${fixture.toUpperCase()}_SCREENSHOT`];
+    if (fixture !== 'editor' && screenshotPath) {
       const screenshot = await connection.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
-      writeFileSync(process.env.NOTER_FINANCE_SCREENSHOT, Buffer.from(screenshot.data, 'base64'));
+      writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
     }
   } finally {
     await connection?.close();

@@ -44,14 +44,14 @@ fn read_last_section(app: tauri::AppHandle) -> Result<String, String> {
         .and_then(|data| {
             data["lastSection"]
                 .as_str()
-                .filter(|section| matches!(*section, "notes" | "finance"))
+                .filter(|section| matches!(*section, "notes" | "finance" | "planner"))
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "notes".into()))
 }
 #[tauri::command]
 fn save_last_section(app: tauri::AppHandle, section: String) -> Result<(), String> {
-    if !matches!(section.as_str(), "notes" | "finance") {
+    if !matches!(section.as_str(), "notes" | "finance" | "planner") {
         return Err("Invalid app section.".into());
     }
     let path = app
@@ -165,7 +165,7 @@ async fn preserve_workspace_edits(
         .await
         .map_err(|_| "Could not preserve unsaved edits.")?
 }
-/// A random identifier for this installation; it names this device's Finance log file.
+/// A random identifier for this installation; it names this device's Finance and Planner log files.
 fn device_id(app: &tauri::AppHandle) -> Result<String, String> {
     let path = app
         .path()
@@ -222,6 +222,32 @@ async fn append_finance(
         expected_own_log.as_deref(),
         expected_template.as_deref(),
     )
+}
+#[tauri::command]
+async fn load_planner(app: tauri::AppHandle, state: State<'_, VaultState>) -> Result<Value, String> {
+    let folder = root(&state)?;
+    let device = device_id(&app)?;
+    let revision = vault::planner_revision(&folder)?;
+    let mut planner = vault::read_planner(&folder, &device)?;
+    if vault::planner_revision(&folder)? != revision {
+        return Err("Planner changed while loading. Wait for synchronization and reload.".into());
+    }
+    planner["revision"] = json!(revision);
+    planner["device"] = json!(device);
+    Ok(planner)
+}
+#[tauri::command]
+async fn planner_revision(state: State<'_, VaultState>) -> Result<String, String> {
+    vault::planner_revision(&root(&state)?)
+}
+#[tauri::command]
+async fn append_planner(
+    app: tauri::AppHandle,
+    state: State<'_, VaultState>,
+    line: String,
+    expected_own_log: Option<String>,
+) -> Result<vault::SavedPlanner, String> {
+    vault::append_planner(&root(&state)?, &device_id(&app)?, &line, expected_own_log.as_deref())
 }
 #[tauri::command]
 async fn open_document(app: tauri::AppHandle, extension: String) -> Result<Option<Value>, String> {
@@ -331,6 +357,9 @@ pub fn run() {
             load_finance,
             append_finance,
             finance_revision,
+            load_planner,
+            append_planner,
+            planner_revision,
             open_document,
             save_document
         ])

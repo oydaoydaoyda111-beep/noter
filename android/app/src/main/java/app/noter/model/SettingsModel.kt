@@ -20,7 +20,7 @@ fun normalizeSettings(input: JSONObject?): Settings {
         motion = text("motion", listOf("full", "subtle", "none"), defaults.motion),
         autosaveDelay = clamped("autosaveDelay", 200, 2000, defaults.autosaveDelay),
         accentColor = text("accentColor", listOf("blue", "green", "purple"), defaults.accentColor),
-        startupSection = text("startupSection", listOf("last", "notes", "finance"), defaults.startupSection),
+        startupSection = text("startupSection", listOf("last", "notes", "finance", "planner"), defaults.startupSection),
         spellcheck = flag("spellcheck", defaults.spellcheck),
         showNoteStats = flag("showNoteStats", defaults.showNoteStats),
         financeCurrency = text("financeCurrency", listOf("", "AZN", "USD", "EUR", "GBP", "TRY"), defaults.financeCurrency),

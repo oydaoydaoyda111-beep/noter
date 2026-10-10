@@ -26,7 +26,7 @@ export interface Settings {
   motion: 'full' | 'subtle' | 'none';
   autosaveDelay: number;
   accentColor: 'blue' | 'green' | 'purple';
-  startupSection: 'last' | 'notes' | 'finance';
+  startupSection: 'last' | 'notes' | 'finance' | 'planner';
   spellcheck: boolean;
   showNoteStats: boolean;
   financeCurrency: '' | 'AZN' | 'USD' | 'EUR' | 'GBP' | 'TRY';

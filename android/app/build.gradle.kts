@@ -14,8 +14,8 @@ android {
         applicationId = "app.noter"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.2"
+        versionCode = 6
+        versionName = "0.4.0"
         testInstrumentationRunner = "app.noter.StorageContractCheck"
     }
 
@@ -63,4 +63,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    // JVM tests check the shared Planner file contract without a device; Android's own org.json is a stub there.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

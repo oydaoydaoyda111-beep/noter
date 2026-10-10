@@ -3,6 +3,7 @@ import './styles/app.css';
 import './styles/editor.css';
 import './styles/database.css';
 import './styles/finance.css';
+import './styles/planner.css';
 import { startApp } from './app';
 
 import { prepareWorkspace, showWorkspaceSetup } from './desktop/startup';
