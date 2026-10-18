@@ -160,6 +160,20 @@
 @media (max-width: 420px) { .finance-form-grid, .finance-category-fields { grid-template-columns: 1fr; } }
 @media (max-width: 540px) { .finance-ledger-summary { grid-template-columns: 1fr; } }
 
+.finance-planned-content { border: 0; padding: 0; margin: 0; min-width: 0; }
+.finance-planned-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 16px 0; }
+.finance-planned-summary > div { display: grid; gap: 6px; }
+.finance-planned-list { display: grid; gap: 6px; margin-bottom: 12px; }
+.finance-planned-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border-strong); }
+.finance-planned-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.finance-planned-editor { display: flex; gap: 6px; width: 100%; }
+.finance-planned-editor input:first-child { flex: 1; min-width: 0; }
+.finance-planned-editor input[name="planned-amount"] { width: 110px; }
+.finance-planned-dialog .negative { color: var(--danger); }
+@media (max-width: 520px) {
+  .finance-planned-editor, .finance-planned-row { flex-wrap: wrap; }
+  .finance-planned-summary { grid-template-columns: 1fr; }
+}
 .finance-account-dialog > .dialog-description { margin-bottom: 12px; }
 .finance-account-dialog > .field-input { margin-bottom: 10px; }
 .finance-account-list { display: grid; gap: 6px; margin-top: 10px; }

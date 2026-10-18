@@ -1004,6 +1004,68 @@ fn save_before_change(
     Ok(saved_revision)
 }
 const FINANCE_LOGS: &str = ".noter/finance";
+const EXPENSE_PLANS: &str = ".noter/planned-expenses.json";
+static EXPENSE_PLANS_LOCK: Mutex<()> = Mutex::new(());
+
+fn expense_plan_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+    let path = safe_path(root, EXPENSE_PLANS)?;
+    if let Some(parent) = path.parent().filter(|parent| parent.exists()) {
+        for entry in fs::read_dir(parent).map_err(|e| error("Could not inspect planned expenses", e))? {
+            let name = entry.map_err(|e| error("Could not inspect planned expenses", e))?.file_name();
+            if name.to_string_lossy().starts_with("planned-expenses.sync-conflict-") {
+                return Err("SYNC_CONFLICT: Planned expenses have Syncthing conflict copies. Resolve these copies before editing; all files have been kept.".into());
+            }
+        }
+    }
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() > 1_000_000) {
+        return Err("Planned expenses file exceeds the 1 MB limit.".into());
+    }
+    read_optional(&path)
+}
+
+pub fn load_expense_plans(root: &Path) -> Result<Value> {
+    let bytes = expense_plan_bytes(root)?;
+    let text = bytes.as_deref().map(|bytes| std::str::from_utf8(bytes).map(str::to_string))
+        .transpose().map_err(|_| "Planned expenses must be UTF-8.")?;
+    Ok(json!({ "text": text, "revision": bytes.as_deref().map(fingerprint) }))
+}
+
+pub fn save_expense_plans(root: &Path, text: &str, expected: Option<&str>) -> Result<String> {
+    let _lock = EXPENSE_PLANS_LOCK.lock().map_err(|_| "Planned expenses are unavailable.")?;
+    if text.len() > 1_000_000 { return Err("Planned expenses file exceeds the 1 MB limit.".into()); }
+    let data: Value = serde_json::from_str(text).map_err(|_| "Invalid planned expenses JSON.")?;
+    let expenses = data["expenses"].as_array().ok_or("Invalid planned expenses list.")?;
+    if data["version"] != 1 { return Err("Unsupported planned expenses version.".into()); }
+    let mut ids = HashSet::new();
+    for item in expenses {
+        let id = item["id"].as_str().filter(|id| !id.is_empty()).ok_or("Invalid planned expense ID.")?;
+        if !ids.insert(id) || item["name"].as_str().is_none_or(|name| name.trim().is_empty())
+            || item["cents"].as_u64().is_none_or(|cents| cents == 0 || cents > 9_007_199_254_740_991) {
+            return Err("Invalid planned expense.".into());
+        }
+    }
+    let previous = expense_plan_bytes(root)?;
+    let check = |bytes: Option<&[u8]>| -> Result<()> {
+        if bytes.map(fingerprint).as_deref() != expected {
+            return Err("SYNC_CONFLICT: Planned expenses changed outside Noter. Reload plans before saving; your draft is still here.".into());
+        }
+        Ok(())
+    };
+    check(previous.as_deref())?;
+    if previous.as_deref() == Some(text.as_bytes()) { return Ok(fingerprint(text.as_bytes())); }
+    if let Some(bytes) = previous {
+        let backup = safe_path(root, &format!(".noter/trash/planned-expenses-{}-{}.json", now(), Uuid::new_v4()))?;
+        atomic_write(&backup, &bytes)?;
+        if read_optional(&backup)?.as_deref() != Some(bytes.as_slice()) { return Err("Could not verify planned expenses backup.".into()); }
+    }
+    check(expense_plan_bytes(root)?.as_deref())?;
+    atomic_write(&safe_path(root, EXPENSE_PLANS)?, text.as_bytes())?;
+    let saved = fingerprint(text.as_bytes());
+    if expense_plan_bytes(root)?.as_deref().map(fingerprint).as_deref() != Some(saved.as_str()) {
+        return Err("SYNC_CONFLICT: Planned expenses changed while saving. Reload plans before editing again.".into());
+    }
+    Ok(saved)
+}
 const FINANCE_LEGACY: &str = ".noter/finance.json";
 const FINANCE_TEMPLATE: &str = ".noter/finance-template.xlsx";
 const MAX_FINANCE_LOGS: u64 = 100_000_000;
@@ -1242,6 +1304,30 @@ pub fn append_finance(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn planned_expenses_round_trip_conflicts_backups_and_validation() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(load_expense_plans(root.path()).unwrap()["text"].is_null());
+        let first = r#"{"version":1,"expenses":[{"id":"one","name":"Lunch","cents":125}]}"#;
+        let second = r#"{"version":1,"expenses":[]}"#;
+        let revision = save_expense_plans(root.path(), first, None).unwrap();
+        assert_eq!(load_expense_plans(root.path()).unwrap()["text"], first);
+        assert!(save_expense_plans(root.path(), second, None).unwrap_err().contains("SYNC_CONFLICT"));
+        save_expense_plans(root.path(), second, Some(&revision)).unwrap();
+        let backups: Vec<_> = fs::read_dir(root.path().join(".noter/trash")).unwrap().collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].as_ref().unwrap().path()).unwrap(), first);
+        let incoming = r#"{"version":1,"expenses":[{"id":"incoming","name":"Rent","cents":10000}]}"#;
+        fs::write(root.path().join(EXPENSE_PLANS), incoming).unwrap();
+        assert!(save_expense_plans(root.path(), first, Some(&fingerprint(second.as_bytes()))).is_err());
+        assert_eq!(fs::read_to_string(root.path().join(EXPENSE_PLANS)).unwrap(), incoming);
+        for text in [r#"{"version":2,"expenses":[]}"#, r#"{"version":1,"expenses":[{"id":"x","name":" ","cents":1}]}"#, r#"{"version":1,"expenses":[{"id":"x","name":"Test","cents":0}]}"#] {
+            assert!(save_expense_plans(root.path(), text, Some(&fingerprint(incoming.as_bytes()))).is_err());
+        }
+        fs::write(root.path().join(".noter/planned-expenses.sync-conflict-test.json"), first).unwrap();
+        assert!(load_expense_plans(root.path()).unwrap_err().contains("conflict copies"));
+        assert!(save_expense_plans(root.path(), second, Some(&fingerprint(incoming.as_bytes()))).is_err());
+    }
     use super::*;
     fn workspace() -> Value {
         json!({"version":1,"nodes":{"folder":{"id":"folder","name":"Personal","type":"folder","children":["note"],"parentId":null,"createdAt":1,"updatedAt":1},"note":{"id":"note","name":"✅ October 2","type":"note","markdown":"# Hello\n\n```noter-database\n{\"rows\":[]}\n```\n","parentId":"folder","createdAt":1,"updatedAt":1}},"rootIds":["folder"],"settings":{"fontSize":18},"openTabs":["note"],"activeNoteId":"note","collapsedFolders":[]})

@@ -1,6 +1,6 @@
 # Noter project memory
 
-Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Check current code and Git state before relying on historical verification.
+Last updated: 2026-10-18. This is a durable handoff, not a feature backlog. Check current code and Git state before relying on historical verification.
 
 ## Product decisions and preferences
 
@@ -15,6 +15,8 @@ Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Chec
 - After completing a requested feature, ask what to implement next with a few concrete options. Do not treat suggested options as approved work.
 
 ## Implemented capabilities
+
+- Desktop Finance planned expenses: button opens a compact add/edit/delete dialog with name and positive amount only. Shows all active-account balances minus saved plans, with negative remaining amounts in red; plans do not create transactions. A separate versioned `.noter/planned-expenses.json` syncs with the workspace without changing Finance logs or breaking current Android readers. Android UI is deferred. Reads on dialog open/manual reload; SHA-256 checks reject stale saves, prior files go to trash, and Syncthing conflict copies require manual resolution. Drafts survive failed saves/reload; stable draft IDs prevent duplicate additions after uncertain acknowledgements. Plans are excluded from Excel/notes backups; back up the workspace file. Implemented on `main` at the user's request; remote `planner` work is separate and unmerged.
 
 - Notes: naming dialogs, emoji selection/titles, folders, tabs, Markdown editing, undo/redo, autosave, and scoped search.
 - Desktop editor: code blocks preserve literal Unicode and trailing blank lines through paste, highlighting, copy and Markdown serialization. Native line-break placeholders provide caret space without adding saved characters. Empty heading/quote/code conversions, leaving bold formatting, and AltGr shortcuts have Chromium interaction coverage.
@@ -56,6 +58,8 @@ Last updated: 2026-10-05. This is a durable handoff, not a feature backlog. Chec
 - A deleted folder that another Windows program uses as its working directory remains on disk and reappears after reload.
 
 ## Validation and repository handoff
+
+- 2026-10-18 planned expenses on `main`: production TypeScript/Vite build passed; `npm test` passed 42 tests with 1 optional private-workbook check skipped, including 125 Finance and 47 editor Chromium assertions; all 35 Rust tests passed. Checked add/edit/delete/reopen, exact active-account totals, shortfalls, keyboard focus/Escape, safe text rendering, failed/stale saves, preserved incoming files, backups and duplicate prevention after uncertain acknowledgement. Inspected a synthetic dialog screenshot. Edge tests now use InPrivate/disabled sync to avoid an OS-account sign-in prompt. Built desktop 1.1.3 MSI/NSIS and upgraded the existing per-machine MSI installation successfully (installer exit 0; installed executable and registry report 1.1.3 in `C:\Program Files\Noter`). Android UI and physical-device sync remain deferred. Plans are a shared snapshot with manual conflict reconciliation, not Finance log operations.
 
 - 2026-10-05 desktop balances: Windows 1.1.2 MSI/NSIS built, not installed. `npm test`: 39 passed, 1 optional workbook check skipped; 103 Finance and 47 editor Chromium checks passed. Historical balances, account/transfer edits, repeat/add previews, invalid drafts and independent overflow recovery have regression coverage. TypeScript/Vite and native release packaging passed; synthetic ledger screenshot inspected. No storage format changes.
 - 2026-10-04 desktop Finance grouping: delivered Windows 1.1.1 MSI/NSIS. `npm test`: 34 passed, 1 optional private-workbook check skipped, including 90 Finance and 47 editor Chromium assertions plus exact-cent/grouping regression tests. TypeScript/Vite and native release packaging passed; inspected the synthetic grouped-ledger screenshot. Filters, pagination, selection/focus, date-range boundaries, save/reload, transfer sides, empty results and unchanged view-only logs are covered. Installer not run; no dependencies or storage format changes.

@@ -9,6 +9,7 @@ import { manageAccounts } from './account-manager';
 import { manageCategories } from './category-manager';
 import { createCategorySelectors } from './category-selectors';
 import { createBudgetView } from './budget-view';
+import { showPlannedExpenses } from './planned-view';
 import { createReportView } from './report-view';
 import { monthRange } from './reports';
 import { editTransactions } from './bulk-editor';
@@ -177,6 +178,7 @@ export function createFinance(root: HTMLElement, getSettings: () => Settings, op
     summary.append(card('Total balance', [...balance.values()].reduce((sum, cents) => sum + cents, 0)));
     for (const account of finance.accounts) summary.append(card(`${account.name}${account.archived ? ' · Archived' : ''}`, balance.get(account.name) ?? 0, getSettings().financeShowAccountNotes ? account.note : undefined)); body.append(summary);
     const entry = el('div', 'finance-entry'); entry.append(action('− Expense', () => transactionDialog('expense'), true), action('+ Income', () => transactionDialog('income')), action('⇄ Transfer', () => transactionDialog('transfer')), action('Manage accounts', () => manageAccounts(() => finance!, commit, format, () => getSettings().financeDefaultAccount, setDefaultAccount)), action('Manage categories', () => manageCategories(() => finance!, commit))); body.append(entry);
+    entry.append(action('Planned expenses', () => showPlannedExpenses(() => finance!, format, () => root.querySelector<HTMLButtonElement>('[aria-label="Planned expenses"]')?.focus())));
     reports.refresh(busy); body.append(reports.root); budgets.refresh(busy); body.append(budgets.root);
     const filters = el('div', 'finance-filters');
     const history = el('div', 'finance-history');

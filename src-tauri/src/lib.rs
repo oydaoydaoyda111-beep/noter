@@ -224,6 +224,18 @@ async fn append_finance(
     )
 }
 #[tauri::command]
+async fn load_expense_plans(state: State<'_, VaultState>) -> Result<Value, String> {
+    let folder = root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || vault::load_expense_plans(&folder))
+        .await.map_err(|_| "Could not load planned expenses.")?
+}
+#[tauri::command]
+async fn save_expense_plans(state: State<'_, VaultState>, text: String, expected: Option<String>) -> Result<String, String> {
+    let folder = root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || vault::save_expense_plans(&folder, &text, expected.as_deref()))
+        .await.map_err(|_| "Could not save planned expenses.")?
+}
+#[tauri::command]
 async fn open_document(app: tauri::AppHandle, extension: String) -> Result<Option<Value>, String> {
     if !["xlsx", "json"].contains(&extension.as_str()) {
         return Err("Unsupported file type.".into());
@@ -331,6 +343,8 @@ pub fn run() {
             load_finance,
             append_finance,
             finance_revision,
+            load_expense_plans,
+            save_expense_plans,
             open_document,
             save_document
         ])

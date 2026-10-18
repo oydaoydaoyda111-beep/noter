@@ -22,7 +22,16 @@ transactions.push({ id: 'out', date: `${month}-01`, cents: -500, account: 'Check
 const initial = { version: 1, accounts: [{ name: 'Checking', note: '' }, { name: 'Savings', note: '' }], transactions, categories: ['Food', 'Dining'], sourceName: 'Synthetic Finance', categoryDefinitions: [{ name: 'Food', subcategories: ['Lunch'] }, { name: 'Dining', subcategories: [] }] };
 const disk = [{ name: 'log-fixture.jsonl', text: batchLine('fixture', 0, 1, diffFinance(undefined, initial, '')).line }];
 let failure = false, app, checks = 0;
+let plannedText = null, plannedRevision = null, plannedSequence = 0, plannedUncertain = false;
 mockIPC((command, args) => {
+  if (command === 'load_expense_plans') return { text: plannedText, revision: plannedRevision };
+  if (command === 'save_expense_plans') {
+    if (failure) throw new Error('Synthetic planned expense save failure');
+    if (args.expected !== plannedRevision) throw new Error('SYNC_CONFLICT: incoming planned expenses');
+    plannedText = args.text; plannedRevision = String(++plannedSequence);
+    if (plannedUncertain) { plannedUncertain = false; throw new Error('Synthetic uncertain acknowledgement'); }
+    return plannedRevision;
+  }
   if (command === 'load_finance') return { logs: disk, template: null, legacy: null, revision: 'fixture', device: 'desktop-test' };
   if (command === 'append_finance') {
     if (failure) throw new Error('Synthetic save failure');
@@ -210,6 +219,48 @@ try {
   checkLedgerTotals('123.45', '0.00', '123.45', 'inclusive date range totals only matching day');
   equal(transactionRows().length, 1, 'inclusive date filter contains one matching income');
   control('Clear filters', root).click(); control('Group transactions', root).focus({ preventScroll: true }); root.querySelector('.finance-history').scrollIntoView({ block: 'start' });
+  const beforePlans = disk.length;
+  control('Planned expenses', root).click(); await pause();
+  equal(document.querySelector('.finance-planned-list').textContent.includes('No planned expenses'), true, 'planned expenses start empty');
+  equal(document.activeElement.name, 'planned-name', 'opening plans focuses the name field for keyboard entry');
+  input(named('planned-name'), '<img src=x onerror=alert(1)>', 'input'); input(named('planned-amount'), '100.00', 'input'); submit(); await pause();
+  equal(JSON.parse(plannedText).expenses[0].cents, 10000, 'planned amount saves in integer cents');
+  equal(document.querySelector('.finance-planned-list img'), null, 'planned names render as safe text');
+  equal(document.querySelector('.finance-planned-summary > div:last-child strong').textContent, '-6.55', 'remaining subtracts plans from active balances');
+  equal(document.querySelector('.finance-planned-summary > div:last-child strong').classList.contains('negative'), true, 'shortfall uses negative styling');
+  const planName = JSON.parse(plannedText).expenses[0].name;
+  // The synthetic name contains selector punctuation, so select by the accessible attribute value.
+  [...document.querySelectorAll('button')].find(item => item.getAttribute('aria-label') === `Edit planned expense ${planName}`).click();
+  input(named('planned-name'), 'Rent', 'input'); input(named('planned-amount'), '20.25', 'input'); submit(); await pause();
+  equal(JSON.parse(plannedText).expenses.length, 1, 'editing a plan preserves its identity');
+  equal(JSON.parse(plannedText).expenses[0].name, 'Rent', 'planned name edit is saved');
+  await closeAfter(() => control('Close planned expenses').click());
+  equal(document.activeElement.getAttribute('aria-label'), 'Planned expenses', 'closing plans restores launcher focus');
+  control('Planned expenses', root).click(); await pause();
+  equal(document.querySelector('.finance-planned-list').textContent.includes('Rent'), true, 'planned expenses reload from shared storage');
+  input(named('planned-name'), 'Keep draft', 'input'); input(named('planned-amount'), '5.00', 'input'); failure = true; submit(); await pause();
+  equal(named('planned-name').value, 'Keep draft', 'failed save retains plan draft');
+  equal(JSON.parse(plannedText).expenses.length, 1, 'failed plan save preserves saved list');
+  failure = false; control('Reload planned expenses').click(); await pause();
+  equal(named('planned-name').value, 'Keep draft', 'reload preserves unsaved plan draft');
+  submit(); await pause(); equal(JSON.parse(plannedText).expenses.length, 2, 'draft saves after reload');
+  control('Delete planned expense Rent').click(); await pause();
+  equal(JSON.parse(plannedText).expenses.length, 1, 'delete removes only selected plan');
+  control('Edit planned expense Keep draft').click(); input(named('planned-amount'), '0', 'input'); submit(); await pause();
+  equal(JSON.parse(plannedText).expenses[0].cents, 500, 'invalid amount does not change a saved plan');
+  control('Cancel planned expense draft').click();
+  plannedText = JSON.stringify({ version: 1, expenses: [{ id: 'incoming', name: 'From another device', cents: 100 }] }); plannedRevision = 'incoming';
+  input(named('planned-name'), 'Local draft', 'input'); input(named('planned-amount'), '2.00', 'input'); submit(); await pause();
+  equal(JSON.parse(plannedText).expenses[0].id, 'incoming', 'stale plan save preserves incoming file');
+  control('Reload planned expenses').click(); await pause(); submit(); await pause();
+  equal(JSON.parse(plannedText).expenses.length, 2, 'retry combines new draft with incoming plans');
+  input(named('planned-name'), 'Uncertain draft', 'input'); input(named('planned-amount'), '3.00', 'input'); plannedUncertain = true; submit(); await pause();
+  equal(named('planned-name').value, 'Uncertain draft', 'uncertain acknowledgement retains plan draft');
+  control('Reload planned expenses').click(); await pause(); submit(); await pause();
+  equal(JSON.parse(plannedText).expenses.filter(item => item.name === 'Uncertain draft').length, 1, 'retry after uncertain acknowledgement never duplicates a plan');
+  equal(disk.length, beforePlans, 'planned expenses never modify Finance transaction logs');
+  await closeAfter(dialog => dialog.dispatchEvent(new Event('cancel', { cancelable: true })));
+  equal(document.activeElement.getAttribute('aria-label'), 'Planned expenses', 'Escape returns focus after saving');
   document.body.dataset.financeCheck = 'passed'; document.getElementById('result').textContent = `${checks} finance checks passed.`;
 } catch (error) { document.body.dataset.financeCheck = 'failed'; document.getElementById('result').textContent = error.stack; }
 </script>

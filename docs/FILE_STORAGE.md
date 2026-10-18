@@ -45,6 +45,18 @@ Each installation has its own persistent device ID and writes `.noter/finance/lo
 
 The two synthetic device logs and `expected-finance.json` in the shared fixture directory verify replay, Unicode, transfers, account recovery, metadata and numeric compatibility on both clients.
 
+## Planned expenses v1
+
+Desktop stores its shared list separately in `.noter/planned-expenses.json`:
+
+```json
+{"version":1,"expenses":[{"id":"example-uuid","name":"Rent","cents":50000}]}
+```
+
+IDs are unique nonempty strings; names are nonblank text; cents are positive JS-safe integers. List order is display order. Plans do not create transactions or affect balances, budgets or reports. The dialog subtracts their total from all active-account ledger balances, including opening balances and transfers. Negative remaining amounts are permitted.
+
+Keep this file synchronized with the workspace. Current Android versions ignore it, so existing Finance logs remain compatible; the Android planned-expenses interface is deferred. Desktop reads plans whenever the dialog opens or Reload plans is pressed. Saves compare the full file SHA-256 against the loaded revision, preserve prior contents in `.noter/trash/planned-expenses-<time>-<uuid>.json`, and use flushed temporary-file replacement. Changed files reject saves and retain drafts. Syncthing conflict copies block editing until manually reconciled. Concurrent offline edits to this shared snapshot need manual reconciliation; there is no per-record merge. Files are limited to 1 MB. Plans are independent of workbook import/export and are not included in Excel or notes JSON backups; synchronize/back up the workspace file itself.
+
 ## Replacement and synchronization boundaries
 
 Both apps offer **Keep edits and reload** when notes have unsaved work. Changed or renamed/moved local notes are compared with the last acknowledged workspace and copied into a new `Recovered edits <timestamp>-<uuid>/` folder with their hierarchy and Markdown intact. Incoming originals are preserved. Each recovery also writes `.noter/recovery/<timestamp>-<uuid>/workspace.json`: a v1 notes backup containing note bodies, folders, settings and deletion intent, in the same shape as desktop notes exports. Finance stays in its own logs.

@@ -9,7 +9,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createServer } from 'vite';
 
 async function browserConnection(browser, profile, url) {
-  const child = spawn(browser, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
+  const child = spawn(browser, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking', '--disable-sync',
+    ...(browser.toLowerCase().endsWith('msedge.exe') ? ['--inprivate'] : []),
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
     '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1280,820', url], { windowsHide: true, stdio: 'ignore' });
   let startupError; child.on('error', error => { startupError = error; });
@@ -94,6 +95,11 @@ for (const fixture of ['editor', 'finance']) test(`Chromium ${fixture} interacti
     if (fixture === 'finance' && process.env.NOTER_FINANCE_SCREENSHOT) {
       const screenshot = await connection.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
       writeFileSync(process.env.NOTER_FINANCE_SCREENSHOT, Buffer.from(screenshot.data, 'base64'));
+    }
+    if (fixture === 'finance' && process.env.NOTER_PLANS_SCREENSHOT) {
+      await connection.call('Runtime.evaluate', { awaitPromise: true, expression: `document.querySelector('[aria-label="Planned expenses"]').click(); new Promise(resolve => setTimeout(resolve, 100))` });
+      const screenshot = await connection.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+      writeFileSync(process.env.NOTER_PLANS_SCREENSHOT, Buffer.from(screenshot.data, 'base64'));
     }
   } finally {
     await connection?.close();
