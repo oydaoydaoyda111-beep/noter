@@ -1,4 +1,4 @@
-import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits, saveViewState } from './desktop/platform';
+import { readWorkspaceSnapshot, adoptWorkspaceSnapshot, workspaceChanged, financeChanged, flushFiles, chooseFolder, readDocument, writeDocument, readLastSection, saveLastSection, preserveWorkspaceEdits, saveViewState, readClipboardText } from './desktop/platform';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createStore } from './state/workspace';
@@ -366,8 +366,23 @@ export async function startApp(mount: HTMLElement) {
     const mod = (event.ctrlKey || event.metaKey) && !event.altKey;
     if (event.key === 'F5' || (mod && ['r', 'p'].includes(event.key.toLowerCase()))) event.preventDefault();
   }, true);
+  // The browser's own context menu never appears; text fields get Noter's cut/copy/paste menu instead.
   document.addEventListener('contextmenu', event => {
-    if (!(event.target as Element).closest('input, textarea, [contenteditable="true"]')) event.preventDefault();
+    if (event.defaultPrevented) return;
+    event.preventDefault();
+    const field = (event.target as Element).closest('input, textarea');
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) || field.disabled) return;
+    if (field instanceof HTMLInputElement && !['text', 'search', 'url', 'email', 'tel', 'password', 'number'].includes(field.type)) return;
+    field.focus();
+    const selected = field instanceof HTMLInputElement && field.type === 'number' ? !!field.value : (field.selectionStart ?? 0) !== (field.selectionEnd ?? 0);
+    const editable = !field.readOnly;
+    const secret = field instanceof HTMLInputElement && field.type === 'password';
+    showMenu(event.clientX, event.clientY, [
+      { label: 'Cut', icon: 'cut', hint: `${mod} X`, disabled: !selected || !editable || secret, action: () => { field.focus(); document.execCommand('cut'); } },
+      { label: 'Copy', icon: 'copy', hint: `${mod} C`, disabled: !selected || secret, action: () => { field.focus(); document.execCommand('copy'); } },
+      { label: 'Paste', icon: 'paste', hint: `${mod} V`, disabled: !editable, action: () => void readClipboardText().then(text => { field.focus(); if (text) document.execCommand('insertText', false, text); }) },
+      { label: 'Select all', icon: 'selectAll', hint: `${mod} A`, separator: true, action: () => { field.focus(); field.select(); } },
+    ], field, 'Text actions');
   });
   for (const type of ['dragover', 'drop'] as const) document.addEventListener(type, event => {
     if (event.dataTransfer?.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = 'none'; }

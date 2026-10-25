@@ -128,6 +128,10 @@ export function pickAttachment() { return invoke<string | null>('pick_attachment
 export async function readAttachment(noteId: string, source: string) {
   return new Uint8Array(await invoke<ArrayBuffer>('read_attachment', { noteId, source }));
 }
+export async function readClipboardText() {
+  try { const { readText } = await import('@tauri-apps/plugin-clipboard-manager'); return await readText(); }
+  catch { return await navigator.clipboard?.readText().catch(() => '') ?? ''; }
+}
 export async function copyText(text: string) {
   const { writeText } = await import('@tauri-apps/plugin-clipboard-manager'); await writeText(text);
 }

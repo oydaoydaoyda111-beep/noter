@@ -219,6 +219,11 @@ mark { background: #a3c3d32e; color: #d7e6ef; border-radius: 2px; }
 .menu-item:hover, .menu-item:focus-visible { background: #accade13; outline: none; }
 .menu-item.danger { border-top: 1px solid var(--border); border-radius: 0 0 4px 4px; margin-top: 4px; }
 .menu-item.danger .icon { color: var(--danger); }
+.menu-label { flex: 1; }
+.menu-hint { margin-left: 18px; color: #7f909d; font: 11px var(--font-ui); letter-spacing: .3px; }
+.menu-item:disabled { opacity: .4; cursor: default; }
+.menu-item:disabled:hover { background: none; }
+.menu-separator { height: 1px; margin: 4px 6px; background: var(--border); }
 .slash-menu { position: fixed; z-index: 16; display: flex; flex-direction: column; width: 306px; max-width: calc(100vw - 24px); border: 1px solid #b7d1e230; border-radius: 9px; background: linear-gradient(145deg, #bdd9ec08, transparent), #242e37f5; backdrop-filter: blur(24px); box-shadow: 0 14px 42px #0007, inset 0 1px 0 #d9edfc0b; overflow: hidden; animation: menu-in var(--motion-fast) var(--ease) both; }
 .slash-caption { padding: 14px 15px 10px; color: #9cb1c1; font-size: 10px; font-weight: 500; letter-spacing: 1.2px; flex-shrink: 0; }
 .slash-options { position: relative; max-height: 310px; min-height: 0; overflow-y: auto; padding: 0 6px 6px; }

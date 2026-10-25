@@ -1,8 +1,8 @@
-import { copyText, openExternal, pickAttachment, readAttachment, saveAttachment } from '../desktop/platform';
+import { copyText, openExternal, pickAttachment, readAttachment, readClipboardText, saveAttachment } from '../desktop/platform';
 import { el, button } from '../ui/dom';
 import { icon, type IconName } from '../ui/icons';
 import { askDialog } from '../ui/dialog';
-import { showMenu } from '../ui/menu';
+import { showMenu, type MenuItem } from '../ui/menu';
 import { codeText, domToMarkdown, imageFigure, inlineDom, markdownToDom, noteLink, safeUrl, tableElement, toggleElement } from './markdown';
 import { createLinkPicker, type NoteLinks } from './links';
 import { bookmark, caretAt, currentBlock, restoreBookmark, selectionRange, setRange, textBeforeCaret } from './selection';
@@ -839,9 +839,9 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     }
   }
 
-  /** Units from [first] to [last] in document order when they share a parent; otherwise just [first]. */
+  /** Units from [first] to [last] in document order; blocks in different containers are widened to page-level blocks. */
   function unitRange(first: HTMLElement, last: HTMLElement): HTMLElement[] {
-    if (first.parentElement !== last.parentElement) return [first];
+    if (first.parentElement !== last.parentElement) { first = topLevel(first); last = topLevel(last); }
     const siblings = Array.from(first.parentElement!.children) as HTMLElement[];
     const [from, to] = [siblings.indexOf(first), siblings.indexOf(last)].sort((a, b) => a - b);
     return siblings.slice(from, to + 1);
@@ -851,7 +851,11 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
   function targetUnits(): HTMLElement[] {
     if (selectedBlocks.length) return selectedBlocks;
     const range = selectionRange(root), block = currentBlock(root);
-    if (!range || !block) return [];
+    if (!range) return [];
+    // Selections that start or end on the page itself (Ctrl+A, dragging past the text) cover whole page-level blocks.
+    if (!block || range.startContainer === root || range.endContainer === root) {
+      return (Array.from(root.children) as HTMLElement[]).filter(child => range.intersectsNode(child));
+    }
     const endElement = range.endContainer instanceof Element ? range.endContainer : range.endContainer.parentElement;
     const endBlock = endElement?.closest<HTMLElement>('p,h1,h2,h3,li,pre,div,td,th');
     const start = unitOf(block);
@@ -957,6 +961,12 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
       savedRange = selectionRange(root)?.cloneRange() ?? null;
       applyBlock(style, false);
     }
+    // Each converted block starts its own list; neighbouring lists of one kind read as one list, as they do after reloading.
+    for (const list of Array.from(root.querySelectorAll<HTMLElement>('ul + ul, ol + ol'))) {
+      const previous = list.previousElementSibling;
+      if (previous && root.contains(list)) { previous.append(...list.childNodes); list.remove(); }
+    }
+    change();
   }
 
   function showTurnInto(units: HTMLElement[], x: number, y: number) {
@@ -1267,6 +1277,56 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
       event.preventDefault(); selectBlocks(unitRange(from, clicked), from, clicked); return;
     }
     if (selectedBlocks.length) selectBlocks([]);
+  });
+  // Right-click menu with clipboard, formatting and block actions in place of the browser's own menu.
+  const modKey = /Mac/.test(navigator.platform) ? '⌘' : 'Ctrl ';
+  root.addEventListener('contextmenu', event => {
+    const target = event.target as Element;
+    if (target.closest('.database-block')) return;
+    event.preventDefault();
+    if (selectedBlocks.length && !selectedBlocks.some(block => block.contains(target))) selectBlocks([]);
+    rememberSelection();
+    const range = selectionRange(root);
+    const hasText = !!range && !range.collapsed && !!range.toString().trim();
+    const blocks = selectedBlocks.length > 0;
+    const clicked = unitAt(target);
+    const units = blocks ? [...selectedBlocks] : hasText ? targetUnits() : clicked ? [clicked] : [];
+    const inCode = !!currentBlock(root)?.closest('pre');
+    const items: MenuItem[] = [];
+    const noteTarget = target.closest<HTMLElement>('.note-link')?.dataset.target;
+    const href = safeUrl(target.closest('a')?.getAttribute('href') ?? '');
+    if (noteTarget && links) items.push({ label: 'Open linked note', icon: 'arrow', action: () => links.open(noteTarget) });
+    if (href) items.push({ label: 'Open link', icon: 'arrow', action: () => void openExternal(href).catch(() => {}) }, { label: 'Copy link address', icon: 'link', action: () => void copyText(href).catch(() => {}) });
+    const clipboard = (command: 'cut' | 'copy') => () => {
+      if (blocks) { const chosen = [...units]; void copyUnits(chosen).then(() => { if (command === 'cut') deleteUnits(chosen); }); return; }
+      restoreSelection(); document.execCommand(command);
+    };
+    items.push(
+      { label: 'Cut', icon: 'cut', hint: `${modKey}X`, disabled: !hasText && !blocks, separator: true, action: clipboard('cut') },
+      { label: 'Copy', icon: 'copy', hint: `${modKey}C`, disabled: !hasText && !blocks, action: clipboard('copy') },
+      { label: 'Paste', icon: 'paste', hint: `${modKey}V`, disabled: blocks, action: () => void readClipboardText().then(text => {
+        if (!text) return;
+        restoreSelection();
+        const data = new DataTransfer(); data.setData('text/plain', text);
+        root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+      }) },
+    );
+    if (hasText && !inCode) items.push(
+      { label: 'Bold', icon: 'bold', hint: `${modKey}B`, separator: true, action: () => applyMark('strong') },
+      { label: 'Italic', icon: 'italic', hint: `${modKey}I`, action: () => applyMark('em') },
+      { label: 'Inline code', icon: 'code', action: () => applyMark('code') },
+      { label: 'Link…', icon: 'link', hint: `${modKey}K`, action: () => { restoreSelection(); void insertLink(); } },
+    );
+    if (units.length) {
+      const count = units.length > 1 ? ` ${units.length} blocks` : ' block';
+      items.push(
+        { label: 'Turn into…', icon: 'edit', hint: `${modKey}/`, separator: true, action: () => showTurnInto(units, event.clientX, event.clientY) },
+        { label: `Duplicate${count}`, icon: 'plus', hint: `${modKey}D`, action: () => duplicateUnits(units) },
+        { label: 'Copy as Markdown', icon: 'copy', action: () => void copyUnits(units) },
+        { label: `Delete${count}`, icon: 'trash', danger: true, action: () => deleteUnits(units) },
+      );
+    }
+    showMenu(event.clientX, event.clientY, items, root, 'Editor actions');
   });
   // Dragging a text selection across blocks selects those blocks, as in Notion.
   root.addEventListener('mouseup', () => {
