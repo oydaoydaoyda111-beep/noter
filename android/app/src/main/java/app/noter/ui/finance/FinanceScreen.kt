@@ -93,7 +93,7 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.util.Locale
 
-enum class FinanceManager { Accounts, Categories }
+enum class FinanceManager { Accounts, Categories, Planned }
 
 @Composable
 private fun amountColor(cents: Long): Color = if (cents < 0) NoterColors.danger else NoterColors.positive
@@ -157,6 +157,7 @@ fun FinanceScreen(
         when (manager) {
             FinanceManager.Accounts -> AccountManager(finance, format, settings.financeDefaultAccount, setDefaultAccount, vm::commit) { onManager(null) }
             FinanceManager.Categories -> CategoryManager(finance, vm::commit) { onManager(null) }
+            FinanceManager.Planned -> PlannedExpensesDialog(finance, format, vm) { onManager(null) }
             null -> {}
         }
         deleting?.let { row ->

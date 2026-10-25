@@ -120,6 +120,14 @@ export async function readDocument(extension: 'xlsx' | 'json'): Promise<{ name: 
 export async function writeDocument(name: string, bytes: Uint8Array) {
   return invoke<boolean>('save_document', { name, bytes: Array.from(bytes) });
 }
+/** Saves image bytes into the workspace attachments folder; resolves to the workspace-relative path. */
+export function saveAttachment(bytes: Uint8Array, extension: string) {
+  return invoke<string>('save_attachment', bytes, { headers: { 'x-extension': extension } });
+}
+export function pickAttachment() { return invoke<string | null>('pick_attachment'); }
+export async function readAttachment(noteId: string, source: string) {
+  return new Uint8Array(await invoke<ArrayBuffer>('read_attachment', { noteId, source }));
+}
 export async function copyText(text: string) {
   const { writeText } = await import('@tauri-apps/plugin-clipboard-manager'); await writeText(text);
 }

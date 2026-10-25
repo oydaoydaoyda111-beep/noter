@@ -20,6 +20,28 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import app.noter.ui.editor.BlockLayout
+import app.noter.ui.editor.ImagePreviewBlock
+import app.noter.ui.editor.PreviewBlock
+import app.noter.ui.editor.TablePreviewBlock
+import app.noter.ui.editor.previewBlocks
+import app.noter.ui.editor.tableMarkdown
+import kotlin.math.roundToInt
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -68,8 +90,31 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.automirrored.filled.ArrowRight
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalContext
+import app.noter.ui.editor.imageAt
+import app.noter.ui.editor.insertImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.contentDescription
@@ -102,7 +147,9 @@ import app.noter.ui.editor.insertLink
 import app.noter.ui.editor.setBlockStyle
 import app.noter.ui.editor.slashMatches
 import app.noter.ui.editor.slashQuery
+import app.noter.ui.editor.taskBoxAt
 import app.noter.ui.editor.toggleInline
+import app.noter.ui.editor.toggleTask
 
 private fun fontFamily(style: String): FontFamily = when (style) {
     "serif" -> FontFamily.Serif
@@ -154,14 +201,43 @@ private class EditorState(initial: TextFieldValue) {
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
-fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (String) -> Unit, modifier: Modifier = Modifier) {
+fun EditorPane(
+    note: Note, loadGeneration: Int, settings: Settings, onChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    saveImage: suspend (ByteArray, String) -> String = { _, _ -> throw IllegalStateException("Images are not available here.") },
+    loadImage: suspend (String) -> ByteArray = { throw IllegalStateException("Images are not available here.") },
+) {
     // Reset only on note switch or reload from disk; resetting on every model change would move the cursor during fast typing.
     val state = remember(note.id, loadGeneration) { EditorState(TextFieldValue(note.markdown)) }
     val latestEditor by rememberUpdatedState(state)
     val latestChange by rememberUpdatedState(onChange)
-    val transformation = remember { MarkdownTransformation() }
     val focusManager = LocalFocusManager.current
     var focused by remember { mutableStateOf(false) }
+    val editing = state.value.text.let { text ->
+        val selection = state.value.selection
+        val first = text.lastIndexOf('\n', selection.min - 1) + 1
+        val last = text.indexOf('\n', selection.max).let { if (it < 0) text.length else it }
+        if (focused) first..last else null
+    }
+    var textLayout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    // Images and tables outside the edited lines are drawn over their hidden Markdown; their lines reserve the space.
+    val density = LocalDensity.current
+    val images = remember(note.id, loadGeneration) { mutableStateMapOf<String, ImageBitmap?>() }
+    val blocks = remember(state.value.text, editing) { previewBlocks(state.value.text, editing) }
+    val fieldWidth = textLayout?.size?.width ?: 0
+    val imageHeights = blocks.filterIsInstance<ImagePreviewBlock>().associate { block ->
+        val pixels = when {
+            block.link !in images -> with(density) { 120.dp.toPx() }
+            else -> images[block.link]?.let { bitmap ->
+                val scaled = if (fieldWidth > 0) fieldWidth.toFloat() * bitmap.height / bitmap.width else bitmap.height.toFloat()
+                minOf(scaled, with(density) { 420.dp.toPx() })
+            }
+        }
+        block.link to pixels?.let { with(density) { it.toSp() } }
+    }
+    val tableRowHeight = with(density) { 40.dp.toSp() }
+    val transformation = remember(editing, imageHeights, tableRowHeight) { MarkdownTransformation(editing, BlockLayout(imageHeights, tableRowHeight)) }
+    var tableEditing by remember(note.id) { mutableStateOf<TablePreviewBlock?>(null) }
     var linkDialog by remember { mutableStateOf(false) }
     var dismissedSlash by remember(note.id) { mutableStateOf<String?>(null) }
     var sourceMode by remember(note.id) { mutableStateOf(false) }
@@ -181,6 +257,66 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
 
     val slash = slashQuery(state.value)?.takeIf { focused && state.value.text != dismissedSlash }
     val matches = slash?.let(::slashMatches).orEmpty()
+
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val latestSave by rememberUpdatedState(saveImage)
+    val latestEditing by rememberUpdatedState(editing)
+    val focusRequester = remember { FocusRequester() }
+    var imageError by remember { mutableStateOf<String?>(null) }
+    var previewImage by remember(note.id) { mutableStateOf<Pair<String, Int>?>(null) }
+    var reordering by remember(note.id) { mutableStateOf(false) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) scope.launch {
+            try {
+                val mime = context.contentResolver.getType(uri).orEmpty()
+                val bytes = withContext(Dispatchers.IO) {
+                    (context.contentResolver.openInputStream(uri) ?: throw IllegalStateException("Could not read the image.")).use { input ->
+                        val output = java.io.ByteArrayOutputStream()
+                        val buffer = ByteArray(8192)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            if (output.size() + read > 20_000_000) throw IllegalStateException("Images must be smaller than 20 MB.")
+                            output.write(buffer, 0, read)
+                        }
+                        output.toByteArray()
+                    }
+                }
+                val link = latestSave(bytes, mime)
+                apply(insertImage(latestEditor.value, link))
+            } catch (problem: Exception) {
+                imageError = problem.message ?: "Could not add the image."
+            }
+        }
+    }
+    fun pickImage() = picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+
+    val latestLoad by rememberUpdatedState(loadImage)
+    // Keyed by the set of links so typing elsewhere does not restart loads.
+    val imageLinks = blocks.mapNotNullTo(HashSet()) { (it as? ImagePreviewBlock)?.link }
+    LaunchedEffect(imageLinks) {
+        for (link in imageLinks) if (link !in images) launch {
+            images[link] = try {
+                val bytes = latestLoad(link)
+                withContext(Dispatchers.Default) { decodeImage(bytes, 1600) }
+            } catch (problem: Exception) {
+                if (problem is kotlinx.coroutines.CancellationException) throw problem
+                null
+            }
+        }
+    }
+    // Only blocks actually drawn over the text: images that failed to load keep their file-name chip.
+    val drawnBlocks = blocks.filter { it !is ImagePreviewBlock || imageHeights[it.link] != null }
+    val latestDrawn by rememberUpdatedState(drawnBlocks)
+    fun blockBounds(layout: TextLayoutResult, block: PreviewBlock): Pair<Float, Float> =
+        layout.getLineTop(layout.getLineForOffset(block.start)) to layout.getLineBottom(layout.getLineForOffset(block.end))
+    fun openBlock(block: PreviewBlock) {
+        when (block) {
+            is ImagePreviewBlock -> previewImage = imageAt(latestEditor.value.text, block.start)
+            is TablePreviewBlock -> { focusManager.clearFocus(); tableEditing = block }
+        }
+    }
 
     BoxWithConstraints(modifier.fillMaxSize()) {
         val slashHeight = (maxHeight * 0.35f).coerceIn(48.dp, 220.dp)
@@ -218,7 +354,46 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
                                 modifier = Modifier.fillMaxWidth().heightIn(min = (viewport - if (imeVisible) 0.dp else 100.dp).coerceAtLeast(80.dp))
                                     .padding(top = if (imeVisible) 12.dp else 0.dp, bottom = 24.dp)
                                     .semantics { contentDescription = "Note content" }
-                                    .onFocusChanged { focused = it.isFocused },
+                                    .focusRequester(focusRequester)
+                                    .onFocusChanged { focused = it.isFocused }
+                                    // Taps on a task checkbox toggle it, and taps on an image chip open its preview,
+                                    // instead of moving the caret or opening the keyboard.
+                                    .pointerInput(Unit) {
+                                        val slop = 12.dp.toPx()
+                                        awaitEachGesture {
+                                            val down = awaitFirstDown(pass = PointerEventPass.Initial)
+                                            val layout = textLayout ?: return@awaitEachGesture
+                                            val text = latestEditor.value.text
+                                            val drawn = latestDrawn.takeIf { layout.layoutInput.text.length == text.length }.orEmpty()
+                                            val hit = drawn.firstOrNull { block -> blockBounds(layout, block).let { (top, bottom) -> down.position.y in top..bottom } }
+                                            if (hit != null) {
+                                                down.consume()
+                                                val up = waitForUpOrCancellation(PointerEventPass.Initial) ?: return@awaitEachGesture
+                                                up.consume()
+                                                openBlock(hit)
+                                                return@awaitEachGesture
+                                            }
+                                            val offset = layout.getOffsetForPosition(down.position)
+                                            val image = imageAt(text, offset)?.takeIf { (_, close) -> latestEditing?.contains(close) != true }
+                                            if (image != null) {
+                                                val chip = layout.getBoundingBox(image.second)
+                                                if (down.position.x > chip.right + slop || down.position.y < chip.top - slop || down.position.y > chip.bottom + slop) return@awaitEachGesture
+                                                down.consume()
+                                                val up = waitForUpOrCancellation(PointerEventPass.Initial) ?: return@awaitEachGesture
+                                                up.consume()
+                                                previewImage = image
+                                                return@awaitEachGesture
+                                            }
+                                            val box = taskBoxAt(text, offset)?.takeIf { it < text.length } ?: return@awaitEachGesture
+                                            val bounds = layout.getBoundingBox(box)
+                                            if (down.position.x > bounds.right + slop / 2 ||down.position.y < bounds.top - slop || down.position.y > bounds.bottom + slop) return@awaitEachGesture
+                                            down.consume()
+                                            val up = waitForUpOrCancellation(PointerEventPass.Initial) ?: return@awaitEachGesture
+                                            up.consume()
+                                            apply(toggleTask(latestEditor.value, box))
+                                        }
+                                    },
+                                onTextLayout = { textLayout = it },
                                 textStyle = TextStyle(
                                     color = NoterColors.editorText,
                                     fontSize = settings.fontSize.toFloat().sp,
@@ -236,6 +411,13 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
                                             }
                                         }
                                         innerTextField()
+                                        val layout = textLayout
+                                        if (layout != null && layout.layoutInput.text.length == state.value.text.length) {
+                                            for (block in drawnBlocks) {
+                                                val (top, bottom) = blockBounds(layout, block)
+                                                BlockOverlay(block, images, layout, top, bottom, onOpen = { openBlock(block) })
+                                            }
+                                        }
                                     }
                                 },
                                 keyboardOptions = KeyboardOptions(
@@ -249,7 +431,10 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
                 }
             }
             if (focused && (sourceMode || databases.isEmpty()) && slash != null) {
-                SlashMenu(matches, maxHeight = slashHeight, onPick = { apply(applySlash(state.value, it)) }, onDismiss = { dismissedSlash = state.value.text })
+                SlashMenu(matches, maxHeight = slashHeight, onPick = {
+                    apply(applySlash(state.value, it))
+                    if (it == BlockStyle.Image) pickImage()
+                }, onDismiss = { dismissedSlash = state.value.text })
             } else if (focused && (sourceMode || databases.isEmpty())) {
                 FormatToolbar(
                     canUndo = state.canUndo,
@@ -260,6 +445,8 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
                     onInline = { apply(toggleInline(state.value, it)) },
                     onLink = { linkDialog = true },
                     onIndent = { apply(indentLines(state.value, outdent = it)) },
+                    onImage = { pickImage() },
+                    onReorder = { focusManager.clearFocus(); reordering = true },
                     onHideKeyboard = { focusManager.clearFocus() },
                 )
             } else if (settings.showNoteStats) {
@@ -273,6 +460,49 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
         }
     }
 
+    imageError?.let { message ->
+        MessageDialog("Could not add image", message, "OK", null, onConfirm = { imageError = null }, onDismiss = { imageError = null })
+    }
+    previewImage?.let { (link, close) ->
+        ImagePreview(link, loadImage, onClose = { previewImage = null }, onEdit = {
+            previewImage = null
+            val editor = latestEditor
+            if (close < editor.value.text.length) editor.update(editor.value.copy(selection = TextRange(close + 1)), step = false)
+            runCatching { focusRequester.requestFocus() }
+        })
+    }
+    tableEditing?.let { block ->
+        TableEditorDialog(
+            block.rows.map { it.second }, block.align,
+            onDismiss = { tableEditing = null },
+            onEditText = {
+                tableEditing = null
+                val editor = latestEditor
+                if (block.start < editor.value.text.length) editor.update(editor.value.copy(selection = TextRange((block.start + 2).coerceAtMost(block.end))), step = false)
+                runCatching { focusRequester.requestFocus() }
+            },
+        ) { rows, align ->
+            val editor = latestEditor
+            val text = editor.value.text
+            // A synced change may have replaced the table while the grid was open; keep both by refusing the stale write.
+            if (block.end > text.length || text.substring(block.start, block.end) != block.source) {
+                imageError = "This table changed while you were editing it. Open it again to edit the latest version."
+            } else {
+                val markdown = tableMarkdown(rows, align)
+                val next = text.replaceRange(block.start, block.end, markdown)
+                val caret = editor.value.selection.start.let { if (it > block.end) it + markdown.length - (block.end - block.start) else it.coerceAtMost(next.length) }
+                apply(TextFieldValue(next, TextRange(caret)))
+            }
+            tableEditing = null
+        }
+    }
+    if (reordering) {
+        ReorderBlocksDialog(state.value.text, onDismiss = { reordering = false }) { markdown ->
+            reordering = false
+            val editor = latestEditor
+            apply(TextFieldValue(markdown, TextRange(editor.value.selection.start.coerceAtMost(markdown.length))))
+        }
+    }
     if (linkDialog) {
         val selected = state.value.text.substring(state.value.selection.min, state.value.selection.max)
         LinkDialog(selected, onDismiss = { linkDialog = false }) { label, url ->
@@ -290,6 +520,55 @@ fun EditorPane(note: Note, loadGeneration: Int, settings: Settings, onChange: (S
             apply(editor.value.copy(text = markdown, selection = TextRange(selection.start.coerceAtMost(markdown.length), selection.end.coerceAtMost(markdown.length)), composition = null))
             openedDatabase = databaseBlocks(markdown).first { it.index == current.index }
         }, onClose = { openedDatabase = null })
+    }
+}
+
+/** Draws an image or a table grid over its hidden Markdown lines; [top] and [bottom] are the lines' bounds in pixels. */
+@Composable
+private fun BlockOverlay(block: PreviewBlock, images: Map<String, ImageBitmap?>, layout: TextLayoutResult, top: Float, bottom: Float, onOpen: () -> Unit) {
+    val density = LocalDensity.current
+    val width = with(density) { layout.size.width.toDp() }
+    val height = with(density) { (bottom - top).toDp() }
+    val border = MaterialTheme.colorScheme.outlineVariant
+    val label = when (block) { is ImagePreviewBlock -> "Image ${block.alt.ifBlank { android.net.Uri.decode(block.link.substringAfterLast('/')) }}"; is TablePreviewBlock -> "Table, tap to edit" }
+    Box(
+        Modifier.offset { IntOffset(0, top.roundToInt()) }.width(width).height(height)
+            .semantics { contentDescription = label; onClick { onOpen(); true } },
+    ) {
+        when (block) {
+            is ImagePreviewBlock -> {
+                val bitmap = images[block.link]
+                if (bitmap != null) {
+                    Image(bitmap, contentDescription = null, contentScale = ContentScale.Fit, alignment = Alignment.TopStart, modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(8.dp)))
+                } else {
+                    Box(Modifier.fillMaxSize().clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                    }
+                }
+            }
+            is TablePreviewBlock -> {
+                val columns = block.rows.maxOf { it.second.size }.coerceAtLeast(1)
+                block.rows.forEachIndexed { index, (lineStart, cells) ->
+                    val line = layout.getLineForOffset(lineStart)
+                    val rowTop = layout.getLineTop(line) - top
+                    val rowHeight = with(density) { (layout.getLineBottom(line) - layout.getLineTop(line)).toDp() }
+                    Row(
+                        Modifier.offset { IntOffset(0, rowTop.roundToInt()) }.fillMaxWidth().height(rowHeight)
+                            .background(if (index == 0) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surface),
+                    ) {
+                        repeat(columns) { column ->
+                            Box(Modifier.weight(1f).fillMaxHeight().border(0.5.dp, border).padding(horizontal = 8.dp), contentAlignment = Alignment.CenterStart) {
+                                Text(
+                                    cells.getOrElse(column) { "" }, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyMedium, fontWeight = if (index == 0) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -385,6 +664,8 @@ private fun FormatToolbar(
     onInline: (String) -> Unit,
     onLink: () -> Unit,
     onIndent: (outdent: Boolean) -> Unit,
+    onImage: () -> Unit,
+    onReorder: () -> Unit,
     onHideKeyboard: () -> Unit,
 ) {
     var headings by remember { mutableStateOf(false) }
@@ -411,18 +692,25 @@ private fun FormatToolbar(
                     ToolButton(Icons.Default.FormatBold, "Bold") { onInline("**") }
                     ToolButton(Icons.Default.FormatItalic, "Italic") { onInline("*") }
                     ToolButton(Icons.AutoMirrored.Filled.FormatListBulleted, "Bullet list") { onBlock(BlockStyle.Bullets) }
+                    ToolButton(Icons.Default.CheckBox, "Task list") { onBlock(BlockStyle.Task) }
+                    ToolButton(Icons.Default.Image, "Insert image", onClick = onImage)
                 }
                 Box {
                     ToolButton(Icons.Default.MoreHoriz, "More formatting") { more = true }
                     DropdownMenu(expanded = more, onDismissRequest = { more = false }, properties = PopupProperties(focusable = false)) {
                         DropdownMenuItem(text = { Text("Add link") }, leadingIcon = { Icon(Icons.Default.Link, contentDescription = null) }, onClick = { more = false; onLink() })
                         DropdownMenuItem(text = { Text("Inline code") }, leadingIcon = { Icon(Icons.Default.Code, contentDescription = null) }, onClick = { more = false; onInline("`") })
-                        listOf(BlockStyle.Numbers to Icons.Default.FormatListNumbered, BlockStyle.Quote to Icons.Default.FormatQuote, BlockStyle.Code to Icons.Default.DataObject, BlockStyle.Divider to Icons.Default.HorizontalRule).forEach { (style, icon) ->
+                        listOf(
+                            BlockStyle.Numbers to Icons.Default.FormatListNumbered, BlockStyle.Quote to Icons.Default.FormatQuote,
+                            BlockStyle.Toggle to Icons.AutoMirrored.Filled.ArrowRight, BlockStyle.Table to Icons.Default.GridOn,
+                            BlockStyle.Code to Icons.Default.DataObject, BlockStyle.Divider to Icons.Default.HorizontalRule,
+                        ).forEach { (style, icon) ->
                             DropdownMenuItem(text = { Text(style.label) }, leadingIcon = { Icon(icon, contentDescription = null) }, onClick = { more = false; onBlock(style) })
                         }
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         DropdownMenuItem(text = { Text("Indent") }, leadingIcon = { Icon(Icons.AutoMirrored.Filled.FormatIndentIncrease, contentDescription = null) }, onClick = { more = false; onIndent(false) })
                         DropdownMenuItem(text = { Text("Outdent") }, leadingIcon = { Icon(Icons.AutoMirrored.Filled.FormatIndentDecrease, contentDescription = null) }, onClick = { more = false; onIndent(true) })
+                        DropdownMenuItem(text = { Text("Reorder blocks") }, leadingIcon = { Icon(Icons.Default.SwapVert, contentDescription = null) }, onClick = { more = false; onReorder() })
                     }
                 }
                 Box(Modifier.width(1.dp).heightIn(min = 24.dp).background(MaterialTheme.colorScheme.outlineVariant))

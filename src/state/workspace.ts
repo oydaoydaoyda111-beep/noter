@@ -91,6 +91,10 @@ export function createStore(initial: Workspace) {
         : [...workspace.collapsedFolders, id];
       emit('folders', id);
     },
+    setAllFolders(collapsed: boolean) {
+      workspace.collapsedFolders = collapsed ? Object.values(workspace.nodes).filter(node => node.type === 'folder').map(node => node.id) : [];
+      emit('folders');
+    },
     edit(id: string, markdown: string) {
       const note = workspace.nodes[id];
       if (note?.type !== 'note' || note.markdown === markdown) return;

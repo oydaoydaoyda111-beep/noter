@@ -26,6 +26,8 @@ class SyncConflictException(message: String) : Exception(message)
 private const val MAX_NOTE = 10_000_000L
 private const val MAX_TOTAL = 100_000_000L
 private const val MANIFEST = ".noter/workspace.json"
+private const val ATTACHMENTS = "attachments"
+private const val MAX_IMAGE = 20_000_000L
 
 /**
  * Markdown files plus `.noter/workspace.json`, in the same layout as the desktop vault so both clients can share a synced folder.
@@ -91,6 +93,8 @@ class Vault(private val saf: Saf) {
         fun walk(doc: String, prefix: String) {
             for (entry in saf.list(doc)) {
                 if (entry.name.startsWith(".") || entry.name == "node_modules") continue
+                // Root `attachments/` holds note images; desktop hides it from the notes tree too.
+                if (prefix.isEmpty() && entry.isDir && entry.name == ATTACHMENTS) continue
                 val key = prefix + entry.name
                 if (entry.isDir || entry.name.lowercase().endsWith(".md")) {
                     visiblePath(key)
@@ -164,6 +168,40 @@ class Vault(private val saf: Saf) {
         pollingRevision = revision
         lastFullCheck = System.nanoTime()
         known = snapshot
+    }
+
+    /** The folder holding notes of [parentId] as a `/`-terminated path, or "" at the root; it must have been saved. */
+    private fun folderPath(parentId: String?): String {
+        if (parentId == null) return ""
+        val path = known?.manifest?.paths?.get(parentId) ?: throw VaultException("Save this note before adding images.")
+        return "$path/"
+    }
+
+    /** Saves image bytes as `attachments/image-<time>.<ext>` and returns its link relative to the note's folder. */
+    fun saveImage(parentId: String?, bytes: ByteArray, extension: String): String {
+        if (bytes.size > MAX_IMAGE) throw VaultException("Images must be smaller than 20 MB.")
+        val folder = folderPath(parentId)
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+        val taken = saf.resolve(ATTACHMENTS)?.takeIf { it.isDir }?.let { dir -> saf.list(dir.doc).map { it.name.lowercase() }.toSet() }.orEmpty()
+        var name = "image-$stamp.$extension"
+        var index = 2
+        while (name.lowercase() in taken) name = "image-$stamp-${index++}.$extension"
+        saf.writeAtomic("$ATTACHMENTS/$name", bytes, mustBeAbsent = true)
+        return "../".repeat(folder.count { it == '/' }) + "$ATTACHMENTS/$name"
+    }
+
+    /** Reads an image linked from a note in [parentId]; links may not leave the workspace or enter hidden folders. */
+    fun readImage(parentId: String?, link: String): ByteArray {
+        if (Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:").containsMatchIn(link) || link.startsWith("/")) throw VaultException("Only images inside the workspace can be shown.")
+        val segments = folderPath(parentId).split('/').filter { it.isNotEmpty() }.toMutableList()
+        for (segment in android.net.Uri.decode(link.substringBefore('#').substringBefore('?')).split('/')) when (segment) {
+            "", "." -> Unit
+            ".." -> if (segments.isEmpty()) throw VaultException("This image is outside the workspace.") else segments.removeAt(segments.lastIndex)
+            else -> segments += segment
+        }
+        if (segments.isEmpty() || segments.any { it.startsWith('.') }) throw VaultException("This image is outside the workspace.")
+        val entry = saf.resolve(segments.joinToString("/"))?.takeIf { !it.isDir } ?: throw VaultException("Image not found. It may still be syncing.")
+        return saf.read(entry.doc, MAX_IMAGE)
     }
 
     fun revision(force: Boolean = false): String {

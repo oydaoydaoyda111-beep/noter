@@ -18,7 +18,7 @@ export function bookmark(root: HTMLElement): Bookmark | null {
   before.setEnd(range.endContainer, range.endOffset);
   const anchor = (node: Node, offset: number): BlockAnchor | undefined => {
     const element = node instanceof Element ? node : node.parentElement;
-    const block = element?.closest<HTMLElement>('p,h1,h2,h3,li,pre,div');
+    const block = element?.closest<HTMLElement>('p,h1,h2,h3,li,pre,div,td,th');
     if (!block || block === root) return;
     const path: number[] = [];
     let child: Node = block;
@@ -38,7 +38,7 @@ export function restoreBookmark(root: HTMLElement, position: Bookmark | null) {
   const endpoint = (absolute: number, anchor?: BlockAnchor): [Node, number] => {
     let container: Node | undefined = root;
     if (anchor) for (const index of anchor.path) container = container?.childNodes[index];
-    const anchored = !!anchor && container instanceof HTMLElement && container.matches('p,h1,h2,h3,li,pre,div,ul,ol,blockquote');
+    const anchored = !!anchor && container instanceof HTMLElement && container.matches('p,h1,h2,h3,li,pre,div,ul,ol,blockquote,td,th');
     const target = anchored ? container! : root;
     const desired = anchored ? anchor!.offset : absolute;
     const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
@@ -51,7 +51,7 @@ export function restoreBookmark(root: HTMLElement, position: Bookmark | null) {
     }
     if (last) return [last, last.length];
     const element = target as HTMLElement;
-    const block = element.querySelector<HTMLElement>('p,h1,h2,h3,li,pre') ?? element;
+    const block = element.querySelector<HTMLElement>('p,h1,h2,h3,li,pre,td,th') ?? element;
     return [block.tagName === 'PRE' ? block.querySelector('code') ?? block : block, 0];
   };
   const range = document.createRange();
@@ -73,7 +73,7 @@ export function caretAt(node: Node, end = false) {
 export function currentBlock(root: HTMLElement): HTMLElement | null {
   const range = selectionRange(root);
   const element = range?.startContainer instanceof Element ? range.startContainer : range?.startContainer.parentElement;
-  const block = element?.closest<HTMLElement>('p,h1,h2,h3,li,pre,div');
+  const block = element?.closest<HTMLElement>('p,h1,h2,h3,li,pre,div,td,th');
   return block && block !== root && root.contains(block) ? block : null;
 }
 

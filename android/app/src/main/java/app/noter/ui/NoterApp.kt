@@ -209,6 +209,7 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
                                 DropdownMenu(expanded = financeMenu, onDismissRequest = { financeMenu = false }) {
                                     DropdownMenuItem(text = { Text("Manage accounts") }, onClick = { financeMenu = false; financeManager = FinanceManager.Accounts })
                                     DropdownMenuItem(text = { Text("Manage categories") }, onClick = { financeMenu = false; financeManager = FinanceManager.Categories })
+                                    DropdownMenuItem(text = { Text("Planned expenses") }, onClick = { financeMenu = false; financeManager = FinanceManager.Planned })
                                     DropdownMenuItem(text = { Text("Reload synced files") }, onClick = { financeMenu = false; financeVm.reload() })
                                 }
                             }
@@ -294,7 +295,11 @@ private fun WorkspaceScreen(vm: WorkspaceViewModel, financeVm: FinanceViewModel,
                         TextButton(onClick = { scope.launch { drawer.open() } }) { Text("Browse notes") }
                     }
                 } else {
-                    EditorPane(active, vm.loadGeneration, workspace.settings, onChange = { vm.edit(active.id, it) })
+                    EditorPane(
+                        active, vm.loadGeneration, workspace.settings, onChange = { vm.edit(active.id, it) },
+                        saveImage = { bytes, mime -> vm.saveImage(active.id, bytes, mime) },
+                        loadImage = { link -> vm.loadImage(active.id, link) },
+                    )
                 }
             }
         }

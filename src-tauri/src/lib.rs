@@ -236,6 +236,35 @@ async fn save_expense_plans(state: State<'_, VaultState>, text: String, expected
         .await.map_err(|_| "Could not save planned expenses.")?
 }
 #[tauri::command]
+async fn save_attachment(state: State<'_, VaultState>, request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else { return Err("Invalid image data.".into()) };
+    let extension = request.headers().get("x-extension").and_then(|value| value.to_str().ok()).unwrap_or_default().to_string();
+    let (folder, bytes) = (root(&state)?, bytes.clone());
+    tauri::async_runtime::spawn_blocking(move || vault::save_attachment(&folder, &extension, &bytes))
+        .await.map_err(|_| "Could not save image.")?
+}
+#[tauri::command]
+async fn pick_attachment(app: tauri::AppHandle, state: State<'_, VaultState>) -> Result<Option<String>, String> {
+    let folder = root(&state)?;
+    let Some(file) = app.dialog().file().add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]).blocking_pick_file() else {
+        return Ok(None);
+    };
+    let path = file.into_path().map_err(|_| "Could not open that file.")?;
+    let extension = path.extension().map(|value| value.to_string_lossy().to_string()).unwrap_or_default();
+    if fs::metadata(&path).map_err(|_| "Could not read that file.")?.len() > 20_000_000 {
+        return Err("Images must be smaller than 20 MB.".into());
+    }
+    let bytes = fs::read(&path).map_err(|_| "Could not read that file.")?;
+    tauri::async_runtime::spawn_blocking(move || vault::save_attachment(&folder, &extension, &bytes).map(Some))
+        .await.map_err(|_| "Could not save image.")?
+}
+#[tauri::command]
+async fn read_attachment(state: State<'_, VaultState>, note_id: String, source: String) -> Result<tauri::ipc::Response, String> {
+    let folder = root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || vault::read_attachment(&folder, &note_id, &source).map(tauri::ipc::Response::new))
+        .await.map_err(|_| "Could not read image.")?
+}
+#[tauri::command]
 async fn open_document(app: tauri::AppHandle, extension: String) -> Result<Option<Value>, String> {
     if !["xlsx", "json"].contains(&extension.as_str()) {
         return Err("Unsupported file type.".into());
@@ -346,7 +375,10 @@ pub fn run() {
             load_expense_plans,
             save_expense_plans,
             open_document,
-            save_document
+            save_document,
+            save_attachment,
+            pick_attachment,
+            read_attachment
         ])
         .setup(|app| {
             let config = app.path().app_config_dir()?.join("vault.json");

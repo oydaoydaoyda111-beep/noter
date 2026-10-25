@@ -3,6 +3,8 @@ const paths = {
   folder: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   folderPlus: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 10v7M8.5 13.5h7"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
+  collapseAll: '<path d="m7 4 5 5 5-5M7 20l5-5 5 5"/>',
+  expandAll: '<path d="m7 9 5-5 5 5M7 15l5 5 5-5"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',

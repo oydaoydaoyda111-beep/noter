@@ -14,11 +14,14 @@ import { animateDocument } from './ui/motion';
 import { icon } from './ui/icons';
 import { nameEmoji } from './ui/emoji';
 import { el } from './ui/dom';
-import type { WorkspaceNode } from './types';
+import type { Note, WorkspaceNode } from './types';
+import { linkedNames } from './editor/markdown';
+import type { NoteLinks } from './editor/links';
 import { createFinance } from './finance/finance';
 
 export async function startApp(mount: HTMLElement) {
   const loaded = await storage.load();
+  loaded.workspace.collapsedFolders = Object.values(loaded.workspace.nodes).filter(node => node.type === 'folder').map(node => node.id);
   const store = createStore(loaded.workspace);
   mount.innerHTML = `
     <div class="app-shell">
@@ -38,7 +41,7 @@ export async function startApp(mount: HTMLElement) {
           <button id="clear-search" class="icon-button" type="button" aria-label="Clear search" title="Clear search" hidden></button>
         </div>
         <div id="search-filters" class="search-filters" role="group" aria-label="Search in"></div>
-        <div class="tree-heading"><h2 id="tree-label">Workspace</h2><span id="note-count"></span></div>
+        <div class="tree-heading"><h2 id="tree-label">Workspace</h2><div class="tree-actions"><button id="collapse-folders" class="icon-button" type="button" title="Collapse all folders" aria-label="Collapse all folders"></button><button id="expand-folders" class="icon-button" type="button" title="Expand all folders" aria-label="Expand all folders"></button><span id="note-count"></span></div></div>
         <div class="sidebar-files"><nav id="file-tree"></nav><div id="search-results" aria-label="Search results" hidden></div></div>
         <div class="sidebar-bottom">
           <button id="settings" class="settings-button" type="button"><span>Settings</span></button>
@@ -58,6 +61,7 @@ export async function startApp(mount: HTMLElement) {
               <div class="document-symbol" aria-hidden="true"></div>
               <input id="note-title" class="note-title" type="text" aria-label="Note title" placeholder="Untitled" maxlength="120" autocomplete="off" spellcheck="false" />
               <div id="editor" class="editor"></div>
+              <section id="backlinks" class="backlinks" aria-label="Notes linking here" hidden></section>
               <div class="document-end" aria-hidden="true"><span></span><span class="end-dot"></span><span></span></div>
             </article>
           </div>
@@ -148,6 +152,57 @@ export async function startApp(mount: HTMLElement) {
 
   function open(id: string) { section(false); store.open(id); }
 
+  const notePath = (id: string) => [...store.path(id), store.workspace.nodes[id].name].join('/');
+  const allNotes = () => Object.values(store.workspace.nodes).filter((node): node is Note => node.type === 'note');
+  // Obsidian-style targets: a note name, or a folder path when names repeat; headings after # are ignored.
+  function resolveNote(target: string): string | null {
+    const wanted = target.split('#')[0].trim().replace(/\.md$/i, '').toLowerCase();
+    if (!wanted) return null;
+    const notes = allNotes();
+    const byPath = wanted.includes('/') ? notes.find(note => notePath(note.id).toLowerCase() === wanted) : undefined;
+    return (byPath ?? notes.find(note => note.name.toLowerCase() === wanted.split('/').pop()))?.id ?? null;
+  }
+  const noteLinks: NoteLinks = {
+    search(query) {
+      const needle = query.toLowerCase();
+      const notes = allNotes().filter(note => note.id !== store.activeNote?.id);
+      const names = new Map<string, number>();
+      for (const note of notes) names.set(note.name.toLowerCase(), (names.get(note.name.toLowerCase()) ?? 0) + 1);
+      return notes.map(note => ({ note, rank: note.name.toLowerCase().startsWith(needle) ? 0 : note.name.toLowerCase().includes(needle) ? 1 : 2 }))
+        .filter(entry => entry.rank < 2).sort((a, b) => a.rank - b.rank || a.note.name.localeCompare(b.note.name)).slice(0, 8)
+        .map(({ note }) => ({ target: (names.get(note.name.toLowerCase()) ?? 0) > 1 ? notePath(note.id) : note.name, name: note.name, detail: store.path(note.id).join(' / ') || 'Workspace' }));
+    },
+    resolve: resolveNote,
+    open(target) {
+      const id = resolveNote(target);
+      if (id) { open(id); return; }
+      const name = target.split('#')[0].split('/').pop()?.trim();
+      if (name) { section(false); store.create('note', name, null); }
+    },
+  };
+
+  function renderBacklinks() {
+    const container = get('backlinks');
+    const note = store.activeNote;
+    container.replaceChildren();
+    const names = note ? new Set([note.name.toLowerCase(), notePath(note.id).toLowerCase()]) : new Set<string>();
+    const linksHere = (markdown: string) => linkedNames(markdown).some(target => names.has(target.replace(/\.md$/, '')));
+    const sources = note ? allNotes().filter(other => other.id !== note.id && linksHere(other.markdown)).sort((a, b) => a.name.localeCompare(b.name)) : [];
+    container.hidden = !sources.length;
+    if (!sources.length) return;
+    container.append(el('h2', 'backlinks-title', `Linked from ${sources.length} ${sources.length === 1 ? 'note' : 'notes'}`));
+    for (const source of sources) {
+      const line = source.markdown.split('\n').find(linksHere) ?? '';
+      const context = line.replace(/\[\[([^[\]|]+)(?:\|([^[\]]+))?\]\]/g, (_, target: string, label?: string) => label || target).replace(/^\s*(?:[-*+>]|#{1,6}|\d+\.)\s+/, '').trim();
+      const item = el('button', 'backlink'); item.type = 'button';
+      item.append(el('span', 'backlink-name', source.name), el('span', 'backlink-context', context.length > 160 ? `${context.slice(0, 160)}…` : context));
+      item.onclick = () => open(source.id);
+      container.append(item);
+    }
+  }
+  let backlinkTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleBacklinks = () => { clearTimeout(backlinkTimer); backlinkTimer = setTimeout(renderBacklinks, 400); };
+
   let creatingNote = false;
   async function createNote(parentId: string | null) {
     if (creatingNote) return;
@@ -200,7 +255,7 @@ export async function startApp(mount: HTMLElement) {
 
   const editor = createEditor(editorRoot, get('format-toolbar'), markdown => {
     if (store.activeNote) store.edit(store.activeNote.id, markdown);
-  });
+  }, () => store.activeNote ? store.path(store.activeNote.id).length : 0, noteLinks);
   const tree = createTree(get('file-tree'), store, { open, menu: nodeMenu, createNote });
   const tabs = createTabs(get('tabs'), store, open);
   const search = createSearch(get<HTMLInputElement>('search'), get<HTMLButtonElement>('clear-search'), get('search-results'), get('file-tree'), get('tree-label'), get('search-filters'), store, open);
@@ -239,6 +294,7 @@ export async function startApp(mount: HTMLElement) {
       if (note) animateDocument(documentPage);
     }
     updateStats();
+    renderBacklinks();
     if (showingFinance) document.title = 'Finance — Noter';
   }
 
@@ -272,14 +328,16 @@ export async function startApp(mount: HTMLElement) {
       clearTimeout(titleTimer); editor.reset(); tree.reset(); scrollPositions.clear(); shownNoteId = null;
       applySettings(store.workspace.settings); finance.refresh(); tree.render(); tabs.render(); search.reset(); renderNote(); renderCount(); saveNow(); return;
     }
-    if (change === 'structure') { tree.render(); tabs.render(); search.render(); renderNote(); renderCount(); persistView(); }
-    if (change === 'content') { updateStats(); if (get<HTMLInputElement>('search').value.trim()) search.render(); }
+    if (change === 'structure') { tree.render(); tabs.render(); search.render(); renderNote(); renderCount(); persistView(); editor.refreshLinks(); }
+    if (change === 'content') { updateStats(); scheduleBacklinks(); if (get<HTMLInputElement>('search').value.trim()) search.render(); }
     if (change === 'settings') { applySettings(store.workspace.settings); finance.refresh(); }
     scheduleSave();
   });
 
   get('new-note').prepend(icon('plus'));
   get('new-folder').append(icon('folderPlus'));
+  get('collapse-folders').append(icon('collapseAll'));
+  get('expand-folders').append(icon('expandAll'));
   get('settings').prepend(icon('settings'));
   get('clear-search').append(icon('close'));
   get('note-actions').append(icon('more'));
@@ -289,6 +347,8 @@ export async function startApp(mount: HTMLElement) {
   mount.querySelector('.new-note-key')!.textContent = `${mod} N`;
   get('new-note').onclick = () => createNote(tree.destination);
   get('new-folder').onclick = () => void createFolder(tree.destination);
+  get('collapse-folders').onclick = () => store.setAllFolders(true);
+  get('expand-folders').onclick = () => store.setAllFolders(false);
   get('empty-create').onclick = () => createNote(null);
   get('settings').onclick = applicationSettings;
   noteMenuButton.onclick = () => {

@@ -285,7 +285,9 @@ fn scan(
         let name = entry.file_name().into_string().map_err(|_| {
             "A workspace filename is not Unicode. Rename it outside Noter before opening this folder."
         })?;
-        if name.starts_with('.') || name == "node_modules" || system_entry(&name, &entry) {
+        // The root attachments folder holds note images; it is not part of the notes tree.
+        let attachments = relative.as_os_str().is_empty() && name == ATTACHMENTS;
+        if name.starts_with('.') || name == "node_modules" || attachments || system_entry(&name, &entry) {
             continue;
         }
         let kind = entry
@@ -1065,6 +1067,97 @@ pub fn save_expense_plans(root: &Path, text: &str, expected: Option<&str>) -> Re
         return Err("SYNC_CONFLICT: Planned expenses changed while saving. Reload plans before editing again.".into());
     }
     Ok(saved)
+}
+const ATTACHMENTS: &str = "attachments";
+const MAX_ATTACHMENT: u64 = 20_000_000;
+const IMAGE_TYPES: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// Civil date and time (UTC) for readable attachment names, without a date dependency.
+fn timestamp_name() -> String {
+    let seconds = now() / 1000;
+    let (days, rest) = ((seconds / 86_400) as i64, seconds % 86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rest / 3600, rest / 60 % 60, rest % 60)
+}
+
+/// Stores image bytes as a new file in the root attachments folder and returns its workspace-relative path.
+pub fn save_attachment(root: &Path, extension: &str, bytes: &[u8]) -> Result<String> {
+    let extension = extension.to_ascii_lowercase();
+    if !IMAGE_TYPES.contains(&extension.as_str()) { return Err("Only PNG, JPEG, GIF, WebP and BMP images can be added.".into()); }
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ATTACHMENT { return Err("Images must be smaller than 20 MB.".into()); }
+    let stem = format!("image-{}", timestamp_name());
+    for index in 1..1000 {
+        let name = if index == 1 { format!("{stem}.{extension}") } else { format!("{stem}-{index}.{extension}") };
+        let relative = format!("{ATTACHMENTS}/{name}");
+        let path = safe_path(root, &relative)?;
+        if path.exists() { continue; }
+        fs::create_dir_all(path.parent().ok_or("Invalid file location.")?).map_err(|e| error("Could not create attachments folder", e))?;
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(problem) if problem.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(problem) => return Err(error("Could not save image", problem)),
+        };
+        if let Err(problem) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error("Could not save image", problem));
+        }
+        return Ok(relative);
+    }
+    Err("Could not choose a name for the image.".into())
+}
+
+/// Reads an image linked from a note. `source` is relative to the note's folder, as Markdown links are.
+pub fn read_attachment(root: &Path, note_id: &str, source: &str) -> Result<Vec<u8>> {
+    let source = source.trim().trim_start_matches('<').trim_end_matches('>');
+    if source.contains(':') || source.starts_with('/') || source.starts_with('\\') { return Err("Only images inside the workspace can be shown.".into()); }
+    let decoded = percent_decode(source).ok_or("Invalid image link.")?;
+    let folder = read_optional(&safe_path(root, ".noter/workspace.json")?)?
+        .and_then(|bytes| manifest(Some(&bytes)).ok())
+        .and_then(|manifest| manifest.paths.get(note_id).cloned())
+        .and_then(|path| path.rsplit_once('/').map(|(folder, _)| folder.to_string()))
+        .unwrap_or_default();
+    let mut parts: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
+    for part in decoded.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            // Notes saved before their folder is known resolve `../` links from the workspace root.
+            ".." => { parts.pop(); }
+            part => parts.push(part),
+        }
+    }
+    let relative = parts.join("/");
+    let extension = relative.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()).unwrap_or_default();
+    if !IMAGE_TYPES.contains(&extension.as_str()) { return Err("Unsupported image type.".into()); }
+    let path = safe_path(root, &relative)?;
+    let metadata = fs::metadata(&path).map_err(|e| error("Image not found", e))?;
+    if !metadata.is_file() || metadata.len() > MAX_ATTACHMENT { return Err("Image is missing or larger than 20 MB.".into()); }
+    fs::read(&path).map_err(|e| error("Could not read image", e))
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = text.get(index + 1..index + 3)?;
+            output.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
 }
 const FINANCE_LEGACY: &str = ".noter/finance.json";
 const FINANCE_TEMPLATE: &str = ".noter/finance-template.xlsx";

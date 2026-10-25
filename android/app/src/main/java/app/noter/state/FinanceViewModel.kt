@@ -12,6 +12,9 @@ import app.noter.finance.Finance
 import app.noter.finance.FinanceException
 import app.noter.finance.FinanceFiles
 import app.noter.finance.FinanceState
+import app.noter.finance.LoadedPlans
+import app.noter.finance.PlannedExpense
+import app.noter.finance.PlannedFiles
 import app.noter.finance.batchLine
 import app.noter.finance.diffFinance
 import app.noter.finance.parseLegacyFinance
@@ -39,6 +42,7 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         ?: UUID.randomUUID().toString().replace("-", "").also { preferences.edit().putString("financeDevice", it).apply() }
     private val lock = Mutex()
     private var files: FinanceFiles? = null
+    private var plannedFiles: PlannedFiles? = null
     private var boundUri: Uri? = null
     private var revision = ""
     private var clock = 0L
@@ -81,7 +85,9 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         if (uri == boundUri) return
         boundUri = uri
         val application = getApplication<Application>()
-        files = FinanceFiles(Saf(application.contentResolver, uri, application.filesDir))
+        val saf = Saf(application.contentResolver, uri, application.filesDir)
+        files = FinanceFiles(saf)
+        plannedFiles = PlannedFiles(saf)
         reload()
     }
 
@@ -184,6 +190,17 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
+    }
+
+    suspend fun loadPlans(): LoadedPlans {
+        val target = plannedFiles ?: throw FinanceException("Choose a workspace folder first.")
+        return withContext(Dispatchers.IO) { target.load() }
+    }
+
+    /** Saves the planned expenses snapshot; finishes even if the dialog closes so the result matches the file. */
+    suspend fun savePlans(expenses: List<PlannedExpense>, expected: String?): String {
+        val target = plannedFiles ?: throw FinanceException("Choose a workspace folder first.")
+        return withContext(NonCancellable + Dispatchers.IO) { target.save(expenses, expected) }
     }
 
     /** Starts Finance without a workbook. Excel import/export is not available on Android yet. */

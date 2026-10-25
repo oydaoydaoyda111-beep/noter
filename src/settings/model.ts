@@ -2,7 +2,7 @@ import type { Settings } from '../types.ts';
 
 export const defaultSettings: Settings = {
   fontSize: 18, fontStyle: 'sans', documentWidth: 790, density: 'comfortable', motion: 'full', autosaveDelay: 650,
-  accentColor: 'blue', startupSection: 'last', spellcheck: true, showNoteStats: true,
+  accentColor: 'blue', startupSection: 'last', spellcheck: false, showNoteStats: true,
   financeCurrency: '', financeDateFormat: 'iso', financeTableDensity: 'compact', financePageSize: 50,
   financeDefaultAccount: '', financeRememberEntries: true, financeShowAccountNotes: true,
 };

@@ -8,9 +8,13 @@ const commands = [
   { style: 'h3', name: 'Heading 3', hint: 'A small section heading', badge: 'H3', keywords: 'h3 heading' },
   { style: 'ul', name: 'Bullet list', hint: 'Keep a few ideas together', badge: '•', keywords: 'ul unordered bullets list' },
   { style: 'ol', name: 'Numbered list', hint: 'Steps in a natural order', badge: '1.', keywords: 'ol ordered numbered list' },
+  { style: 'task', name: 'Task list', hint: 'Track things to do', badge: '☐', keywords: 'todo to-do checkbox task check list' },
   { style: 'blockquote', name: 'Quote', hint: 'Give a thought some emphasis', badge: '❝', keywords: 'blockquote quote' },
+  { style: 'toggle', name: 'Toggle', hint: 'Hide details under a title', badge: '▸', keywords: 'toggle collapse collapsible details fold' },
   { style: 'pre', name: 'Code block', hint: 'Code with syntax highlighting', badge: '<>', keywords: 'pre code snippet' },
+  { style: 'table', name: 'Table', hint: 'Simple rows and columns', badge: '⊞', keywords: 'table grid columns rows markdown' },
   { style: 'hr', name: 'Divider', hint: 'A little space between ideas', badge: '—', keywords: 'hr divider horizontal rule separator' },
+  { style: 'image', name: 'Image', hint: 'Add a picture from your computer', badge: '▣', keywords: 'image picture photo png jpg' },
   { style: 'database', name: 'Database', hint: 'A table with typed properties', badge: '▦', keywords: 'database table rows properties' },
 ] as const;
 

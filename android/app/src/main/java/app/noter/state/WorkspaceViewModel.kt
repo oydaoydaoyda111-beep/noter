@@ -202,6 +202,31 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch { flush() }
     }
 
+    /** Saves an image for [noteId] in `attachments/`; returns the Markdown link path. The note is saved first so its folder exists. */
+    suspend fun saveImage(noteId: String, bytes: ByteArray, mime: String): String {
+        val extension = when (mime.lowercase()) {
+            "image/png" -> "png"
+            "image/jpeg", "image/jpg" -> "jpg"
+            "image/gif" -> "gif"
+            "image/webp" -> "webp"
+            else -> throw IllegalArgumentException("Choose a PNG, JPEG, GIF, or WebP image.")
+        }
+        flush()
+        val parent = workspace.nodes[noteId]?.parentId
+        return lock.withLock {
+            val target = vault ?: throw IllegalStateException("Open your workspace first.")
+            withContext(Dispatchers.IO) { target.saveImage(parent, bytes, extension) }
+        }
+    }
+
+    suspend fun loadImage(noteId: String, link: String): ByteArray {
+        val parent = workspace.nodes[noteId]?.parentId
+        return lock.withLock {
+            val target = vault ?: throw IllegalStateException("Open your workspace first.")
+            withContext(Dispatchers.IO) { target.readImage(parent, link) }
+        }
+    }
+
     private suspend fun checkExternalChanges(force: Boolean = false) {
         val target = vault ?: return
         if (screen != Screen.Ready || dirty || conflict != null || recovering || lock.isLocked) return

@@ -3,6 +3,85 @@ import { readDatabase } from '../database/model';
 
 const BLOCK_START = /^(?:\s{0,3}#{1,3}\s|\s*`{3,}|\s*>|\s*(?:[-+*]|\d+[.)])\s|\s*(?:-{3,}|\*{3,}|_{3,})\s*$)/;
 const LIST_ITEM = /^(\s*)([-+*]|\d+[.)])\s+(.*)$/;
+const TASK = /^\[([ xX])\](?:\s+(.*))?$/;
+const TOGGLE = /^\[!toggle\]([+-]?)\s*(.*)$/i;
+const IMAGE = /^\s*!\[([^\]\n]*)\]\((<[^>\n]+>|[^\s)]+)\)\s*$/;
+const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
+
+const WIKI_LINK = /^\[\[([^[\]\n|]+)(?:\|([^[\]\n]+))?\]\]/;
+
+/** An Obsidian-style `[[Note]]` link, kept as one unit so its target cannot be half-edited. */
+export function noteLink(target: string, label?: string): HTMLElement {
+  const link = document.createElement('span');
+  link.className = 'note-link'; link.contentEditable = 'false';
+  link.dataset.target = target;
+  if (label && label !== target) link.dataset.label = label;
+  link.textContent = label || target.split('#')[0].split('/').pop() || target;
+  return link;
+}
+
+/** Note names linked from Markdown, lower-cased without headings or aliases. */
+export function linkedNames(markdown: string): string[] {
+  return Array.from(markdown.matchAll(/\[\[([^[\]\n|#]+)(?:#[^[\]\n|]*)?(?:\|[^[\]\n]*)?\]\]/g), match => match[1].trim().toLowerCase());
+}
+
+/** Cells of a pipe-table row; `\|` is a literal pipe. */
+function tableCells(line: string): string[] {
+  const text = line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '');
+  const cells: string[] = [];
+  let current = '';
+  for (let index = 0; index < text.length; index++) {
+    if (text[index] === '\\' && text[index + 1] === '|') { current += '|'; index++; }
+    else if (text[index] === '|') { cells.push(current.trim()); current = ''; }
+    else current += text[index];
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function isTableStart(lines: string[], index: number): boolean {
+  return lines[index].includes('|') && TABLE_DELIMITER.test(lines[index + 1] ?? '') && lines[index + 1].includes('-')
+    && tableCells(lines[index]).length === tableCells(lines[index + 1]).length;
+}
+
+/** A Markdown image link; the original link text is kept so saving does not rewrite it. */
+export function imageFigure(source: string, alt = ''): HTMLElement {
+  const figure = document.createElement('figure');
+  figure.className = 'md-image'; figure.contentEditable = 'false';
+  figure.dataset.src = source; figure.dataset.alt = alt;
+  return figure;
+}
+
+/** A Notion-style table with a header row; cells hold inline Markdown. */
+export function tableElement(rows: string[][], align: string[] = []): HTMLTableElement {
+  const table = document.createElement('table');
+  table.className = 'md-table'; table.dataset.align = align.join(',');
+  const head = document.createElement('thead'), body = document.createElement('tbody');
+  rows.forEach((cells, rowIndex) => {
+    const row = document.createElement('tr');
+    for (const text of cells) {
+      const cell = document.createElement(rowIndex ? 'td' : 'th');
+      cell.append(inlineDom(text));
+      if (!cell.childNodes.length) cell.append(document.createElement('br'));
+      row.append(cell);
+    }
+    (rowIndex ? body : head).append(row);
+  });
+  table.append(head, body);
+  return table;
+}
+
+/** A collapsible block stored as an Obsidian foldable callout. */
+export function toggleElement(summary: Node, body: Node, open: boolean): HTMLElement {
+  const toggle = document.createElement('div');
+  toggle.className = 'toggle'; toggle.dataset.open = String(open);
+  const title = document.createElement('p'); title.className = 'toggle-summary'; title.append(summary);
+  if (!title.childNodes.length) title.append(document.createElement('br'));
+  const content = document.createElement('div'); content.className = 'toggle-body'; content.append(body);
+  if (!content.childNodes.length) { const paragraph = document.createElement('p'); paragraph.append(document.createElement('br')); content.append(paragraph); }
+  toggle.append(title, content);
+  return toggle;
+}
 
 export function safeUrl(value: string): string | null {
   const trimmed = value.trim();
@@ -76,6 +155,10 @@ export function inlineDom(text: string): DocumentFragment {
         fragment.append(mark); index = end + emphasis.length; continue;
       }
     }
+    const wiki = text.startsWith('[[', index) ? text.slice(index).match(WIKI_LINK) : null;
+    if (wiki) {
+      flush(); fragment.append(noteLink(wiki[1].trim(), wiki[2]?.trim())); index += wiki[0].length; continue;
+    }
     if (text[index] === '[') {
       const match = text.slice(index).match(/^\[([^\]\n]+)\]\(([^\s)]*)(?:\s+"[^"]*")?\)/);
       const href = match ? safeUrl(match[2]) : null;
@@ -104,7 +187,9 @@ function parseList(lines: string[], start: number): { list: HTMLElement; next: n
     const match = lines[index].match(LIST_ITEM);
     if (!match || match[1].length !== indentation || /^\d/.test(match[2]) !== ordered) break;
     const item = document.createElement('li');
-    item.append(inlineDom(match[3]));
+    const task = ordered ? null : match[3].match(TASK);
+    if (task) { item.className = 'task'; item.dataset.checked = String(task[1] !== ' '); }
+    item.append(inlineDom(task ? task[2] ?? '' : match[3]));
     list.append(item);
     index++;
     while (index < lines.length) {
@@ -156,9 +241,24 @@ function parseBlocks(lines: string[]): DocumentFragment {
       rule.contentEditable = 'false';
       fragment.append(rule); index++; continue;
     }
+    const image = line.match(IMAGE);
+    if (image) { fragment.append(imageFigure(image[2], image[1])); index++; continue; }
+    if (isTableStart(lines, index)) {
+      const header = tableCells(line);
+      const align = tableCells(lines[index + 1]).map(cell => cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : cell.startsWith(':') ? 'left' : '');
+      const rows = [header];
+      index += 2;
+      while (index < lines.length && lines[index].trim() && lines[index].includes('|')) {
+        const cells = tableCells(lines[index++]);
+        rows.push(header.map((_, column) => cells[column] ?? ''));
+      }
+      fragment.append(tableElement(rows, align)); continue;
+    }
     if (/^\s*>/.test(line)) {
       const quoted: string[] = [];
       while (index < lines.length && /^\s*>/.test(lines[index])) quoted.push(lines[index++].replace(/^\s*> ?/, ''));
+      const toggle = quoted[0].match(TOGGLE);
+      if (toggle) { fragment.append(toggleElement(inlineDom(toggle[2]), parseBlocks(quoted.slice(1)), toggle[1] !== '-')); continue; }
       const quote = document.createElement('blockquote');
       quote.append(parseBlocks(quoted));
       if (!quote.childNodes.length) quote.append(document.createElement('p'));
@@ -171,7 +271,7 @@ function parseBlocks(lines: string[]): DocumentFragment {
     const paragraph = document.createElement('p');
     const content = [line.replace(/ {2}$/, '')];
     index++;
-    while (index < lines.length && lines[index].trim() && !BLOCK_START.test(lines[index])) content.push(lines[index++].replace(/ {2}$/, ''));
+    while (index < lines.length && lines[index].trim() && !BLOCK_START.test(lines[index]) && !IMAGE.test(lines[index]) && !isTableStart(lines, index)) content.push(lines[index++].replace(/ {2}$/, ''));
     paragraph.append(inlineDom(content.join('\n')));
     fragment.append(paragraph);
   }
@@ -181,7 +281,7 @@ function parseBlocks(lines: string[]): DocumentFragment {
 export function markdownToDom(markdown: string): DocumentFragment {
   const fragment = parseBlocks(markdown.replace(/\r\n?/g, '\n').split('\n'));
   const last = fragment.lastElementChild;
-  if (!last || ['HR', 'PRE'].includes(last.tagName) || last.classList.contains('database-block')) {
+  if (!last || ['HR', 'PRE', 'TABLE', 'FIGURE'].includes(last.tagName) || last.classList.contains('database-block') || last.classList.contains('toggle')) {
     const paragraph = document.createElement('p');
     paragraph.append(document.createElement('br'));
     fragment.append(paragraph);
@@ -222,6 +322,11 @@ function inlineMarkdown(node: Node): string {
       return href ? `[${content}](${href.replace(/\(/g, '%28').replace(/\)/g, '%29')})` : content;
     }
     case 'UL': case 'OL': return '';
+    case 'SPAN': {
+      const target = node.classList.contains('note-link') ? node.getAttribute('data-target') : null;
+      if (target) { const label = node.getAttribute('data-label'); return `[[${target}${label ? `|${label}` : ''}]]`; }
+      return content;
+    }
     default: return content;
   }
 }
@@ -231,9 +336,10 @@ function serializeList(list: Element, indent = ''): string {
   let number = parseInt(list.getAttribute('start') ?? '1') || 1;
   return Array.from(list.children).map(item => {
     const prefix = ordered ? `${number++}. ` : '- ';
+    const task = !ordered && item.classList.contains('task') ? `[${item.getAttribute('data-checked') === 'true' ? 'x' : ' '}]` : '';
     const text = Array.from(item.childNodes).map(inlineMarkdown).join('').trim();
     const continuation = indent + ' '.repeat(prefix.length);
-    const lines = `${indent}${prefix}${text.replace(/\n/g, `\n${continuation}`)}`;
+    const lines = `${indent}${prefix}${task ? `${task} ` : ''}${text.replace(/\n/g, `\n${continuation}`)}`;
     const nested = Array.from(item.children).filter(child => child.tagName === 'UL' || child.tagName === 'OL');
     return lines + nested.map(child => '\n' + serializeList(child, continuation)).join('');
   }).join('\n');
@@ -242,6 +348,27 @@ function serializeList(list: Element, indent = ''): string {
 function blockMarkdown(node: Node): string {
   if (node.nodeType === Node.TEXT_NODE) return escapeText(node.textContent ?? '').trim();
   if (!(node instanceof Element)) return '';
+  if (node.classList.contains('toggle')) {
+    const summary = node.querySelector(':scope > .toggle-summary');
+    const title = summary ? Array.from(summary.childNodes).map(inlineMarkdown).join('').replace(/\s*\n\s*/g, ' ').trim() : '';
+    const body = Array.from(node.querySelector(':scope > .toggle-body')?.childNodes ?? []).map(blockMarkdown).filter(Boolean).join('\n\n');
+    const header = `> [!toggle]${node.getAttribute('data-open') === 'false' ? '-' : '+'}${title ? ` ${title}` : ''}`;
+    return body ? `${header}\n${body.split('\n').map(line => line ? `> ${line}` : '>').join('\n')}` : header;
+  }
+  if (node.tagName === 'FIGURE' && node.classList.contains('md-image')) {
+    const source = node.getAttribute('data-src') ?? '';
+    return source ? `![${(node.getAttribute('data-alt') ?? '').replace(/[\]\n]/g, ' ')}](${source})` : '';
+  }
+  if (node.tagName === 'TABLE') {
+    const rows = Array.from(node.querySelectorAll('tr')).map(row => Array.from(row.children).map(cell =>
+      Array.from(cell.childNodes).map(inlineMarkdown).join('').replace(/\s*\n\s*/g, ' ').trim().replace(/(?<!\\)\|/g, '\\|')));
+    if (!rows.length) return '';
+    const width = Math.max(...rows.map(row => row.length));
+    const align = (node.getAttribute('data-align') ?? '').split(',');
+    const line = (cells: string[]) => `| ${Array.from({ length: width }, (_, column) => cells[column] ?? '').join(' | ')} |`;
+    const delimiter = `| ${Array.from({ length: width }, (_, column) => ({ left: ':---', center: ':---:', right: '---:' } as Record<string, string>)[align[column]] ?? '---').join(' | ')} |`;
+    return [line(rows[0]), delimiter, ...rows.slice(1).map(line)].join('\n');
+  }
   if (node.classList.contains('database-block')) {
     const content = node.getAttribute('data-database') ?? '{}';
     const fence = '`'.repeat(Math.max(3, longestTicks(content) + 1));
