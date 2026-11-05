@@ -285,7 +285,7 @@ fun EditorPane(
     val focusRequester = remember { FocusRequester() }
     var imageError by remember { mutableStateOf<String?>(null) }
     var previewImage by remember(note.id) { mutableStateOf<Pair<String, Int>?>(null) }
-    var reordering by remember(note.id) { mutableStateOf(false) }
+    var reordering by remember(note.id) { mutableStateOf<String?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) scope.launch {
             try {
@@ -467,7 +467,7 @@ fun EditorPane(
                     onLink = { linkDialog = true },
                     onIndent = { apply(indentLines(state.value, outdent = it)) },
                     onImage = { pickImage() },
-                    onReorder = { focusManager.clearFocus(); reordering = true },
+                    onReorder = { focusManager.clearFocus(); reordering = state.value.text },
                     onHideKeyboard = { focusManager.clearFocus() },
                 )
             } else if (settings.showNoteStats) {
@@ -481,9 +481,6 @@ fun EditorPane(
         }
     }
 
-    imageError?.let { message ->
-        MessageDialog("Could not add image", message, "OK", null, onConfirm = { imageError = null }, onDismiss = { imageError = null })
-    }
     previewImage?.let { (link, close) ->
         ImagePreview(link, loadImage, onClose = { previewImage = null }, onEdit = {
             previewImage = null
@@ -507,21 +504,25 @@ fun EditorPane(
             val text = editor.value.text
             // A synced change may have replaced the table while the grid was open; keep both by refusing the stale write.
             if (block.end > text.length || text.substring(block.start, block.end) != block.source) {
-                imageError = "This table changed while you were editing it. Open it again to edit the latest version."
+                imageError = "This table changed while you were editing it. Your edits are still open. Copy them before reopening the latest table."
             } else {
                 val markdown = tableMarkdown(rows, align)
                 val next = text.replaceRange(block.start, block.end, markdown)
                 val caret = editor.value.selection.start.let { if (it > block.end) it + markdown.length - (block.end - block.start) else it.coerceAtMost(next.length) }
                 apply(TextFieldValue(next, TextRange(caret)))
+                tableEditing = null
             }
-            tableEditing = null
         }
     }
-    if (reordering) {
-        ReorderBlocksDialog(state.value.text, onDismiss = { reordering = false }) { markdown ->
-            reordering = false
+    reordering?.let { original ->
+        ReorderBlocksDialog(original, onDismiss = { reordering = null }) { markdown ->
             val editor = latestEditor
-            apply(TextFieldValue(markdown, TextRange(editor.value.selection.start.coerceAtMost(markdown.length))))
+            if (editor.value.text != original) {
+                imageError = "This note changed while you were reordering it. Cancel and reopen reordering to use the latest version."
+            } else {
+                apply(TextFieldValue(markdown, TextRange(editor.value.selection.start.coerceAtMost(markdown.length))))
+                reordering = null
+            }
         }
     }
     if (linkDialog) {
@@ -541,6 +542,9 @@ fun EditorPane(
             apply(editor.value.copy(text = markdown, selection = TextRange(selection.start.coerceAtMost(markdown.length), selection.end.coerceAtMost(markdown.length)), composition = null))
             openedDatabase = databaseBlocks(markdown).first { it.index == current.index }
         }, onClose = { openedDatabase = null })
+    }
+    imageError?.let { message ->
+        MessageDialog("Could not update note", message, "OK", null, onConfirm = { imageError = null }, onDismiss = { imageError = null })
     }
 }
 

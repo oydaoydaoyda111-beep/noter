@@ -133,8 +133,8 @@ fun OptionSheet(title: String, options: List<Triple<String, String, String>>, se
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DateDialog(value: String, allowClear: Boolean, onChange: (String) -> Unit, onDismiss: () -> Unit) {
-    val initial = runCatching { LocalDate.parse(value).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli() }.getOrNull()
-    val state = rememberDatePickerState(initialSelectedDateMillis = initial)
+    val initial = runCatching { LocalDate.parse(value).takeIf { it.year in 1..9999 }?.atStartOfDay(ZoneOffset.UTC)?.toInstant()?.toEpochMilli() }.getOrNull()
+    val state = rememberDatePickerState(initialSelectedDateMillis = initial, yearRange = 1..9999)
     DatePickerDialog(
         onDismissRequest = onDismiss,
         confirmButton = {

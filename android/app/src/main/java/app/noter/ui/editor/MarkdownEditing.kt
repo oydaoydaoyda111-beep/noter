@@ -22,13 +22,12 @@ enum class BlockStyle(val label: String, val hint: String, val badge: String, va
 private val PREFIX = Regex("^(\\s*)(#{1,6}\\s+|[-+*]\\s+|\\d+[.)]\\s+|>\\s?)?")
 private val LIST_ITEM = Regex("^(\\s*)([-+*]|(\\d+)([.)]))(\\s+)(.*)$")
 private val QUOTE_LINE = Regex("^(\\s*>\\s?)(.*)$")
-private val FENCE_LINE = Regex("^\\s{0,3}(`{3,}|~{3,}).*$")
+private val FENCE_LINE = Regex("^\\s{0,3}(`{3,}|~{3,})(.*)$")
 private val HEADING_PREFIX = Regex("^\\s{0,3}#{1,6}\\s+")
 private val TASK_LINE = Regex("^(\\s*)([-+*])(\\s+)\\[([ xX])\\](\\s+|$)")
 private val TASK_SHORTCUT = Regex("^(\\s*)[-+*](?:\\[([ xX]?)\\]?| \\[([ xX]?)\\]) $")
 private val TOGGLE_PREFIX = Regex("^\\s*>\\s?\\[!toggle\\][+-]\\s*", RegexOption.IGNORE_CASE)
 private val IMAGE_LINE = Regex("^\\s*!\\[[^\\]\\n]*\\]\\(([^)\\s]+)\\)\\s*$")
-private val TABLE_LINE = Regex("^\\s*\\|")
 private val RULE_LINE = Regex("^\\s{0,3}([-*_])(\\s*\\1){2,}\\s*$")
 private val SLASH = Regex("^/([^\\n/]{0,30})$")
 
@@ -48,15 +47,19 @@ private fun styleOf(line: String): BlockStyle {
 }
 
 private fun insideFence(text: String, index: Int): Boolean {
-    var open = false
+    var fence: String? = null
     var start = 0
     while (start < index) {
         val end = lineEnd(text, start)
         if (end >= index) break
-        if (FENCE_LINE.matches(text.substring(start, end))) open = !open
+        val match = FENCE_LINE.matchEntire(text.substring(start, end))
+        if (match != null) {
+            if (fence == null) fence = match.groupValues[1]
+            else if (match.groupValues[1].startsWith(fence) && match.groupValues[2].isBlank()) fence = null
+        }
         start = end + 1
     }
-    return open
+    return fence != null
 }
 
 private fun replace(value: TextFieldValue, start: Int, end: Int, insert: String, selection: TextRange) =
@@ -128,14 +131,21 @@ fun imageAt(text: String, offset: Int): Pair<String, Int>? {
 /** Splits a note into movable blocks: code fences, quotes/toggles, tables, list items with their nested lines, headings, rules, images, and paragraphs. */
 fun splitBlocks(text: String): List<String> {
     val lines = text.split('\n')
+    val lineStarts = IntArray(lines.size)
+    for (line in 1 until lines.size) lineStarts[line] = lineStarts[line - 1] + lines[line - 1].length + 1
+    val tables = previewBlocks(text, null).filterIsInstance<TablePreviewBlock>().associate { it.start to it.end }
     val blocks = ArrayList<String>()
     var index = 0
-    fun starts(line: String) = line.isBlank() || FENCE_LINE.matches(line) || QUOTE_LINE.matches(line) || TABLE_LINE.containsMatchIn(line) ||
-        LIST_ITEM.matches(line) || HEADING_PREFIX.containsMatchIn(line) || RULE_LINE.matches(line) || IMAGE_LINE.matches(line)
+    fun starts(index: Int): Boolean {
+        val line = lines[index]
+        return line.isBlank() || FENCE_LINE.matches(line) || QUOTE_LINE.matches(line) || lineStarts[index] in tables ||
+            LIST_ITEM.matches(line) || HEADING_PREFIX.containsMatchIn(line) || RULE_LINE.matches(line) || IMAGE_LINE.matches(line)
+    }
     while (index < lines.size) {
         val line = lines[index]
         if (line.isBlank()) { index++; continue }
         val from = index++
+        val tableEnd = tables[lineStarts[from]]
         when {
             FENCE_LINE.matches(line) -> {
                 val fence = line.trimStart().takeWhile { it == line.trimStart()[0] }
@@ -143,13 +153,13 @@ fun splitBlocks(text: String): List<String> {
                 if (index < lines.size) index++
             }
             QUOTE_LINE.matches(line) -> while (index < lines.size && QUOTE_LINE.matches(lines[index])) index++
-            TABLE_LINE.containsMatchIn(line) -> while (index < lines.size && TABLE_LINE.containsMatchIn(lines[index])) index++
+            tableEnd != null -> while (index < lines.size && lineStarts[index] <= tableEnd) index++
             LIST_ITEM.matches(line) -> {
                 val indent = line.takeWhile { it == ' ' || it == '\t' }.length
                 while (index < lines.size && lines[index].isNotBlank() && lines[index].takeWhile { it == ' ' || it == '\t' }.length > indent) index++
             }
             HEADING_PREFIX.containsMatchIn(line) || RULE_LINE.matches(line) || IMAGE_LINE.matches(line) -> Unit
-            else -> while (index < lines.size && !starts(lines[index])) index++
+            else -> while (index < lines.size && !starts(index)) index++
         }
         blocks += lines.subList(from, index).joinToString("\n")
     }
@@ -302,8 +312,12 @@ fun handleTyping(old: TextFieldValue, new: TextFieldValue): TextFieldValue {
         return TextFieldValue(new.text.substring(0, cursor + 1) + indent + new.text.substring(cursor + 1), TextRange(cursor + 1 + indent.length))
     }
     FENCE_LINE.matchEntire(line)?.let { fence ->
-        val unclosed = text.split('\n').count { FENCE_LINE.matches(it) } % 2 == 1
-        if (!unclosed || cursor != start + line.length) return new
+        if (cursor != start + line.length) return new
+        val hasClosing = text.substring(cursor).lineSequence().drop(1).any { candidate ->
+            val closing = FENCE_LINE.matchEntire(candidate)
+            closing != null && closing.groupValues[1].startsWith(fence.groupValues[1]) && closing.groupValues[2].isBlank()
+        }
+        if (hasClosing) return new
         val close = "\n" + line.takeWhile { it == ' ' } + fence.groupValues[1]
         return TextFieldValue(new.text.substring(0, cursor + 1) + close + new.text.substring(cursor + 1), TextRange(cursor + 1))
     }

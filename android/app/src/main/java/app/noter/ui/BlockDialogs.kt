@@ -117,16 +117,16 @@ fun TableEditorDialog(rows: List<List<String>>, align: List<String>, onDismiss: 
     val columns = rows.maxOf { it.size }.coerceAtLeast(1)
     val cells = remember(rows) { rows.map { row -> List(columns) { row.getOrElse(it) { "" } }.toMutableStateList() }.toMutableStateList() }
     val alignment = remember(align) { List(columns) { align.getOrElse(it) { "" } }.toMutableStateList() }
-    var discard by remember { mutableStateOf(false) }
+    var discard by remember { mutableStateOf<(() -> Unit)?>(null) }
     fun changed() = cells.map { it.toList() } != rows.map { row -> List(columns) { row.getOrElse(it) { "" } } } || alignment.toList() != List(columns) { align.getOrElse(it) { "" } }
-    fun close() { if (changed()) discard = true else onDismiss() }
+    fun close(action: () -> Unit = onDismiss) { if (changed()) discard = action else action() }
     FullScreenDialog(onDismissRequest = { close() }) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.fillMaxSize().imePadding()) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { close() }) { Icon(Icons.Default.Close, contentDescription = "Close table") }
                     Text("Table", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    TextButton(onClick = onEditText) { Text("Edit as text") }
+                    TextButton(onClick = { close(onEditText) }) { Text("Edit as text") }
                     TextButton(onClick = { onDone(cells.map { it.toList() }, alignment.toList()) }) { Text("Done") }
                 }
                 Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -162,9 +162,9 @@ fun TableEditorDialog(rows: List<List<String>>, align: List<String>, onDismiss: 
             }
         }
     }
-    if (discard) {
+    discard?.let { action ->
         MessageDialog("Discard table changes?", "The note keeps its current table.", "Discard", "Keep editing",
-            onConfirm = { discard = false; onDismiss() }, onDismiss = { discard = false })
+            onConfirm = { discard = null; action() }, onDismiss = { discard = null })
     }
 }
 
