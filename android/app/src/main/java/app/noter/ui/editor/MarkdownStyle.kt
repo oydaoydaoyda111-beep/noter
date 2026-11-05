@@ -197,12 +197,15 @@ fun styleMarkdown(text: String, active: IntRange? = null, layout: BlockLayout? =
             }
             // A drawn table keeps one line per row, sized to the grid row; the delimiter row collapses.
             table && tableDrawn -> {
-                add(hiddenStyle, start, end)
+                val rowEnd = (end + 1).coerceAtMost(text.length)
+                // Paragraph boundaries already separate rows; a literal newline would add empty lines.
+                if (end < text.length) chars[end] = '\u200B'
+                add(hiddenStyle, start, rowEnd)
                 paragraph(ParagraphStyle(
                     lineHeight = if (start == tableDelimiter) 1.sp else layout!!.tableRowHeights.getValue(start),
                     // Every row is a single-line paragraph; trimming would collapse its hidden, tiny text.
                     lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.None),
-                ), start, end)
+                ), start, rowEnd)
             }
             table -> styleTableRow(this, line, start, header, preview)
             else -> styleLine(this, line, start, preview, layout)
