@@ -12,6 +12,7 @@ import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextGeometricTransform
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
@@ -197,7 +198,11 @@ fun styleMarkdown(text: String, active: IntRange? = null, layout: BlockLayout? =
             // A drawn table keeps one line per row, sized to the grid row; the delimiter row collapses.
             table && tableDrawn -> {
                 add(hiddenStyle, start, end)
-                paragraph(ParagraphStyle(lineHeight = if (start == tableDelimiter) 1.sp else layout!!.tableRowHeights.getValue(start)), start, end)
+                paragraph(ParagraphStyle(
+                    lineHeight = if (start == tableDelimiter) 1.sp else layout!!.tableRowHeights.getValue(start),
+                    // Every row is a single-line paragraph; trimming would collapse its hidden, tiny text.
+                    lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.None),
+                ), start, end)
             }
             table -> styleTableRow(this, line, start, header, preview)
             else -> styleLine(this, line, start, preview, layout)
