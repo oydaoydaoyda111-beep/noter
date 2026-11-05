@@ -341,6 +341,14 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     if (recordHistory) history.record(true);
     let block = currentBlock(root) ?? root.firstElementChild as HTMLElement;
     if (!block) return;
+    // A toggle title changes kind by leaving the toggle (its content follows as normal blocks); otherwise
+    // the converted title would no longer be the toggle's title and would be dropped when saving.
+    if (block.classList.contains('toggle-summary') && !['toggle', 'table', 'hr', 'database'].includes(style)) {
+      block = unwrapToggle(block.parentElement!);
+      if (style === 'p') { change(); rememberSelection(); return; }
+    }
+    // Quote lines become lists outside the quote, as other block types already do.
+    if ((style === 'ul' || style === 'ol' || style === 'task') && block.parentElement?.tagName === 'BLOCKQUOTE') block = exitStructured(block);
     const position = bookmark(root);
     if (style === 'task') {
       if (block.tagName === 'LI' && block.parentElement?.tagName === 'UL') {
@@ -354,7 +362,9 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
       change(); rememberSelection(); return;
     }
     if (style === 'toggle') {
-      if (block.closest('pre,td,th')) return;
+      if (block.closest('td,th')) return;
+      const pre = block.closest('pre');
+      if (pre) { const paragraph = el('p', '', codeText(pre).replace(/\s+$/, '')); pre.replaceWith(paragraph); block = paragraph; }
       if (block.classList.contains('toggle-summary')) { unwrapToggle(block.parentElement!); change(); rememberSelection(); return; }
       if (block.tagName === 'LI' || block.parentElement?.tagName === 'BLOCKQUOTE') block = exitStructured(block);
       const summary = document.createDocumentFragment(); summary.append(...block.childNodes);
@@ -404,6 +414,8 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
         block.replaceWith(list); restoreBookmark(root, position);
       }
     } else if (style === 'blockquote') {
+      // A list item leaves its list first; a quote inside a list would still save as a list item.
+      if (block.tagName === 'LI') block = exitStructured(block);
       if (!block.closest('blockquote')) { const quote = el('blockquote'); block.replaceWith(quote); quote.append(block); }
       placeCaret(block, position);
     } else {
@@ -534,7 +546,13 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
   dividerButton.addEventListener('mousedown', event => event.preventDefault());
   dividerButton.onclick = () => applyBlock('hr');
   toolbar.append(el('span', 'toolbar-divider'), dividerButton);
-  styleSelect.onchange = () => applyBlock(styleSelect.value as BlockStyle);
+  styleSelect.onchange = () => {
+    const style = styleSelect.value as BlockStyle;
+    // With several blocks selected (or a text selection across blocks) the dropdown converts all of them.
+    const units = targetUnits();
+    if (turnIntoStyles.some(([each]) => each === style) && units.length) turnInto(units, style);
+    else applyBlock(style);
+  };
   floating.addEventListener('keydown', event => {
     if (event.key === 'Escape') { event.preventDefault(); dismissFloating(); restoreSelection(); return; }
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -847,19 +865,34 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     return siblings.slice(from, to + 1);
   }
 
-  /** The selected blocks, or the blocks the text selection touches. */
+  /**
+   * The unit at one end of a selection. Mouse selections often end on a container rather than in text
+   * (a list's padding, the page after the last line), so the boundary is resolved to the nearest item.
+   */
+  function unitAtBoundary(container: Node, offset: number, end: boolean): HTMLElement | null {
+    let node: Node | null = container;
+    if (container instanceof Element && container.childNodes.length) {
+      node = container.childNodes[Math.max(0, Math.min(container.childNodes.length - 1, end ? offset - 1 : offset))];
+    }
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!(element instanceof HTMLElement) || element === root || !root.contains(element)) return null;
+    if (element.matches('ul,ol')) return (end ? element.lastElementChild : element.firstElementChild) as HTMLElement | null;
+    const item = element.closest('li');
+    return item && root.contains(item) ? item : outerBlock(element);
+  }
+
+  /** The selected blocks, or every block the text selection touches. */
   function targetUnits(): HTMLElement[] {
     if (selectedBlocks.length) return selectedBlocks;
-    const range = selectionRange(root), block = currentBlock(root);
+    // Toolbar controls take focus; the last editor selection still says which blocks were meant.
+    const range = selectionRange(root) ?? (savedRange && root.contains(savedRange.startContainer) ? savedRange : null);
     if (!range) return [];
-    // Selections that start or end on the page itself (Ctrl+A, dragging past the text) cover whole page-level blocks.
-    if (!block || range.startContainer === root || range.endContainer === root) {
-      return (Array.from(root.children) as HTMLElement[]).filter(child => range.intersectsNode(child));
-    }
-    const endElement = range.endContainer instanceof Element ? range.endContainer : range.endContainer.parentElement;
-    const endBlock = endElement?.closest<HTMLElement>('p,h1,h2,h3,li,pre,div,td,th');
-    const start = unitOf(block);
-    return unitRange(start, endBlock && endBlock !== root && root.contains(endBlock) ? unitOf(endBlock) : start);
+    const start = unitAtBoundary(range.startContainer, range.startOffset, false);
+    let end = unitAtBoundary(range.endContainer, range.endOffset, true) ?? start;
+    if (!start || !end) return [];
+    // A selection that stops at the very start of the next block (Shift+Down, triple-click) does not include it.
+    if (!range.collapsed && end !== start && range.endOffset === 0 && range.endContainer !== root && end.previousElementSibling instanceof HTMLElement) end = end.previousElementSibling;
+    return unitRange(start, end);
   }
 
   function focusUnit(unit: HTMLElement, end: boolean) {
@@ -954,12 +987,21 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     if (!targets.length) return;
     selectBlocks([]);
     history.record(true);
+    const setTask = (item: Element, task: boolean) => {
+      if (task && !item.classList.contains('task')) { item.classList.add('task'); item.setAttribute('data-checked', 'false'); }
+      if (!task) { item.classList.remove('task'); item.removeAttribute('data-checked'); if (!item.classList.length) item.removeAttribute('class'); }
+    };
     for (const target of targets) {
       if (!root.contains(target)) continue;
+      // Bullet items change kind in place. applyBlock toggles tasks and toggles, which would undo mixed selections.
+      if (target.tagName === 'LI' && target.parentElement?.tagName === 'UL' && (style === 'task' || style === 'ul')) { setTask(target, style === 'task'); continue; }
+      if (style === 'toggle' && target.classList.contains('toggle-summary')) continue;
       root.focus({ preventScroll: true });
       caretAt(target.tagName === 'PRE' ? target.querySelector('code') ?? target : target, true);
       savedRange = selectionRange(root)?.cloneRange() ?? null;
-      applyBlock(style, false);
+      applyBlock(style === 'task' ? 'ul' : style, false);
+      const item = currentBlock(root)?.closest('li');
+      if (item && (style === 'task' || style === 'ul' || style === 'ol')) setTask(item, style === 'task');
     }
     // Each converted block starts its own list; neighbouring lists of one kind read as one list, as they do after reloading.
     for (const list of Array.from(root.querySelectorAll<HTMLElement>('ul + ul, ol + ol'))) {
@@ -1027,16 +1069,22 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
   codeLayer.append(handle, dropLine);
   let handleBlock: HTMLElement | null = null;
   let dragging = false;
-  function unitAt(target: EventTarget | null): HTMLElement | null {
+  function unitAt(target: EventTarget | null, y?: number): HTMLElement | null {
     const element = target instanceof Element ? target : null;
     if (!element || !root.contains(element) || element === root) return null;
     const item = element.closest('li');
     if (item && root.contains(item)) return item;
+    // The pointer is in a list's padding beside its items: use the item on that line, not the whole list.
+    if (element.matches('ul,ol') && y !== undefined) {
+      const items = Array.from(element.children) as HTMLElement[];
+      const match = items.find(child => { const rect = child.getBoundingClientRect(); return y >= rect.top && y <= rect.bottom; });
+      if (match) return match;
+    }
     return outerBlock(element instanceof HTMLElement ? element : element.parentElement!);
   }
   root.addEventListener('mousemove', event => {
     if (dragging) return;
-    const unit = unitAt(event.target);
+    const unit = unitAt(event.target, event.clientY);
     if (!unit || unit === root) return;
     handleBlock = unit;
     const bounds = codeLayer.getBoundingClientRect(), rect = unit.getBoundingClientRect();
@@ -1269,9 +1317,11 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     return item.tagName !== 'LI' || item.parentElement?.tagName === 'UL' ? item : null;
   };
   root.addEventListener('mousedown', event => {
+    // A right-click must keep the selection so the context menu acts on it.
+    if (event.button !== 0) { if (selectedBlocks.length && selectedBlocks.some(block => block.contains(event.target as Node))) event.preventDefault(); return; }
     if (gutterControl(event) || (event.target as Element).closest('.note-link')) { event.preventDefault(); return; }
     // Shift+click selects whole blocks from the caret's block to the clicked one.
-    const clicked = event.shiftKey && event.button === 0 ? unitAt(event.target) : null;
+    const clicked = event.shiftKey && event.button === 0 ? unitAt(event.target, event.clientY) : null;
     const from = selectedBlocks.length ? blockAnchor : currentBlock(root) && unitOf(currentBlock(root)!);
     if (clicked && from && clicked !== from && clicked.parentElement === from.parentElement) {
       event.preventDefault(); selectBlocks(unitRange(from, clicked), from, clicked); return;
@@ -1289,7 +1339,7 @@ export function createEditor(root: HTMLElement, toolbar: HTMLElement, onChange: 
     const range = selectionRange(root);
     const hasText = !!range && !range.collapsed && !!range.toString().trim();
     const blocks = selectedBlocks.length > 0;
-    const clicked = unitAt(target);
+    const clicked = unitAt(target, event.clientY);
     const units = blocks ? [...selectedBlocks] : hasText ? targetUnits() : clicked ? [clicked] : [];
     const inCode = !!currentBlock(root)?.closest('pre');
     const items: MenuItem[] = [];

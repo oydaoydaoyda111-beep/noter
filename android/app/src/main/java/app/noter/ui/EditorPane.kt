@@ -41,6 +41,7 @@ import app.noter.ui.editor.PreviewBlock
 import app.noter.ui.editor.TablePreviewBlock
 import app.noter.ui.editor.previewBlocks
 import app.noter.ui.editor.tableMarkdown
+import app.noter.ui.editor.styleTableCell
 import kotlin.math.roundToInt
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -121,12 +122,15 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.PopupProperties
@@ -235,8 +239,24 @@ fun EditorPane(
         }
         block.link to pixels?.let { with(density) { it.toSp() } }
     }
-    val tableRowHeight = with(density) { 40.dp.toSp() }
-    val transformation = remember(editing, imageHeights, tableRowHeight) { MarkdownTransformation(editing, BlockLayout(imageHeights, tableRowHeight)) }
+    val textMeasurer = rememberTextMeasurer()
+    val tableTextStyle = MaterialTheme.typography.bodyMedium
+    val tableRowHeights = remember(blocks, fieldWidth, density, tableTextStyle, textMeasurer) {
+        buildMap {
+            for (block in blocks.filterIsInstance<TablePreviewBlock>()) {
+                val columns = block.rows.first().second.size
+                val width = maxOf(fieldWidth, with(density) { (columns * 160).dp.roundToPx() })
+                val padding = with(density) { 8.dp.roundToPx() * 2 }
+                val cellWidth = (width / columns - padding).coerceAtLeast(1)
+                block.rows.forEachIndexed { index, (lineStart, cells) ->
+                    val style = tableTextStyle.copy(fontWeight = if (index == 0) FontWeight.SemiBold else FontWeight.Normal)
+                    val height = cells.maxOf { textMeasurer.measure(styleTableCell(it), style, constraints = Constraints(maxWidth = cellWidth)).size.height }
+                    put(lineStart, with(density) { maxOf(40.dp.roundToPx(), height + padding).toSp() })
+                }
+            }
+        }
+    }
+    val transformation = remember(editing, imageHeights, tableRowHeights) { MarkdownTransformation(editing, BlockLayout(imageHeights, tableRowHeights)) }
     var tableEditing by remember(note.id) { mutableStateOf<TablePreviewBlock?>(null) }
     var linkDialog by remember { mutableStateOf(false) }
     var dismissedSlash by remember(note.id) { mutableStateOf<String?>(null) }
@@ -366,6 +386,7 @@ fun EditorPane(
                                             val text = latestEditor.value.text
                                             val drawn = latestDrawn.takeIf { layout.layoutInput.text.length == text.length }.orEmpty()
                                             val hit = drawn.firstOrNull { block -> blockBounds(layout, block).let { (top, bottom) -> down.position.y in top..bottom } }
+                                            if (hit is TablePreviewBlock) return@awaitEachGesture
                                             if (hit != null) {
                                                 down.consume()
                                                 val up = waitForUpOrCancellation(PointerEventPass.Initial) ?: return@awaitEachGesture
@@ -547,22 +568,27 @@ private fun BlockOverlay(block: PreviewBlock, images: Map<String, ImageBitmap?>,
                 }
             }
             is TablePreviewBlock -> {
-                val columns = block.rows.maxOf { it.second.size }.coerceAtLeast(1)
-                block.rows.forEachIndexed { index, (lineStart, cells) ->
-                    val line = layout.getLineForOffset(lineStart)
-                    val rowTop = layout.getLineTop(line) - top
-                    val rowHeight = with(density) { (layout.getLineBottom(line) - layout.getLineTop(line)).toDp() }
-                    Row(
-                        Modifier.offset { IntOffset(0, rowTop.roundToInt()) }.fillMaxWidth().height(rowHeight)
-                            .background(if (index == 0) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surface),
-                    ) {
-                        repeat(columns) { column ->
-                            Box(Modifier.weight(1f).fillMaxHeight().border(0.5.dp, border).padding(horizontal = 8.dp), contentAlignment = Alignment.CenterStart) {
-                                Text(
-                                    cells.getOrElse(column) { "" }, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.bodyMedium, fontWeight = if (index == 0) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                )
+                val columns = block.rows.first().second.size
+                Box(Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).clickable(onClick = onOpen)) {
+                    Box(Modifier.width(maxOf(width, (columns * 160).dp)).fillMaxHeight()) {
+                        block.rows.forEachIndexed { index, (lineStart, cells) ->
+                            val line = layout.getLineForOffset(lineStart)
+                            val rowTop = layout.getLineTop(line) - top
+                            val rowHeight = with(density) { (layout.getLineBottom(line) - layout.getLineTop(line)).toDp() }
+                            Row(
+                                Modifier.offset { IntOffset(0, rowTop.roundToInt()) }.fillMaxWidth().height(rowHeight)
+                                    .background(if (index == 0) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surface),
+                            ) {
+                                repeat(columns) { column ->
+                                    Box(Modifier.weight(1f).fillMaxHeight().border(0.5.dp, border).padding(8.dp), contentAlignment = Alignment.CenterStart) {
+                                        Text(
+                                            styleTableCell(cells[column]), modifier = Modifier.fillMaxWidth(),
+                                            textAlign = when (block.align.getOrNull(column)) { "center" -> TextAlign.Center; "right" -> TextAlign.Right; else -> TextAlign.Left },
+                                            style = MaterialTheme.typography.bodyMedium, fontWeight = if (index == 0) FontWeight.SemiBold else FontWeight.Normal,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

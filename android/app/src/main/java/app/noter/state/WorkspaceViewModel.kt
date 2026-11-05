@@ -104,7 +104,7 @@ class WorkspaceViewModel(application: Application) : AndroidViewModel(applicatio
                     val opened = withContext(Dispatchers.IO) {
                         if (keepEdits) preserved = (vault ?: throw IllegalStateException("Open your workspace first.")).preserveEdits(snapshot, base)
                         val application = getApplication<Application>()
-                        val vault = Vault(Saf(application.contentResolver, uri, application.filesDir))
+                        val vault = Vault(Saf(application.contentResolver, uri, application.filesDir), java.io.File(application.filesDir, "note-cache"))
                         vault to vault.load()
                     }
                     if (version != snapshotVersion) {

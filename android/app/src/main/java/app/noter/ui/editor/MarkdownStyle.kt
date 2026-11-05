@@ -41,8 +41,7 @@ private val ITALIC_UNDERSCORE = Regex("(?<![\\w_\\\\])_(?![_\\s])(.+?)(?<![\\s_]
 private val LINK = Regex("\\[([^\\]\\n]+)\\]\\(([^)\\s]*)\\)")
 private val IMAGE = Regex("^(\\s*)!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)\\)\\s*$")
 private val TOGGLE = Regex("^(\\s*)>(\\s?)(\\[!toggle\\])([+-])(\\s*)(.*)$", RegexOption.IGNORE_CASE)
-private val TABLE_ROW = Regex("^\\s*\\|")
-private val TABLE_DELIMITER = Regex("^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)*\\|?\\s*$")
+private val TABLE_DELIMITER = Regex("^\\s*\\|?\\s*:?-+:?\\s*(\\|\\s*:?-+:?\\s*)*\\|?\\s*$")
 
 private val markerStyle = SpanStyle(color = Marker)
 // Markers stay in the text so offsets map one to one; they are drawn transparent and almost zero width instead.
@@ -63,7 +62,7 @@ private class Styler(text: String) {
  * Space reserved for blocks the editor draws over the text: images (by link; null shows the file-name chip)
  * and table rows. The Markdown stays in the field, hidden, so editing and offsets are unchanged.
  */
-class BlockLayout(val imageHeights: Map<String, TextUnit?>, val tableRowHeight: TextUnit)
+class BlockLayout(val imageHeights: Map<String, TextUnit?>, val tableRowHeights: Map<Int, TextUnit>)
 
 sealed interface PreviewBlock { val start: Int; val end: Int }
 class ImagePreviewBlock(override val start: Int, override val end: Int, val link: String, val alt: String) : PreviewBlock
@@ -105,11 +104,11 @@ private fun lineEndAt(text: String, start: Int) = text.indexOf('\n', start).let 
 /** End of the table whose header row starts at [start], or null when no delimiter row follows it. */
 private fun tableEnd(text: String, start: Int): Int? {
     val end = lineEndAt(text, start)
-    if (end >= text.length) return null
+    if (end >= text.length || !text.substring(start, end).contains('|')) return null
     val delimiter = text.substring(end + 1, lineEndAt(text, end + 1))
-    if (!TABLE_ROW.containsMatchIn(delimiter) || !TABLE_DELIMITER.matches(delimiter)) return null
+    if (!TABLE_DELIMITER.matches(delimiter) || tableCells(text.substring(start, end)).size != tableCells(delimiter).size) return null
     var last = lineEndAt(text, end + 1)
-    while (last < text.length && TABLE_ROW.containsMatchIn(text.substring(last + 1, lineEndAt(text, last + 1)))) last = lineEndAt(text, last + 1)
+    while (last < text.length && text.substring(last + 1, lineEndAt(text, last + 1)).contains('|')) last = lineEndAt(text, last + 1)
     return last
 }
 
@@ -128,14 +127,21 @@ fun previewBlocks(text: String, active: IntRange?): List<PreviewBlock> {
             if (fenceMatch != null && fenceMatch.groupValues[1].startsWith(fence) && fenceMatch.groupValues[2].isBlank()) fence = null
         } else if (fenceMatch != null) {
             fence = fenceMatch.groupValues[1]
-        } else if (TABLE_ROW.containsMatchIn(line)) {
+        } else {
             val last = tableEnd(text, start)
             if (last != null) {
                 if (outside(start, last, active)) {
                     val lines = text.substring(start, last).split('\n')
+                    val columns = tableCells(lines.first()).size
                     var lineStart = start
                     val rows = ArrayList<Pair<Int, List<String>>>()
-                    lines.forEachIndexed { index, row -> if (index != 1) rows += lineStart to tableCells(row); lineStart += row.length + 1 }
+                    lines.forEachIndexed { index, row ->
+                        if (index != 1) {
+                            val cells = tableCells(row)
+                            rows += lineStart to List(columns) { cells.getOrElse(it) { "" } }
+                        }
+                        lineStart += row.length + 1
+                    }
                     val align = tableCells(lines[1]).map { cell ->
                         when { cell.startsWith(':') && cell.endsWith(':') -> "center"; cell.endsWith(':') -> "right"; cell.startsWith(':') -> "left"; else -> "" }
                     }
@@ -144,8 +150,9 @@ fun previewBlocks(text: String, active: IntRange?): List<PreviewBlock> {
                 start = last + 1
                 continue
             }
-        } else IMAGE.matchEntire(line)?.let { match ->
-            if (outside(start, end, active)) result += ImagePreviewBlock(start, end, match.groupValues[3], match.groupValues[2])
+            IMAGE.matchEntire(line)?.let { match ->
+                if (outside(start, end, active)) result += ImagePreviewBlock(start, end, match.groupValues[3], match.groupValues[2])
+            }
         }
         start = end + 1
     }
@@ -158,7 +165,8 @@ fun previewBlocks(text: String, active: IntRange?): List<PreviewBlock> {
  */
 fun styleMarkdown(text: String, active: IntRange? = null, layout: BlockLayout? = null): AnnotatedString = Styler(text).apply {
     var fence: String? = null
-    var table = false
+    var tableLast = -1
+    var tableDelimiter = -1
     var tableDrawn = false
     var start = 0
     while (start <= text.length) {
@@ -166,15 +174,14 @@ fun styleMarkdown(text: String, active: IntRange? = null, layout: BlockLayout? =
         val line = text.substring(start, end)
         val fenceMatch = FENCE.matchEntire(line)
         val preview = active == null || start > active.last || end < active.first
-        // A table starts at a `|` row followed by a delimiter row and continues while rows start with `|`.
         var header = false
-        if (fence != null || fenceMatch != null || !TABLE_ROW.containsMatchIn(line)) table = false
-        else if (!table) {
-            val next = if (end < text.length) text.substring(end + 1, text.indexOf('\n', end + 1).let { if (it < 0) text.length else it }) else ""
-            header = next.contains('|') && TABLE_DELIMITER.matches(next)
-            table = header
-            tableDrawn = header && layout != null && tableEnd(text, start)?.let { outside(start, it, active) } == true
+        if (start > tableLast) {
+            tableLast = if (fence == null && fenceMatch == null) tableEnd(text, start) ?: -1 else -1
+            header = tableLast >= start
+            tableDelimiter = end + 1
+            tableDrawn = header && layout != null && outside(start, tableLast, active)
         }
+        val table = start <= tableLast
         when {
             fence != null -> {
                 add(SpanStyle(fontFamily = FontFamily.Monospace, color = BlockCode, background = BlockCodeBackground), start, end)
@@ -190,13 +197,17 @@ fun styleMarkdown(text: String, active: IntRange? = null, layout: BlockLayout? =
             // A drawn table keeps one line per row, sized to the grid row; the delimiter row collapses.
             table && tableDrawn -> {
                 add(hiddenStyle, start, end)
-                paragraph(ParagraphStyle(lineHeight = if (TABLE_DELIMITER.matches(line)) 1.sp else layout!!.tableRowHeight), start, end)
+                paragraph(ParagraphStyle(lineHeight = if (start == tableDelimiter) 1.sp else layout!!.tableRowHeights.getValue(start)), start, end)
             }
             table -> styleTableRow(this, line, start, header, preview)
             else -> styleLine(this, line, start, preview, layout)
         }
         start = end + 1
     }
+}.build()
+
+fun styleTableCell(text: String): AnnotatedString = Styler(text).apply {
+    styleInline(this, text, 0, 0, preview = true)
 }.build()
 
 private fun styleTableRow(styler: Styler, line: String, offset: Int, header: Boolean, preview: Boolean) {

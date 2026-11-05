@@ -10,13 +10,18 @@ import app.noter.model.toJson
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.TreeMap
 import java.util.UUID
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
 
 class VaultException(message: String) : Exception(message)
 
@@ -33,16 +38,72 @@ private const val MAX_IMAGE = 20_000_000L
  * Markdown files plus `.noter/workspace.json`, in the same layout as the desktop vault so both clients can share a synced folder.
  * Revisions verify note contents; routine polling uses metadata hints between bounded full audits.
  */
-class Vault(private val saf: Saf) {
+class Vault(private val saf: Saf, cacheDirectory: File? = null) {
     class Loaded(val workspace: Workspace, val revision: String)
     data class PreservedEdits(val snapshot: String, val folder: String?, val notes: Int)
 
     private class Manifest(val workspace: JSONObject, val paths: Map<String, String>, val bytes: ByteArray)
     private class Snapshot(val disk: TreeMap<String, Entry>, val contents: TreeMap<String, String?>, val manifest: Manifest)
+    private class CachedNote(val doc: String, val size: Long, val modified: Long, val text: String) {
+        fun matches(entry: Entry) = entry.modified > 0 && entry.doc == doc && entry.size == size && entry.modified == modified
+    }
 
     private companion object {
         const val BACKUP_INTERVAL_NS = 600_000_000_000L
+        const val READ_THREADS = 4
         val recentBackups = HashMap<String, Long>()
+    }
+
+    /**
+     * Private copy of note text from the last open. Each SAF read is slow, so opening reuses text whose document, size and
+     * modification time are unchanged; saves still verify the files they replace, and polling audits reread everything.
+     */
+    private val cacheFile = cacheDirectory?.let { directory ->
+        File(directory, MessageDigest.getInstance("SHA-256").digest(saf.rootDoc.toByteArray()).joinToString("") { "%02x".format(it) } + ".json")
+    }
+
+    private fun readCache(): Map<String, CachedNote> {
+        val file = cacheFile?.takeIf { it.isFile } ?: return emptyMap()
+        return try {
+            val notes = JSONObject(file.readText())
+            notes.keys().asSequence().associateWith { path ->
+                notes.getJSONObject(path).let { CachedNote(it.getString("doc"), it.getLong("size"), it.getLong("modified"), it.getString("text")) }
+            }
+        } catch (_: Exception) {
+            file.delete()
+            emptyMap()
+        }
+    }
+
+    private fun writeCache(snapshot: Snapshot, cache: Map<String, CachedNote>) {
+        val file = cacheFile ?: return
+        val notes = snapshot.disk.filterValues { !it.isDir && it.modified > 0 }
+        if (notes.keys == cache.keys && notes.all { (path, entry) -> cache.getValue(path).matches(entry) }) return
+        try {
+            val json = JSONObject()
+            for ((path, entry) in notes) {
+                json.put(path, JSONObject().put("doc", entry.doc).put("size", entry.size).put("modified", entry.modified).put("text", snapshot.contents[path]))
+            }
+            file.parentFile?.mkdirs()
+            val pending = File(file.parentFile, ".${file.name}.tmp")
+            pending.writeText(json.toString())
+            Files.move(pending.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (_: Exception) {
+            file.delete()
+        }
+    }
+
+    private fun readNotes(entries: List<Pair<String, Entry>>): Map<String, ByteArray> {
+        if (entries.size < 2) return entries.associate { (path, entry) -> path to saf.read(entry.doc, MAX_NOTE) }
+        val pool = Executors.newFixedThreadPool(READ_THREADS)
+        try {
+            val pending = entries.map { (path, entry) -> path to pool.submit<ByteArray> { saf.read(entry.doc, MAX_NOTE) } }
+            return pending.associate { (path, future) ->
+                path to try { future.get() } catch (problem: ExecutionException) { throw problem.cause ?: problem }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
     private var pollingMetadata: String? = null
@@ -146,15 +207,20 @@ class Vault(private val saf: Saf) {
         return hash.digest().joinToString("") { "%02x".format(it) }
     }
 
-    private fun snapshot(disk: TreeMap<String, Entry> = scan(), manifest: Manifest = readManifest()): Snapshot {
+    private fun snapshot(
+        disk: TreeMap<String, Entry> = scan(),
+        manifest: Manifest = readManifest(),
+        cache: Map<String, CachedNote> = emptyMap(),
+    ): Snapshot {
+        val read = readNotes(disk.filter { (path, entry) -> !entry.isDir && cache[path]?.matches(entry) != true }.toList())
         val contents = TreeMap<String, String?>()
         var total = 0L
         for ((path, entry) in disk) {
             if (entry.isDir) contents[path] = null else {
-                val bytes = saf.read(entry.doc, MAX_NOTE)
-                total += bytes.size
+                val bytes = read[path]
+                total += bytes?.size?.toLong() ?: entry.size
                 if (total > MAX_TOTAL) throw VaultException("Choose a workspace with less than 100 MB of Markdown content.")
-                contents[path] = decode(bytes)
+                contents[path] = if (bytes != null) decode(bytes) else cache.getValue(path).text
             }
         }
         return Snapshot(disk, contents, manifest)
@@ -327,7 +393,8 @@ class Vault(private val saf: Saf) {
     private fun rememberBackup(path: String) = synchronized(recentBackups) { recentBackups["${saf.rootDoc}/$path"] = System.nanoTime() }
 
     fun load(): Loaded {
-        val initial = snapshot()
+        val cache = readCache()
+        val initial = snapshot(cache = cache)
         val disk = initial.disk
         val previous = initial.manifest
         val before = revisionOf(initial.contents, previous.bytes)
@@ -392,6 +459,7 @@ class Vault(private val saf: Saf) {
             // reading instead of rereading every note twice; saves still verify the files they replace.
             if (metadataRevision(scan(), readManifest().bytes) != metadataRevision(disk, previous.bytes)) throw SyncConflictException(changed)
             remember(initial, before)
+            writeCache(initial, cache)
             return Loaded(workspace, before)
         }
         if (revision(true) != before) throw SyncConflictException(changed)
@@ -401,6 +469,7 @@ class Vault(private val saf: Saf) {
         val actual = revisionOf(verified.contents, verified.manifest.bytes)
         if (actual != expected) throw SyncConflictException(changed)
         remember(verified, actual)
+        writeCache(verified, cache)
         return Loaded(workspace, actual)
     }
 
